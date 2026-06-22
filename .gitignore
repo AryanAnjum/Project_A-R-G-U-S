@@ -216,3 +216,24 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+# ==========================================
+# A.R.G.U.S. Custom AI & Media Ignores
+# ==========================================
+
+# AI Model Weights (CRITICAL: Do not commit these)
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
+
+# Local Audio/Video Buffers
+data/
+*.wav
+*.mp3
+*.mp4
+*.avi
+
+# Local Environment Variables (API Keys)
+.env
