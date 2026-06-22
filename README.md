@@ -36,6 +36,13 @@ During the first sprint, the foundation of **Pillar 1 (Sensory Ingestion)** was 
 * **Hallucination & Artifact Filtering:** Programmed a programmatic logic gate to catch and discard typical static artifacts (such as single-word hallucinated loops like "You", "Thank you") before passing data to the transcription console.
 * **Real-Time Latency Telemetry:** Embedded execution timers to output precise mathematical processing speed (`[Lat: X.XXs]`) alongside localized system timestamps for every spoken sentence.
 
+### Running the Engine
+Use the repository virtual environment and the PowerShell call operator to avoid interpreter path issues:
+```powershell
+cd "C:\Users\Sn1pEx\Desktop\Project_A-R-G-U-S\src"
+& "C:\Users\Sn1pEx\Desktop\Project_A-R-G-U-S\.ARGUS_venv\Scripts\python.exe" argus_hearing.py
+```
+
 ---
 
 ## 4. Current Repository Structure

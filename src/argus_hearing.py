@@ -1,11 +1,19 @@
 import collections
+import os
 import queue
+import sys
 import numpy as np
 import pyaudio
 import webrtcvad
 import time
 from datetime import datetime
 from faster_whisper import WhisperModel
+
+if sys.platform == "win32":
+    project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    nvidia_cublas_bin = os.path.join(project_root, ".ARGUS_venv", "Lib", "site-packages", "nvidia", "cublas", "bin")
+    if os.path.isdir(nvidia_cublas_bin) and nvidia_cublas_bin not in os.environ.get("PATH", ""):
+        os.environ["PATH"] = f"{nvidia_cublas_bin};" + os.environ.get("PATH", "")
 
 # ==========================================
 # A.R.G.U.S. HARDWARE CONFIGURATION
