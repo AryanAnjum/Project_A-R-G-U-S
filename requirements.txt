@@ -1,0 +1,10 @@
+faster-whisper
+av
+ctranslate2
+huggingface-hub
+onnxruntime
+tokenizers
+tqdm
+pyaudio
+webrtcvad
+numpy

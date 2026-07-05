@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+
+# --- Project Aurgus / Data Exclusions ---
+# Ignore the large video datasets
+videos/
+data/
+
+# Ignore IDE/OS specific files (often created by Windows/VS Code)
+.DS_Store
+Thumbs.db
+Desktop.ini
