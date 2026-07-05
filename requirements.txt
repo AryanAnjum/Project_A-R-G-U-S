@@ -31,3 +31,5 @@ faster-whisper
 fvcore
 iopath
 packaging
+
+pip install opencv-python
