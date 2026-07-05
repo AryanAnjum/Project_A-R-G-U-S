@@ -8,3 +8,26 @@ tqdm
 pyaudio
 webrtcvad
 numpy
+
+# ==========================================
+# A.R.G.U.S. Core Dependencies
+# ==========================================
+
+# 1. Vision & Machine Learning (X3D Engine)
+torch>=1.13.0
+torchvision
+torchaudio
+pytorchvideo
+av>=10.0.0
+opencv-python>=4.7.0
+
+# 2. Audio & VAD (Hearing Engine)
+numpy
+PyAudio
+webrtcvad
+faster-whisper
+
+# 3. Meta/FAIR Core Dependencies (Required by PyTorchVideo)
+fvcore
+iopath
+packaging
