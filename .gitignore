@@ -2,6 +2,8 @@
 __pycache__/
 *.py[codz]
 *$py.class
+ARGUS_venv/
+.ARGUS_venv/
 
 # C extensions
 *.so
@@ -218,12 +220,30 @@ __marimo__/
 .streamlit/secrets.toml
 
 
-# --- Project Aurgus / Data Exclusions ---
-# Ignore the large video datasets
+# ==========================================
+# A.R.G.U.S. Custom AI & Media Ignores
+# ==========================================
+
+# Ignore the large video datasets & local buffers
 videos/
 data/
+*.wav
+*.mp3
+*.mp4
+*.avi
+
+# AI Model Weights (CRITICAL: Do not commit these)
+models/
+*.pt
+*.pth
+*.bin
+*.safetensors
+*.onnx
 
 # Ignore IDE/OS specific files (often created by Windows/VS Code)
 .DS_Store
 Thumbs.db
 Desktop.ini
+
+# Local Environment Variables (API Keys)
+.env
