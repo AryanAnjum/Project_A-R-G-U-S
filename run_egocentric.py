@@ -71,7 +71,14 @@ for video_path in video_files:
     video = None 
     try:
         video = EncodedVideo.from_path(video_path)
-        video_data = video.get_clip(start_sec=0.0, end_sec=2.0)
+        
+        # Calculate the middle 2-second window
+        duration = float(video.duration)
+        start_sec = max(0.0, (duration / 2.0) - 1.0)
+        end_sec = min(duration, start_sec + 2.0)
+        
+        # Extract the dynamic clip
+        video_data = video.get_clip(start_sec=start_sec, end_sec=end_sec)
         video_data = transform(video_data)
         inputs = video_data["video"].to(device)[None, ...]
 
