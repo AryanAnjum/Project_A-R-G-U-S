@@ -34,3 +34,6 @@ packaging
 
 pip install opencv-python
 pip install pandas
+pip install faster-whisper SpeechRecognition pyaudio
+pip install SpeechRecognition
+pip install faster-whisper pyaudio

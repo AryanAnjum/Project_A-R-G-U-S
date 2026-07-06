@@ -4,21 +4,25 @@ import urllib.request
 import os
 import cv2
 import threading
+import time
+import speech_recognition as sr
+from faster_whisper import WhisperModel
 from pytorchvideo.data.encoded_video import EncodedVideo
 from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
 from torchvision.transforms import Compose, Lambda
 from torchvision.transforms._transforms_video import CenterCropVideo, NormalizeVideo
 
 # ==========================================
-# A.R.G.U.S. VISUAL DEMO ENGINE (SAFE-THREADING MODE)
+# A.R.G.U.S. MULTIMODAL DEMO ENGINE (VISION + AUDIO)
 # ==========================================
-print("\n[SYSTEM] Booting A.R.G.U.S. Vision Demo for Faculty Presentation...")
+print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-# 1. Load Pre-trained X3D Model & Kinetics Labels
-model_name = 'x3d_s'
-print("[SYSTEM] Loading Pre-trained Base Model...")
-model = torch.hub.load('facebookresearch/pytorchvideo', model_name, pretrained=True).to(device).eval()
+# ------------------------------------------
+# 1. LOAD AI MODELS
+# ------------------------------------------
+print("[SYSTEM] Loading Vision Brain (X3D)...")
+vision_model = torch.hub.load('facebookresearch/pytorchvideo', 'x3d_s', pretrained=True).to(device).eval()
 
 url = "https://dl.fbaipublicfiles.com/pyslowfast/dataset/class_names/kinetics_classnames.json"
 if not os.path.exists("kinetics_classnames.json"):
@@ -27,7 +31,15 @@ with open("kinetics_classnames.json", "r") as f:
     kinetics_classnames = json.load(f)
 kinetics_id_to_classname = {v: str(k).replace('"', "").replace('_', ' ') for k, v in kinetics_classnames.items()}
 
-# 2. Frame Transformations
+print("[SYSTEM] Loading Audio Brain (Faster Whisper)...")
+# Using the "tiny" model so it runs instantly alongside the video model
+audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if device == "cuda" else "int8")
+
+# ------------------------------------------
+# 2. CONFIGURATION & VARIABLES
+# ------------------------------------------
+target_video = r"videos\P01_06.mp4" 
+
 transform = ApplyTransformToKey(
     key="video",
     transform=Compose([
@@ -39,70 +51,119 @@ transform = ApplyTransformToKey(
     ]),
 )
 
-# 3. Target Video Setup (Fixed string literal for Windows paths)
-target_video = r"videos\P01_06.mp4" 
+prediction_text = "VISION: INITIALIZING..."
+subtitle_text = "AUDIO: LISTENING TO MICROPHONE..."
+current_time_sec = 0.0
+system_is_running = True
 
-if not os.path.exists(target_video):
-    print(f"\n[ERROR] Could not find video at: {target_video}")
-    exit()
+# ------------------------------------------
+# 3. BACKGROUND THREAD 1: VISION WORKER
+# ------------------------------------------
+def vision_worker():
+    global prediction_text, current_time_sec, system_is_running
+    ai_video_reader = EncodedVideo.from_path(target_video)
+    last_inferred_time = -1.0
+    
+    while system_is_running:
+        if current_time_sec - last_inferred_time >= 1.0:
+            infer_time = current_time_sec
+            try:
+                video_data = ai_video_reader.get_clip(start_sec=infer_time, end_sec=infer_time + 2.0)
+                video_data = transform(video_data)
+                inputs = video_data["video"].to(device)[None, ...]
 
-print(f"[SYSTEM] Establishing video feed from: {target_video}...")
+                with torch.no_grad():
+                    preds = vision_model(inputs)
+                    preds = torch.nn.Softmax(dim=1)(preds)
+                    top_idx = preds.topk(k=1).indices[0][0].item()
+                    confidence = preds.topk(k=1).values[0][0].item() * 100
+                    
+                prediction_text = f"TARGET LOCKED: {kinetics_id_to_classname[top_idx].upper()} ({confidence:.1f}%)"
+                last_inferred_time = infer_time
+            except Exception:
+                pass
+        time.sleep(0.05)
 
-# 4. The Streaming HUD Loop
+# ------------------------------------------
+# 4. BACKGROUND THREAD 2: AUDIO WORKER (DEBUG MODE)
+# ------------------------------------------
+def audio_worker():
+    global subtitle_text, system_is_running
+    recognizer = sr.Recognizer()
+    
+    try:
+        mic = sr.Microphone()
+        print("[AUDIO] Microphone detected successfully.")
+        with mic as source:
+            print("[AUDIO] Calibrating for background noise... (Please stay quiet for 1s)")
+            recognizer.adjust_for_ambient_noise(source, duration=1)
+            print("[AUDIO] Calibration complete. Listening active.")
+    except Exception as e:
+        print(f"[AUDIO ERROR] Failed to initialize microphone: {e}")
+        subtitle_text = "AUDIO ERROR: No microphone found!"
+        return
+
+    while system_is_running:
+        try:
+            with mic as source:
+                print("[AUDIO] Listening...")
+                # Listen in short bursts
+                audio_data = recognizer.listen(source, timeout=2, phrase_time_limit=3)
+                print("[AUDIO] Processing speech...")
+                
+                # Save to temporary file
+                with open("temp_mic.wav", "wb") as f:
+                    f.write(audio_data.get_wav_data())
+                
+                # Transcribe
+                segments, _ = audio_model.transcribe("temp_mic.wav", beam_size=1)
+                transcription = "".join([segment.text for segment in segments]).strip()
+                
+                if transcription:
+                    print(f"[AUDIO WHISPER] Transcribed: {transcription}")
+                    subtitle_text = f"MIC: {transcription}"
+                else:
+                    print("[AUDIO WHISPER] Heard sound, but no words detected.")
+        except sr.WaitTimeoutError:
+            print("[AUDIO] Listening timeout (silence)...")
+        except Exception as e:
+            print(f"[AUDIO LOOP ERROR]: {e}")
+            
+        time.sleep(0.1)
+
+# Start both AI brains in the background
+threading.Thread(target=vision_worker, daemon=True).start()
+threading.Thread(target=audio_worker, daemon=True).start()
+
+# ------------------------------------------
+# 5. THE STREAMING HUD LOOP (MAIN THREAD)
+# ------------------------------------------
 print("[SYSTEM] Launching Real-Time HUD. Press 'q' to close window.")
 cap = cv2.VideoCapture(target_video)
 
-frame_count = 0
-prediction_text = "INITIALIZING A.R.G.U.S..."
-is_inferencing = False  # <--- THIS IS THE CRASH FIX
-
-# The background AI function
-def run_ai_inference(current_time):
-    global prediction_text, is_inferencing
-    try:
-        # Create a safe, temporary video reader just for this thread
-        local_video = EncodedVideo.from_path(target_video)
-        video_data = local_video.get_clip(start_sec=current_time, end_sec=current_time + 2.0)
-        video_data = transform(video_data)
-        inputs = video_data["video"].to(device)[None, ...]
-
-        with torch.no_grad():
-            preds = model(inputs)
-            preds = torch.nn.Softmax(dim=1)(preds)
-            top_idx = preds.topk(k=1).indices[0][0].item()
-            confidence = preds.topk(k=1).values[0][0].item() * 100
-            
-            prediction_text = f"TARGET LOCKED: {kinetics_id_to_classname[top_idx].upper()} ({confidence:.1f}%)"
-    except Exception as e:
-        pass 
-    finally:
-        # Unlock so the next frame can run!
-        is_inferencing = False
-
-# Read through the video continuously
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret:
-        break # Video ended
+        break 
 
-    # ONLY run if the previous AI guess is finished (prevents crashes)
-    if frame_count % 30 == 0 and not is_inferencing:
-        is_inferencing = True # Lock it
-        current_time = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-        # Start a background thread
-        threading.Thread(target=run_ai_inference, args=(current_time,), daemon=True).start()
+    current_time_sec = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+    frame_height, frame_width, _ = frame.shape
 
-    # Draw the HUD Overlay
+    # Draw Top HUD (Vision)
     cv2.rectangle(frame, (10, 10), (800, 60), (0, 0, 0), -1) 
     cv2.putText(frame, prediction_text, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
 
-    # Display the live feed
+    # Draw Bottom HUD (Audio / Subtitles)
+    cv2.rectangle(frame, (10, frame_height - 60), (frame_width - 10, frame_height - 10), (0, 0, 0), -1)
+    cv2.putText(frame, subtitle_text, (20, frame_height - 25), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2, cv2.LINE_AA)
+
     cv2.imshow("A.R.G.U.S. Vision Engine", frame)
-    frame_count += 1
     
-    # Play speed (wait ~30ms between frames). Press 'q' to quit.
     if cv2.waitKey(30) & 0xFF == ord('q'):
         break
 
+# Cleanup
+system_is_running = False 
 cap.release()
 cv2.destroyAllWindows()
+print("[SYSTEM] Shutdown complete.")
