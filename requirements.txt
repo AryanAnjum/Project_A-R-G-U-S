@@ -40,3 +40,4 @@ pip install faster-whisper pyaudio
 pip install tqdm
 pip install pyttsx3
 
+pip install transformers==4.56.1 einops accelerate
