@@ -37,8 +37,6 @@ pip install pandas
 pip install faster-whisper SpeechRecognition pyaudio
 pip install SpeechRecognition
 pip install faster-whisper pyaudio
-<<<<<<< HEAD
 pip install tqdm
-=======
 pip install pyttsx3
->>>>>>> f58fd65350250c038c68c058565f8903ff9de135
+
