@@ -10,6 +10,8 @@ import queue
 import textwrap 
 import collections
 import numpy as np
+import io
+import re  
 import speech_recognition as sr
 import pyttsx3
 from PIL import Image
@@ -27,19 +29,14 @@ except ImportError:
 # ==========================================
 # MOONDREAM2 COMPATIBILITY PATCH
 # ==========================================
-_orig_getattr = torch.nn.Module.__getattr__
-def _patched_getattr(self, name):
-    if name == "all_tied_weights_keys":
-        return {} 
-    return _orig_getattr(self, name)
-torch.nn.Module.__getattr__ = _patched_getattr
-
+# Injecting the missing attribute as a property intercepts it before custom Hugging Face models crash
+torch.nn.Module.all_tied_weights_keys = property(lambda self: {})
 
 # ==========================================
 # A.R.G.U.S. MASTER ENGINE 
 # ==========================================
 print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda" if torch.cuda.is_available() else "cpu" 
 
 # ------------------------------------------
 # 1. LOAD AI MODELS & ENGINES
@@ -47,7 +44,6 @@ device = "cuda" if torch.cuda.is_available() else "cpu"
 print("[SYSTEM] Loading Temporal Brain (X3D with Custom Weights)...")
 vision_model = torch.hub.load('facebookresearch/pytorchvideo', 'x3d_s', pretrained=True)
 
-# Swap head for your 5 custom classes and load the .pth you trained!
 NUM_CUSTOM_CLASSES = 5
 in_features = vision_model.blocks[5].proj.in_features
 vision_model.blocks[5].proj = nn.Linear(in_features, NUM_CUSTOM_CLASSES)
@@ -61,7 +57,6 @@ else:
 
 vision_model = vision_model.to(device).eval()
 
-# Update these to match the 5 classes you used during fine-tuning!
 custom_classnames = {
     0: "Washing Dishes",
     1: "Chopping Vegetables",
@@ -72,10 +67,20 @@ custom_classnames = {
 
 print("[SYSTEM] Loading Spatial Brain (Moondream2)...")
 md_model_id = "vikhyatk/moondream2"
+
+# Pinned to the stable 2024-05-08 release with float16
 moondream = AutoModelForCausalLM.from_pretrained(
-    md_model_id, trust_remote_code=True, torch_dtype=torch.float16
-).to(device)
-md_tokenizer = AutoTokenizer.from_pretrained(md_model_id, trust_remote_code=True)
+    md_model_id, 
+    revision="2024-05-08",
+    trust_remote_code=True, 
+    torch_dtype=torch.float16
+).to(device).eval()
+
+md_tokenizer = AutoTokenizer.from_pretrained(
+    md_model_id, 
+    revision="2024-05-08", 
+    trust_remote_code=True
+)
 
 print("[SYSTEM] Loading Audio Brain (Faster Whisper)...")
 audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if device == "cuda" else "int8")
@@ -100,16 +105,14 @@ prediction_text = "VISION: BUFFERING FRAMES..."
 subtitle_text = "AUDIO: LISTENING TO MICROPHONE..."
 current_action_label = "nothing" 
 argus_reply_text = "" 
-reply_timestamp = 0.0  # Added to clear text after 8 seconds
+reply_timestamp = 0.0  
 
-# Global state trackers
 memory_log = [] 
 current_cv2_frame = None 
-frame_buffer = collections.deque(maxlen=60) # 2 seconds of rolling video frames in RAM
+frame_buffer = collections.deque(maxlen=60) 
 system_is_running = True
 assistant_state = "idle"
 
-# Audio Synchronization Tools
 tts_queue = queue.Queue()
 tts_done_event = threading.Event()
 tts_engine = None
@@ -152,10 +155,30 @@ def process_prompt(user_spoken_prompt):
 
         print(f"[MOONDREAM] Analyzing spatial frame for prompt: '{user_spoken_prompt}'")
         encoded_image = moondream.encode_image(pil_image)
-        answer = moondream.answer_question(encoded_image, user_spoken_prompt, md_tokenizer)
+        
+        # THE FIX: Removed all hacky kwargs. 
+        # The healthy model will naturally stop itself using its own <END> token.
+        answer = moondream.answer_question(
+            encoded_image, 
+            user_spoken_prompt, 
+            md_tokenizer 
+        )
+
+        answer = answer.replace('"', '').strip()
+
+        # 2. THE ANTI-CRASH FILTER: 
+        # Keeps Windows TTS safe from freezing if the model ever gets confused
+        is_garbage = any(len(word) > 20 for word in answer.split())
+        
+        if is_garbage:
+            print(f"\n[SYSTEM WARNING] Intercepted hallucination: {answer}")
+            answer = "I am having trouble seeing the image clearly."
+
+        if len(answer) > 150:
+            answer = answer[:150] + "..."
 
         argus_reply_text = f"A.R.G.U.S: {answer.upper()}"
-        reply_timestamp = time.time()  # Start the 8-second timer
+        reply_timestamp = time.time()  
         tts_queue.put(answer)
         
         del encoded_image
@@ -175,30 +198,29 @@ def interrupt_tts():
 def detect_wake_word(transcription):
     text = (transcription or "").lower().replace("-", " ").replace(",", " ").replace(".", " ").replace("!", " ").replace("?", " ")
     words = text.split()
-    wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "argyz"]
+    wake_variants = ["hey"]
     return any(variant in words for variant in wake_variants)
 
 def extract_followup_prompt(transcription):
     text = (transcription or "").lower()
-    wake_variants = ["hey argus", "hi argus", "okay argus", "argus"]
+    wake_variants = ["hey"]
     for marker in wake_variants:
         if marker in text:
             return text.replace(marker, "", 1).strip()
     return text.strip()
 
 # ------------------------------------------
-# 3. BACKGROUND THREAD 1: VISION WORKER (RAM BUFFERED)
+# 3. BACKGROUND THREAD 1: VISION WORKER 
 # ------------------------------------------
 def vision_worker():
     global prediction_text, system_is_running, current_action_label, memory_log
     
     while system_is_running:
-        if len(frame_buffer) == 60:  # Only run if we have a full 2-second buffer
+        if len(frame_buffer) == 60:  
             try:
-                # Convert RAM frames directly to PyTorch Tensor (No Hard Drive usage)
                 frames_list = list(frame_buffer)
                 video_tensor = torch.from_numpy(np.stack(frames_list))
-                video_tensor = video_tensor.permute(3, 0, 1, 2).float() # [C, T, H, W]
+                video_tensor = video_tensor.permute(3, 0, 1, 2).float() 
 
                 video_data = {"video": video_tensor}
                 video_data = transform(video_data)
@@ -218,15 +240,14 @@ def vision_worker():
                         memory_log.append(current_action_label)
                         
             except Exception as e:
-                print(f"[VISION ERROR] {e}")
+                pass
                 
-            # Sleep for 1 second before sampling the next 2-second window
             time.sleep(1.0) 
         else:
             time.sleep(0.1)
 
 # ------------------------------------------
-# 4. BACKGROUND THREAD 2: VOCAL ENGINE (pyttsx3)
+# 4. BACKGROUND THREAD 2: VOCAL ENGINE 
 # ------------------------------------------
 def tts_worker():
     global system_is_running, tts_done_event, tts_interrupt_requested
@@ -241,16 +262,20 @@ def tts_worker():
             pass
 
 # ------------------------------------------
-# 5. BACKGROUND THREAD 3: AUDIO WORKER (RAM PROCESSING)
+# 5. BACKGROUND THREAD 3: AUDIO WORKER 
 # ------------------------------------------
 def audio_worker():
     global subtitle_text, system_is_running, current_action_label, argus_reply_text, memory_log, current_cv2_frame, tts_done_event, thinking_active, assistant_state, reply_timestamp
     recognizer = sr.Recognizer()
+    
+    recognizer.pause_threshold = 0.5 
+    recognizer.non_speaking_duration = 0.3
 
     try:
         mic = sr.Microphone()
         print("[AUDIO] Microphone detected successfully.")
         with mic as source:
+            print("[AUDIO] Calibrating for background noise... (Stay quiet for 1s)")
             recognizer.adjust_for_ambient_noise(source, duration=1)
             print("[AUDIO] Calibration complete. Listening active.")
     except Exception as e:
@@ -270,16 +295,32 @@ def audio_worker():
                         assistant_state = "idle"
                         continue
 
-                    # Direct RAM audio conversion (No hard drive thrashing!)
-                    audio_data = np.frombuffer(command_audio.get_raw_data(), np.int16).astype(np.float32) / 32768.0
-                    segments, _ = audio_model.transcribe(audio_data, beam_size=1)
-                    user_spoken_prompt = "".join([segment.text for segment in segments]).strip().lower()
+                    wav_bytes = command_audio.get_wav_data()
+                    wav_stream = io.BytesIO(wav_bytes)
                     
-                    if user_spoken_prompt:
+                    segments, _ = audio_model.transcribe(
+                        wav_stream, 
+                        beam_size=5, 
+                        language="en", 
+                        condition_on_previous_text=False,
+                        vad_filter=True
+                    )
+                    
+                    raw_transcription = "".join([segment.text for segment in segments]).strip().lower()
+                    cleaned_prompt = re.sub(r'[^\w\s]', '', raw_transcription).strip()
+                    
+                    words = cleaned_prompt.split()
+                    if len(words) > 4 and len(set(words)) <= 2: 
+                        cleaned_prompt = "" 
+                    
+                    if len(cleaned_prompt) > 1:
+                        user_spoken_prompt = cleaned_prompt
                         subtitle_text = f"MIC: {user_spoken_prompt}"
                         play_capture_chime()
                     else:
                         user_spoken_prompt = "Describe the main objects in this scene."
+                        subtitle_text = "MIC: (Silence detected. Asking for description.)"
+                        play_capture_chime()
                         
                     assistant_state = "idle"
                     process_prompt(user_spoken_prompt)
@@ -287,9 +328,17 @@ def audio_worker():
 
                 audio_data = recognizer.listen(source, timeout=2.0, phrase_time_limit=4.0)
                 
-                # Direct RAM audio conversion
-                raw_np = np.frombuffer(audio_data.get_raw_data(), np.int16).astype(np.float32) / 32768.0
-                segments, _ = audio_model.transcribe(raw_np, beam_size=1)
+                wav_bytes = audio_data.get_wav_data()
+                wav_stream = io.BytesIO(wav_bytes)
+                
+                segments, _ = audio_model.transcribe(
+                    wav_stream, 
+                    beam_size=5, 
+                    language="en", 
+                    condition_on_previous_text=False,
+                    vad_filter=True
+                )
+                
                 transcription = "".join([segment.text for segment in segments]).strip().lower()
 
                 if transcription:
@@ -312,9 +361,14 @@ def audio_worker():
 
                     elif detect_wake_word(transcription):
                         interrupt_tts()
-                        user_spoken_prompt = extract_followup_prompt(transcription)
+                        raw_followup = extract_followup_prompt(transcription)
+                        cleaned_followup = re.sub(r'[^\w\s]', '', raw_followup).strip()
+                        
+                        words = cleaned_followup.split()
+                        if len(words) > 4 and len(set(words)) <= 2: 
+                            cleaned_followup = "" 
 
-                        subtitle_text = "MIC: HEY ARGUS..."
+                        subtitle_text = "MIC: HEY..."
                         tts_done_event.clear()
                         tts_queue.put("I am listening.")
                         threading.Thread(target=play_startup_chime, daemon=True).start()
@@ -322,16 +376,21 @@ def audio_worker():
                         tts_done_event.wait(timeout=3.0)
                         time.sleep(0.25)
 
-                        if user_spoken_prompt.strip():
-                            subtitle_text = f"MIC: {user_spoken_prompt}"
+                        if len(cleaned_followup) > 1:
+                            subtitle_text = f"MIC: {cleaned_followup}"
                             play_capture_chime()
                             assistant_state = "idle"
-                            process_prompt(user_spoken_prompt)
+                            process_prompt(cleaned_followup)
                         else:
                             assistant_state = "awaiting_prompt"
 
-        except sr.WaitTimeoutError: pass
-        except Exception: pass
+        except sr.WaitTimeoutError: 
+            pass
+        except Exception as e: 
+            import traceback
+            print(f"\n[CRITICAL AUDIO ERROR] {e}")
+            traceback.print_exc()
+            
         time.sleep(0.1)
 
 # Start all three AI brains
@@ -351,36 +410,29 @@ cv2.resizeWindow("A.R.G.U.S. Vision Engine", 1280, 720)
 while cap.isOpened():
     ret, frame = cap.read()
     if not ret: 
-        # Loop the video for continuous testing
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
         continue 
 
     frame_height, frame_width, _ = frame.shape
     current_cv2_frame = frame.copy() 
     
-    # Push the frame to the RAM buffer for X3D (Resized for performance)
     rgb_small = cv2.cvtColor(cv2.resize(frame, (320, 240)), cv2.COLOR_BGR2RGB)
     frame_buffer.append(rgb_small)
 
-    # 1. Draw Top HUD
     cv2.rectangle(frame, (10, 10), (800, 60), (0, 0, 0), -1) 
     cv2.putText(frame, prediction_text, (20, 45), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2, cv2.LINE_AA)
 
-    # 2. Draw Bottom HUD 
     cv2.rectangle(frame, (10, frame_height - 50), (frame_width - 10, frame_height - 10), (0, 0, 0), -1)
     cv2.putText(frame, subtitle_text, (65, frame_height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2, cv2.LINE_AA)
 
-    # 3. Clear Stale Answers (Timeout after 8 seconds)
     if argus_reply_text != "" and (time.time() - reply_timestamp > 8.0):
         argus_reply_text = ""
 
-    # 4. Draw Thinking Animation
     if thinking_active:
         spinner = [".  ", ".. ", "...", ".. "]
         dots = spinner[int(time.time() * 6) % len(spinner)]
         cv2.putText(frame, f"THINKING{dots}", (frame_width - 220, 45), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
 
-    # 5. Dynamic Text Wrapping
     if argus_reply_text != "":
         wrapped_lines = textwrap.wrap(argus_reply_text, width=65)
         
