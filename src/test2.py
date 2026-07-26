@@ -20,9 +20,6 @@ from faster_whisper import WhisperModel
 # DO NOT pass the path to the .pt file. 
 # Just use the model name, and the library will download the correct CTranslate2 format.
 MODEL_SIZE = "large-v3"
-
-print("[ARGUS] Initializing Faster Whisper Large-v3...")
-
 # This will automatically download the correct files on the first run.
 # compute_type="int8" forces it to compress, keeping your 8GB VRAM safe.
 whisper_model = WhisperModel(
@@ -31,7 +28,6 @@ whisper_model = WhisperModel(
     compute_type="int8" 
 )
 
-print("[ARGUS] Audio Engine loaded successfully in INT8 mode.")
 try:
     import winsound
 except ImportError:
@@ -76,7 +72,7 @@ moondream = AutoModelForCausalLM.from_pretrained(
 ).to(device)
 md_tokenizer = AutoTokenizer.from_pretrained(md_model_id, trust_remote_code=True)
 
-print("[SYSTEM] Loading Audio Brain (Faster Whisper)...")
+print("[SYSTEM] Loading Audio Brain (Whisper)...")
 audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if device == "cuda" else "int8")
 
 
@@ -313,17 +309,20 @@ def audio_worker():
             with mic as source:
                 if assistant_state == "awaiting_prompt":
                     subtitle_text = "MIC: (I AM LISTENING - SPEAK NOW!)"
-                    print("[AUDIO] Recording your question...")
+                    print("[A.R.G.U.S] I AM LISTENING - SPEAK NOW!")
                     try:
-                        recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                        command_audio = recognizer.listen(source, timeout=5.0, phrase_time_limit=5.0)
+
+                        command_audio = recognizer.listen(source, timeout=3.0, phrase_time_limit=7.0)
                     except sr.WaitTimeoutError:
                         tts_queue.put("I didn't hear a command.")
                         assistant_state = "idle"
                         continue
 
+                    # Process the audio...
                     with open("temp_mic.wav", "wb") as f:
                         f.write(command_audio.get_wav_data())
+                    
+                    # ... [Your Whisper transcription code stays exactly the same here] ...
 
                     # 3. NEW: The Whisper accuracy constraints
                     segments, _ = audio_model.transcribe(
@@ -346,7 +345,7 @@ def audio_worker():
                     process_prompt(user_spoken_prompt)
                     continue
 
-                audio_data = recognizer.listen(source, timeout=2.0, phrase_time_limit=4.0)
+                audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=10.0)
 
                 with open("temp_mic.wav", "wb") as f:
                     f.write(audio_data.get_wav_data())
@@ -384,24 +383,22 @@ def audio_worker():
 
                     elif detect_wake_word(transcription):
                         interrupt_tts()
-                        user_spoken_prompt = extract_followup_prompt(transcription)
-
-                        print("[AUDIO] Wake word detected. Announcing listening state...")
+                        
+                        print("[AUDIO] Wake word detected. Enforcing 2-step pipeline...")
                         subtitle_text = "MIC: HEY ARGUS..."
+                        
+                        # 1. Trigger the "I am listening" sequence
                         tts_done_event.clear()
                         tts_queue.put("I am listening.")
                         threading.Thread(target=play_startup_chime, daemon=True).start()
 
-                        tts_done_event.wait(timeout=3.0)
-                        time.sleep(0.25)
+                        # 2. Wait for the AI to physically finish talking
+                        tts_done_event.wait(timeout=1.0)
+                        time.sleep(0.2) # Tiny buffer to ensure mic doesn't catch the speaker echo
 
-                        if user_spoken_prompt.strip():
-                            subtitle_text = f"MIC: {user_spoken_prompt}"
-                            play_capture_chime()
-                            assistant_state = "idle"
-                            process_prompt(user_spoken_prompt)
-                        else:
-                            assistant_state = "awaiting_prompt"
+                        # 3. FORCE the system into the 10-second recording state
+                        # (We removed the extract_followup_prompt logic entirely)
+                        assistant_state = "awaiting_prompt"
 
         except sr.WaitTimeoutError:
             pass
