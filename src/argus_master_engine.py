@@ -270,13 +270,16 @@ def audio_worker():
     
     recognizer.pause_threshold = 0.5 
     recognizer.non_speaking_duration = 0.3
+    
+    # THE FIX: Stop the microphone from auto-muting your voice
+    recognizer.dynamic_energy_threshold = False 
 
     try:
         mic = sr.Microphone()
         print("[AUDIO] Microphone detected successfully.")
         with mic as source:
             print("[AUDIO] Calibrating for background noise... (Stay quiet for 1s)")
-            recognizer.adjust_for_ambient_noise(source, duration=1)
+            recognizer.adjust_for_ambient_noise(source, duration=1.0)
             print("[AUDIO] Calibration complete. Listening active.")
     except Exception as e:
         subtitle_text = "AUDIO ERROR: No microphone found!"
@@ -288,7 +291,7 @@ def audio_worker():
                 if assistant_state == "awaiting_prompt":
                     subtitle_text = "MIC: (I AM LISTENING - SPEAK NOW!)"
                     try:
-                        recognizer.adjust_for_ambient_noise(source, duration=0.2)
+                        # THE FIX: Removed the 0.2s recalibration that was deafening the mic!
                         command_audio = recognizer.listen(source, timeout=5.0, phrase_time_limit=5.0)
                     except sr.WaitTimeoutError:
                         tts_queue.put("I didn't hear a command.")
