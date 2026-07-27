@@ -332,22 +332,23 @@ def tts_worker():
 
 
 # ------------------------------------------
-# 5. BACKGROUND THREAD 3: AUDIO WORKER (Whisper + Moondream2)
+# 5. BACKGROUND THREAD 3: AUDIO WORKER (Conversational Mode)
 # ------------------------------------------
 def audio_worker():
     global subtitle_text, system_is_running, current_action_label, argus_reply_text, memory_log, current_cv2_frame, tts_done_event, thinking_active, thinking_text, assistant_state
     
     recognizer = sr.Recognizer()
-    # 1. NEW: Strict microphone noise gating
     recognizer.energy_threshold = 4000  
     recognizer.dynamic_energy_threshold = True
+    
+    # 1. THE PAUSE FIX: Increased to 1.5 seconds so you can breathe or say "umm" without being cut off
+    recognizer.pause_threshold = 1.5 
 
     try:
         mic = sr.Microphone()
         print("[AUDIO] Microphone detected successfully.")
         with mic as source:
             print("[AUDIO] Calibrating for background noise... (Stay quiet for 2s)")
-            # 2. NEW: Increased calibration duration to 2.0 seconds
             recognizer.adjust_for_ambient_noise(source, duration=2.0)
             print("[AUDIO] Calibration complete. Listening active.")
     except Exception as e:
@@ -355,101 +356,83 @@ def audio_worker():
         subtitle_text = "AUDIO ERROR: No microphone found!"
         return
 
+    # Start in sleep mode
+    assistant_state = "idle"
+
     while system_is_running:
         try:
             with mic as source:
-                if assistant_state == "awaiting_prompt":
-                    subtitle_text = "MIC: (I AM LISTENING - SPEAK NOW!)"
-                    print("[A.R.G.U.S] I AM LISTENING - SPEAK NOW!")
+                # ========================================================
+                # ACTIVE MODE: Continuous Back-and-Forth Conversation
+                # ========================================================
+                if assistant_state == "active":
+                    subtitle_text = "MIC: (CONVERSATION MODE - SPEAK FREELY)"
                     try:
-
-                        command_audio = recognizer.listen(source, timeout=3.0, phrase_time_limit=7.0)
+                        # Listens for up to 10 seconds of silence. If you are quiet, it goes back to sleep.
+                        command_audio = recognizer.listen(source, timeout=10.0, phrase_time_limit=15.0)
                     except sr.WaitTimeoutError:
-                        tts_queue.put("I didn't hear a command.")
+                        print("[AUDIO] 10 seconds of silence. Going back to sleep.")
+                        subtitle_text = "MIC: (Sleeping. Say 'Hey Argus' to wake.)"
                         assistant_state = "idle"
                         continue
 
-                    # Process the audio...
+                    # Process what you said...
                     with open("temp_mic.wav", "wb") as f:
                         f.write(command_audio.get_wav_data())
                     
-                    # ... [Your Whisper transcription code stays exactly the same here] ...
-
-                    # 3. NEW: The Whisper accuracy constraints
                     segments, _ = audio_model.transcribe(
-                        "temp_mic.wav", 
-                        beam_size=5,
-                        language="en", 
-                        condition_on_previous_text=False,
-                        temperature=0.0,
-                        initial_prompt="A conversation with an AI engine named Argus. Technical terms: Moondream2, X3D, egocentric, VRAM.",
-                        vad_filter=True,
-                        vad_parameters=dict(min_silence_duration_ms=500)
+                        "temp_mic.wav", beam_size=5, language="en", condition_on_previous_text=False, temperature=0.0
                     )
                     user_spoken_prompt = "".join([segment.text for segment in segments]).strip().lower()
-                    if user_spoken_prompt:
+                    
+                    # If you actually spoke words (didn't just cough or bump the desk)
+                    if len(user_spoken_prompt) > 2:
                         subtitle_text = f"MIC: {user_spoken_prompt}"
                         play_capture_chime()
-                    else:
-                        user_spoken_prompt = "Describe the main objects in this scene."
-                    assistant_state = "idle"
-                    process_prompt(user_spoken_prompt)
+                        
+                        # Send the question to Moondream
+                        process_prompt(user_spoken_prompt)
+                        
+                        # VERY IMPORTANT: Wait for Argus to completely finish speaking his answer out loud
+                        # before opening the mic again, so he doesn't accidentally hear and reply to his own voice!
+                        tts_done_event.wait()
+                        time.sleep(0.3)
+                    
+                    # Stays in active mode! Loops right back to the top of the conversation.
                     continue
 
-                audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=10.0)
+                # ========================================================
+                # SLEEP MODE: Waiting for Wake Word
+                # ========================================================
+                elif assistant_state == "idle":
+                    audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=10.0)
 
-                with open("temp_mic.wav", "wb") as f:
-                    f.write(audio_data.get_wav_data())
+                    with open("temp_mic.wav", "wb") as f:
+                        f.write(audio_data.get_wav_data())
 
-                # 4. NEW: The Whisper accuracy constraints (Applied to the passive listening loop as well)
-                segments, _ = audio_model.transcribe(
-                    "temp_mic.wav", 
-                    beam_size=5,
-                    language="en", 
-                    condition_on_previous_text=False,
-                    temperature=0.0,
-                    initial_prompt="A conversation with an AI engine named Argus. Technical terms: Moondream2, X3D, egocentric, VRAM.",
-                    vad_filter=True,
-                    vad_parameters=dict(min_silence_duration_ms=500)
-                )
-                transcription = "".join([segment.text for segment in segments]).strip().lower()
+                    segments, _ = audio_model.transcribe(
+                        "temp_mic.wav", beam_size=5, language="en", condition_on_previous_text=False,
+                        temperature=0.0, vad_filter=True, vad_parameters=dict(min_silence_duration_ms=500)
+                    )
+                    transcription = "".join([segment.text for segment in segments]).strip().lower()
 
-                if transcription:
-                    print(f"[AUDIO WHISPER] Transcribed: {transcription}")
-                    subtitle_text = f"MIC: {transcription}"
+                    if transcription:
+                        subtitle_text = f"MIC: {transcription}"
 
-                    if "what is" in transcription and "doing" in transcription:
-                        answer = f"Right now, he is {current_action_label}."
-                        argus_reply_text = f"A.R.G.U.S: {answer.upper()}"
-                        tts_queue.put(answer)
+                        if detect_wake_word(transcription):
+                            interrupt_tts()
+                            print("[AUDIO] Wake word detected. Entering Continuous Conversation Mode...")
+                            subtitle_text = "MIC: HEY ARGUS..."
+                            
+                            tts_done_event.clear()
+                            tts_queue.put("I'm here, what's on your mind?")
+                            threading.Thread(target=play_startup_chime, daemon=True).start()
 
-                    elif "first" in transcription or "start" in transcription:
-                        if len(memory_log) > 0:
-                            first_event = memory_log[0]
-                            answer = f"At the start of the video, he was {first_event}."
-                        else:
-                            answer = "I haven't recorded any actions yet."
-                        argus_reply_text = f"A.R.G.U.S: {answer.upper()}"
-                        tts_queue.put(answer)
+                            tts_done_event.wait(timeout=2.0)
+                            time.sleep(0.2) 
 
-                    elif detect_wake_word(transcription):
-                        interrupt_tts()
-                        
-                        print("[AUDIO] Wake word detected. Enforcing 2-step pipeline...")
-                        subtitle_text = "MIC: HEY ARGUS..."
-                        
-                        # 1. Trigger the "I am listening" sequence
-                        tts_done_event.clear()
-                        tts_queue.put("I am listening.")
-                        threading.Thread(target=play_startup_chime, daemon=True).start()
-
-                        # 2. Wait for the AI to physically finish talking
-                        tts_done_event.wait(timeout=1.0)
-                        time.sleep(0.2) # Tiny buffer to ensure mic doesn't catch the speaker echo
-
-                        # 3. FORCE the system into the 10-second recording state
-                        # (We removed the extract_followup_prompt logic entirely)
-                        assistant_state = "awaiting_prompt"
+                            # Lock into active back-and-forth mode!
+                            assistant_state = "active"
 
         except sr.WaitTimeoutError:
             pass
