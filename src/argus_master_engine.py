@@ -88,7 +88,7 @@ audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if d
 # ------------------------------------------
 # 2. CONFIGURATION & VARIABLES
 # ------------------------------------------
-target_video = r"F:\Project CSE499\Project_A-R-G-U-S\videos\P01_05.mp4" 
+target_video = r"F:\Project CSE499\Project_A-R-G-U-S\videos\P01_05.mp4"
 
 transform = ApplyTransformToKey(
     key="video",
