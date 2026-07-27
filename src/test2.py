@@ -9,12 +9,24 @@ import queue
 import speech_recognition as sr
 import pyttsx3
 from PIL import Image
-from faster_whisper import WhisperModel
+
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from pytorchvideo.data.encoded_video import EncodedVideo
 from pytorchvideo.transforms import ApplyTransformToKey, ShortSideScale, UniformTemporalSubsample
 from torchvision.transforms import Compose, Lambda
 from torchvision.transforms._transforms_video import CenterCropVideo, NormalizeVideo
+from faster_whisper import WhisperModel
+
+# DO NOT pass the path to the .pt file. 
+# Just use the model name, and the library will download the correct CTranslate2 format.
+MODEL_SIZE = "large-v3"
+# This will automatically download the correct files on the first run.
+# compute_type="int8" forces it to compress, keeping your 8GB VRAM safe.
+whisper_model = WhisperModel(
+    MODEL_SIZE, 
+    device="cuda", 
+    compute_type="int8" 
+)
 
 try:
     import winsound
@@ -60,14 +72,14 @@ moondream = AutoModelForCausalLM.from_pretrained(
 ).to(device)
 md_tokenizer = AutoTokenizer.from_pretrained(md_model_id, trust_remote_code=True)
 
-print("[SYSTEM] Loading Audio Brain (Faster Whisper)...")
+print("[SYSTEM] Loading Audio Brain (Whisper)...")
 audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if device == "cuda" else "int8")
 
 
 # ------------------------------------------
 # 2. CONFIGURATION & VARIABLES
 # ------------------------------------------
-target_video = r"../videos/P01_12.mp4" 
+target_video = r"../videos/P01_13.mp4" 
 
 transform = ApplyTransformToKey(
     key="video",
@@ -178,7 +190,7 @@ def interrupt_tts():
 def detect_wake_word(transcription):
     text = (transcription or "").lower().replace("-", " ").replace(",", " ").replace(".", " ").replace("!", " ").replace("?", " ")
     words = text.split()
-    wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "argyz"]
+    wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "argyz", "ardis", "aridus", "arigos", 'argers']
     for variant in wake_variants:
         if variant in words:
             return True
@@ -191,7 +203,18 @@ def detect_wake_word(transcription):
 
 def extract_followup_prompt(transcription):
     text = (transcription or "").lower()
-    wake_variants = ["hey argus", "hi argus", "okay argus", "argus", "hey aragus", "hi aragus", "okay aragus", "aragus", "hey arghas", "hi arghas", "okay arghas", "arghas", "hey argas", "hi argas", "okay argas", "argas", "hey arghus", "hi arghus", "okay arghus", "arghus", "hey argos", "hi argos", "okay argos", "argos"]
+    wake_variants = [
+        "hey argus", "hi argus", "okay argus", "argus",
+        "hey aragus", "hi aragus", "okay aragus", "aragus",
+        "hey arghas", "hi arghas", "okay arghas", "arghas",
+        "hey argas", "hi argas", "okay argas", "argas",
+        "hey arghus", "hi arghus", "okay arghus", "arghus",
+        "hey argos", "hi argos", "okay argos", "argos",
+        "hey ardis", "hi ardis", "okay ardis", "ardis",
+        "hey aridus", "hi aridus", "okay aridus", "aridus",
+        "hey arigos", "hi arigos", "okay arigos", "arigos",
+        "hey argers", "hi argers", "okay argers", "argers",
+    ]
     for marker in wake_variants:
         if marker in text:
             return text.replace(marker, "", 1).strip()
@@ -262,14 +285,19 @@ def tts_worker():
 # ------------------------------------------
 def audio_worker():
     global subtitle_text, system_is_running, current_action_label, argus_reply_text, memory_log, current_cv2_frame, tts_done_event, thinking_active, thinking_text, assistant_state
+    
     recognizer = sr.Recognizer()
+    # 1. NEW: Strict microphone noise gating
+    recognizer.energy_threshold = 4000  
+    recognizer.dynamic_energy_threshold = True
 
     try:
         mic = sr.Microphone()
         print("[AUDIO] Microphone detected successfully.")
         with mic as source:
-            print("[AUDIO] Calibrating for background noise... (Stay quiet for 1s)")
-            recognizer.adjust_for_ambient_noise(source, duration=1)
+            print("[AUDIO] Calibrating for background noise... (Stay quiet for 2s)")
+            # 2. NEW: Increased calibration duration to 2.0 seconds
+            recognizer.adjust_for_ambient_noise(source, duration=2.0)
             print("[AUDIO] Calibration complete. Listening active.")
     except Exception as e:
         print(f"[AUDIO ERROR] Failed to initialize microphone: {e}")
@@ -281,19 +309,32 @@ def audio_worker():
             with mic as source:
                 if assistant_state == "awaiting_prompt":
                     subtitle_text = "MIC: (I AM LISTENING - SPEAK NOW!)"
-                    print("[AUDIO] Recording your question...")
+                    print("[A.R.G.U.S] I AM LISTENING - SPEAK NOW!")
                     try:
-                        recognizer.adjust_for_ambient_noise(source, duration=0.2)
-                        command_audio = recognizer.listen(source, timeout=5.0, phrase_time_limit=5.0)
+
+                        command_audio = recognizer.listen(source, timeout=3.0, phrase_time_limit=7.0)
                     except sr.WaitTimeoutError:
                         tts_queue.put("I didn't hear a command.")
                         assistant_state = "idle"
                         continue
 
+                    # Process the audio...
                     with open("temp_mic.wav", "wb") as f:
                         f.write(command_audio.get_wav_data())
+                    
+                    # ... [Your Whisper transcription code stays exactly the same here] ...
 
-                    segments, _ = audio_model.transcribe("temp_mic.wav", beam_size=1)
+                    # 3. NEW: The Whisper accuracy constraints
+                    segments, _ = audio_model.transcribe(
+                        "temp_mic.wav", 
+                        beam_size=5,
+                        language="en", 
+                        condition_on_previous_text=False,
+                        temperature=0.0,
+                        initial_prompt="A conversation with an AI engine named Argus. Technical terms: Moondream2, X3D, egocentric, VRAM.",
+                        vad_filter=True,
+                        vad_parameters=dict(min_silence_duration_ms=500)
+                    )
                     user_spoken_prompt = "".join([segment.text for segment in segments]).strip().lower()
                     if user_spoken_prompt:
                         subtitle_text = f"MIC: {user_spoken_prompt}"
@@ -304,12 +345,22 @@ def audio_worker():
                     process_prompt(user_spoken_prompt)
                     continue
 
-                audio_data = recognizer.listen(source, timeout=2.0, phrase_time_limit=4.0)
+                audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=10.0)
 
                 with open("temp_mic.wav", "wb") as f:
                     f.write(audio_data.get_wav_data())
 
-                segments, _ = audio_model.transcribe("temp_mic.wav", beam_size=1)
+                # 4. NEW: The Whisper accuracy constraints (Applied to the passive listening loop as well)
+                segments, _ = audio_model.transcribe(
+                    "temp_mic.wav", 
+                    beam_size=5,
+                    language="en", 
+                    condition_on_previous_text=False,
+                    temperature=0.0,
+                    initial_prompt="A conversation with an AI engine named Argus. Technical terms: Moondream2, X3D, egocentric, VRAM.",
+                    vad_filter=True,
+                    vad_parameters=dict(min_silence_duration_ms=500)
+                )
                 transcription = "".join([segment.text for segment in segments]).strip().lower()
 
                 if transcription:
@@ -332,24 +383,22 @@ def audio_worker():
 
                     elif detect_wake_word(transcription):
                         interrupt_tts()
-                        user_spoken_prompt = extract_followup_prompt(transcription)
-
-                        print("[AUDIO] Wake word detected. Announcing listening state...")
+                        
+                        print("[AUDIO] Wake word detected. Enforcing 2-step pipeline...")
                         subtitle_text = "MIC: HEY ARGUS..."
+                        
+                        # 1. Trigger the "I am listening" sequence
                         tts_done_event.clear()
                         tts_queue.put("I am listening.")
                         threading.Thread(target=play_startup_chime, daemon=True).start()
 
-                        tts_done_event.wait(timeout=3.0)
-                        time.sleep(0.25)
+                        # 2. Wait for the AI to physically finish talking
+                        tts_done_event.wait(timeout=1.0)
+                        time.sleep(0.2) # Tiny buffer to ensure mic doesn't catch the speaker echo
 
-                        if user_spoken_prompt.strip():
-                            subtitle_text = f"MIC: {user_spoken_prompt}"
-                            play_capture_chime()
-                            assistant_state = "idle"
-                            process_prompt(user_spoken_prompt)
-                        else:
-                            assistant_state = "awaiting_prompt"
+                        # 3. FORCE the system into the 10-second recording state
+                        # (We removed the extract_followup_prompt logic entirely)
+                        assistant_state = "awaiting_prompt"
 
         except sr.WaitTimeoutError:
             pass
