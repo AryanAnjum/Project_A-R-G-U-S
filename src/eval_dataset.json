@@ -1,51 +1,51 @@
 [
     {
-        "image_path": "./videos/test_frame_1.jpg",
+        "image_path": "../videos/test_frame_1.jpg",
         "question": "What kind of animal is this?",
         "ground_truth": "rabbit"
     },
     {
-        "image_path": "./videos/test_frame_2.jpg",
+        "image_path": "../videos/test_frame_2.jpg",
         "question": "How many cats are there?",
         "ground_truth": "two"
     },
     {
-        "image_path": "./videos/test_frame_3.jpg",
+        "image_path": "../videos/test_frame_3.jpg",
         "question": "What is written on the board?",
         "ground_truth": "staff meeting 3pm"
     },
     {
-        "image_path": "./videos/test_frame_4_action.jpg",
+        "image_path": "../videos/test_frame_4_action.jpg",
         "question": "What is the person in this image doing?",
         "ground_truth": "making tea"
     },
     {
-        "image_path": "./videos/test_frame_5_color.jpg",
+        "image_path": "../videos/test_frame_5_color.jpg",
         "question": "What color is the shirt the person is wearing?",
         "ground_truth": "red"
     },
     {
-        "image_path": "./videos/test_frame_6_spatial.jpg",
+        "image_path": "../videos/test_frame_6_spatial.jpg",
         "question": "What object is sitting directly to the left of the computer monitor?",
         "ground_truth": "coffee mug"
     },
     {
-        "image_path": "./videos/test_frame_7_boolean.jpg",
+        "image_path": "../videos/test_frame_7_boolean.jpg",
         "question": "Is it raining in this scene?",
         "ground_truth": "yes"
     },
     {
-        "image_path": "./videos/test_frame_8_ocr_complex.jpg",
+        "image_path": "../videos/test_frame_8_ocr_complex.jpg",
         "question": "What is the title of the book on the table?",
-        "ground_truth": "the great gatsby"
+        "ground_truth": "inside formula 1"
     },
     {
-        "image_path": "./videos/test_frame_9_counting.jpg",
+        "image_path": "../videos/test_frame_9_counting.jpg",
         "question": "How many people are visible in the background?",
-        "ground_truth": "four"
+        "ground_truth": "five"
     },
     {
-        "image_path": "./videos/test_frame_10_detail.jpg",
+        "image_path": "../videos/test_frame_10_detail.jpg",
         "question": "Is the cat an adult or a small kitten?",
         "ground_truth": "small kitten"
     }

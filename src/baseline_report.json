@@ -1,0 +1,110 @@
+{
+    "metrics": {
+        "total_tests": 10,
+        "exact_match_accuracy": 0.0,
+        "partial_match_accuracy": 80.0,
+        "average_inference_time_sec": 0.91
+    },
+    "detailed_results": [
+        {
+            "test_id": 1,
+            "image": "../videos/test_frame_1.jpg",
+            "question": "What kind of animal is this?",
+            "ground_truth": "rabbit",
+            "ai_answer": "this is a white rabbit.",
+            "inference_time_sec": 0.96,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 2,
+            "image": "../videos/test_frame_2.jpg",
+            "question": "How many cats are there?",
+            "ground_truth": "two",
+            "ai_answer": "there are two cats in the picture.",
+            "inference_time_sec": 0.54,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 3,
+            "image": "../videos/test_frame_3.jpg",
+            "question": "What is written on the board?",
+            "ground_truth": "staff meeting 3pm",
+            "ai_answer": "the board has the words staff meeting 3pm written on it.",
+            "inference_time_sec": 0.82,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 4,
+            "image": "../videos/test_frame_4_action.jpg",
+            "question": "What is the person in this image doing?",
+            "ground_truth": "making tea",
+            "ai_answer": "the person in the image is pouring milk into a pot.",
+            "inference_time_sec": 0.58,
+            "exact_match": false,
+            "partial_match": false
+        },
+        {
+            "test_id": 5,
+            "image": "../videos/test_frame_5_color.jpg",
+            "question": "What color is the shirt the person is wearing?",
+            "ground_truth": "red",
+            "ai_answer": "the person is wearing a red shirt.",
+            "inference_time_sec": 0.44,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 6,
+            "image": "../videos/test_frame_6_spatial.jpg",
+            "question": "What object is sitting directly to the left of the computer monitor?",
+            "ground_truth": "coffee mug",
+            "ai_answer": "a mug is sitting directly to the left of the computer monitor.",
+            "inference_time_sec": 2.7,
+            "exact_match": false,
+            "partial_match": false
+        },
+        {
+            "test_id": 7,
+            "image": "../videos/test_frame_7_boolean.jpg",
+            "question": "Is it raining in this scene?",
+            "ground_truth": "yes",
+            "ai_answer": "yes, it is raining in this scene.",
+            "inference_time_sec": 0.51,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 8,
+            "image": "../videos/test_frame_8_ocr_complex.jpg",
+            "question": "What is the title of the book on the table?",
+            "ground_truth": "inside formula 1",
+            "ai_answer": "the title of the book on the table is inside formula 1.",
+            "inference_time_sec": 0.64,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 9,
+            "image": "../videos/test_frame_9_counting.jpg",
+            "question": "How many people are visible in the background?",
+            "ground_truth": "five",
+            "ai_answer": "there are five people visible in the background.",
+            "inference_time_sec": 1.4,
+            "exact_match": false,
+            "partial_match": true
+        },
+        {
+            "test_id": 10,
+            "image": "../videos/test_frame_10_detail.jpg",
+            "question": "Is the cat an adult or a small kitten?",
+            "ground_truth": "small kitten",
+            "ai_answer": "the cat in the picture is a small kitten.",
+            "inference_time_sec": 0.51,
+            "exact_match": false,
+            "partial_match": true
+        }
+    ]
+}
