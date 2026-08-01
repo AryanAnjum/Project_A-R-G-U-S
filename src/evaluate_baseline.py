@@ -2,7 +2,9 @@ import torch
 import json
 import time
 import os
+import pandas as pd
 from PIL import Image
+from sklearn.metrics import classification_report, confusion_matrix, accuracy_score
 from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 
@@ -35,10 +37,12 @@ spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
 # 3. METRICS TRACKERS
 # ==========================================
 total_tests = len(eval_data)
-exact_matches = 0
-partial_matches = 0
 total_inference_time = 0.0
 results_log = []
+
+# Lists to hold binary representations for sklearn metrics
+y_true = []
+y_pred = []
 
 system_prompt = (
     "You are a highly observant AI. Look very closely at the fine details. "
@@ -101,19 +105,24 @@ for index, item in enumerate(eval_data):
     # Clean up string for grading
     ai_answer = raw_answer.replace('"', '').strip().lower()
 
-    # --- GRADING LOGIC ---
-    is_exact = False
-    is_partial = False
+    # --- GRADING & BINARY MAPPING LOGIC ---
+    # Determine correctness (1 = Correct/Positive, 0 = Incorrect/Negative)
+    is_exact = (ground_truth == ai_answer)
+    is_partial = (ground_truth in ai_answer)
+    
+    # For Yes/No ground truths, map directly to binary (1 = Yes, 0 = No)
+    if ground_truth in ["yes", "no"]:
+        gt_binary = 1 if ground_truth == "yes" else 0
+        pred_binary = 1 if "yes" in ai_answer else 0
+    else:
+        # For general open questions, treat target condition as Correct (1) vs Incorrect (0)
+        gt_binary = 1
+        pred_binary = 1 if is_partial else 0
 
-    if ground_truth == ai_answer:
-        exact_matches += 1
-        is_exact = True
-        is_partial = True
-    elif ground_truth in ai_answer:
-        partial_matches += 1
-        is_partial = True
+    y_true.append(gt_binary)
+    y_pred.append(pred_binary)
 
-    # Log it
+    # Log individual test result
     print(f"Test {index + 1}/{total_tests}")
     print(f"Image:  {image_path}")
     print(f"Q:      {question}")
@@ -138,33 +147,60 @@ for index, item in enumerate(eval_data):
     torch.cuda.empty_cache()
 
 # ==========================================
-# 5. CALCULATE FINAL SCORES
+# 5. CALCULATE STATISTICAL & ACADEMIC METRICS
 # ==========================================
 avg_inference = total_inference_time / total_tests if total_tests > 0 else 0
-exact_accuracy = (exact_matches / total_tests) * 100 if total_tests > 0 else 0
-partial_accuracy = ((exact_matches + partial_matches) / total_tests) * 100 if total_tests > 0 else 0
 
-print("\n==========================================")
-print("       BASELINE EVALUATION RESULTS        ")
-print("==========================================")
-print(f"Total Tests Run:    {total_tests}")
-print(f"Exact Match Acc:    {exact_accuracy:.1f}%")
-print(f"Partial Match Acc:  {partial_accuracy:.1f}%")
-print(f"Avg Inference Time: {avg_inference:.2f} seconds")
-print("==========================================")
+# Compute sklearn classification report & confusion matrix
+report_dict = classification_report(
+    y_true, 
+    y_pred, 
+    target_names=["Negative / Fail (0)", "Positive / Pass (1)"], 
+    output_dict=True,
+    zero_division=0
+)
+df_report = pd.DataFrame(report_dict).transpose()
 
-# Save the final report for your faculty
-report = {
+conf_matrix = confusion_matrix(y_true, y_pred, labels=[0, 1])
+tn, fp, fn, tp = conf_matrix.ravel() if conf_matrix.size == 4 else (0, 0, 0, 0)
+
+# ==========================================
+# 6. OUTPUT SUMMARY TABLES
+# ==========================================
+print("\n" + "=" * 65)
+print("             A.R.G.U.S. ACADEMIC EVALUATION TABLE           ")
+print("=" * 65)
+print(df_report.round(3).to_string())
+
+print("\n" + "=" * 65)
+print("                      CONFUSION MATRIX                      ")
+print("=" * 65)
+print(f" True Negatives  (TN): {tn:<5} | False Positives (FP): {fp:<5}")
+print(f" False Negatives (FN): {fn:<5} | True Positives  (TP): {tp:<5}")
+print("-" * 65)
+print(f" Average Inference Latency: {avg_inference:.2f} seconds / sample")
+print("=" * 65)
+
+# Save JSON and CSV reports for presentation/paper insertion
+report_summary = {
     "metrics": {
         "total_tests": total_tests,
-        "exact_match_accuracy": exact_accuracy,
-        "partial_match_accuracy": partial_accuracy,
-        "average_inference_time_sec": round(avg_inference, 2)
+        "average_inference_time_sec": round(avg_inference, 2),
+        "accuracy": round(report_dict["accuracy"], 3),
+        "confusion_matrix": {
+            "true_negatives": int(tn),
+            "false_positives": int(fp),
+            "false_negatives": int(fn),
+            "true_positives": int(tp)
+        }
     },
+    "classification_report": report_dict,
     "detailed_results": results_log
 }
 
 with open("baseline_report.json", "w") as f:
-    json.dump(report, f, indent=4)
-    
-print("\n[SYSTEM] Full evaluation report saved to 'baseline_report.json'")
+    json.dump(report_summary, f, indent=4)
+
+df_report.to_csv("baseline_metrics_table.csv")
+
+print("\n[SYSTEM] Reports successfully exported to 'baseline_report.json' and 'baseline_metrics_table.csv'")
