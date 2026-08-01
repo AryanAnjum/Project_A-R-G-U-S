@@ -45,3 +45,4 @@ pip install edge-tts pygame
 pip install qwen-vl-utils
 
 .\venv\Scripts\python.exe -m pip install scikit-learn pandas
+.\venv\Scripts\python.exe -m pip install datasets
