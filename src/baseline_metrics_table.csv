@@ -1,6 +1,0 @@
-,precision,recall,f1-score,support
-Negative / Fail (0),0.0,0.0,0.0,0.0
-Positive / Pass (1),1.0,0.8,0.8888888888888888,10.0
-accuracy,0.8,0.8,0.8,0.8
-macro avg,0.5,0.4,0.4444444444444444,10.0
-weighted avg,1.0,0.8,0.888888888888889,10.0
