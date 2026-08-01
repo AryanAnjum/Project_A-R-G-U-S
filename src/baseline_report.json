@@ -1,9 +1,41 @@
 {
     "metrics": {
         "total_tests": 10,
-        "exact_match_accuracy": 0.0,
-        "partial_match_accuracy": 80.0,
-        "average_inference_time_sec": 0.91
+        "average_inference_time_sec": 1.03,
+        "accuracy": 0.8,
+        "confusion_matrix": {
+            "true_negatives": 0,
+            "false_positives": 0,
+            "false_negatives": 2,
+            "true_positives": 8
+        }
+    },
+    "classification_report": {
+        "Negative / Fail (0)": {
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1-score": 0.0,
+            "support": 0.0
+        },
+        "Positive / Pass (1)": {
+            "precision": 1.0,
+            "recall": 0.8,
+            "f1-score": 0.8888888888888888,
+            "support": 10.0
+        },
+        "accuracy": 0.8,
+        "macro avg": {
+            "precision": 0.5,
+            "recall": 0.4,
+            "f1-score": 0.4444444444444444,
+            "support": 10.0
+        },
+        "weighted avg": {
+            "precision": 1.0,
+            "recall": 0.8,
+            "f1-score": 0.888888888888889,
+            "support": 10.0
+        }
     },
     "detailed_results": [
         {
@@ -12,7 +44,7 @@
             "question": "What kind of animal is this?",
             "ground_truth": "rabbit",
             "ai_answer": "this is a white rabbit.",
-            "inference_time_sec": 0.96,
+            "inference_time_sec": 1.09,
             "exact_match": false,
             "partial_match": true
         },
@@ -22,7 +54,7 @@
             "question": "How many cats are there?",
             "ground_truth": "two",
             "ai_answer": "there are two cats in the picture.",
-            "inference_time_sec": 0.54,
+            "inference_time_sec": 0.53,
             "exact_match": false,
             "partial_match": true
         },
@@ -32,7 +64,7 @@
             "question": "What is written on the board?",
             "ground_truth": "staff meeting 3pm",
             "ai_answer": "the board has the words staff meeting 3pm written on it.",
-            "inference_time_sec": 0.82,
+            "inference_time_sec": 0.84,
             "exact_match": false,
             "partial_match": true
         },
@@ -42,7 +74,7 @@
             "question": "What is the person in this image doing?",
             "ground_truth": "making tea",
             "ai_answer": "the person in the image is pouring milk into a pot.",
-            "inference_time_sec": 0.58,
+            "inference_time_sec": 0.63,
             "exact_match": false,
             "partial_match": false
         },
@@ -52,7 +84,7 @@
             "question": "What color is the shirt the person is wearing?",
             "ground_truth": "red",
             "ai_answer": "the person is wearing a red shirt.",
-            "inference_time_sec": 0.44,
+            "inference_time_sec": 0.45,
             "exact_match": false,
             "partial_match": true
         },
@@ -62,7 +94,7 @@
             "question": "What object is sitting directly to the left of the computer monitor?",
             "ground_truth": "coffee mug",
             "ai_answer": "a mug is sitting directly to the left of the computer monitor.",
-            "inference_time_sec": 2.7,
+            "inference_time_sec": 3.22,
             "exact_match": false,
             "partial_match": false
         },
@@ -72,7 +104,7 @@
             "question": "Is it raining in this scene?",
             "ground_truth": "yes",
             "ai_answer": "yes, it is raining in this scene.",
-            "inference_time_sec": 0.51,
+            "inference_time_sec": 0.57,
             "exact_match": false,
             "partial_match": true
         },
@@ -92,7 +124,7 @@
             "question": "How many people are visible in the background?",
             "ground_truth": "five",
             "ai_answer": "there are five people visible in the background.",
-            "inference_time_sec": 1.4,
+            "inference_time_sec": 1.72,
             "exact_match": false,
             "partial_match": true
         },
@@ -102,7 +134,7 @@
             "question": "Is the cat an adult or a small kitten?",
             "ground_truth": "small kitten",
             "ai_answer": "the cat in the picture is a small kitten.",
-            "inference_time_sec": 0.51,
+            "inference_time_sec": 0.56,
             "exact_match": false,
             "partial_match": true
         }

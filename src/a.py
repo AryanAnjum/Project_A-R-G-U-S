@@ -38,7 +38,7 @@ model = Qwen2VLForConditionalGeneration.from_pretrained(
 print("[SYSTEM] Connecting to Hugging Face Cloud...")
 # We use streaming=True so it doesn't download gigabytes to your hard drive!
 # We use the 'adversarial' subset of POPE which is the hardest test for the AI.
-dataset = load_dataset("lmms-lab/POPE", name="adversarial", split="test", streaming=True)
+dataset = load_dataset("lmms-lab/POPE", name="Full", split="adversarial", streaming=True)
 
 # Define how many samples you want to test today (e.g., 500 for a solid evaluation graph)
 TARGET_EVAL_COUNT = 500 
