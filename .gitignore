@@ -225,11 +225,8 @@ __marimo__/
 # ==========================================
 
 # Ignore the large video datasets & local buffers
-videos/
 data/
 *.wav
-*.mp3
-*.mp4
 *.avi
 
 # AI Model Weights (CRITICAL: Do not commit these)
