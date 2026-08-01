@@ -43,3 +43,5 @@ pip install pyttsx3
 pip install transformers==4.56.1 einops accelerate
 pip install edge-tts pygame
 pip install qwen-vl-utils
+
+.\venv\Scripts\python.exe -m pip install scikit-learn pandas
