@@ -12,7 +12,7 @@
     {
         "image_path": "./videos/test_frame_3.jpg",
         "question": "What is written on the board?",
-        "ground_truth": "motorola wildlife"
+        "ground_truth": "staff meeting 3pm"
     },
     {
         "image_path": "./videos/test_frame_4_action.jpg",
@@ -32,7 +32,7 @@
     {
         "image_path": "./videos/test_frame_7_boolean.jpg",
         "question": "Is it raining in this scene?",
-        "ground_truth": "no"
+        "ground_truth": "yes"
     },
     {
         "image_path": "./videos/test_frame_8_ocr_complex.jpg",
@@ -42,7 +42,7 @@
     {
         "image_path": "./videos/test_frame_9_counting.jpg",
         "question": "How many people are visible in the background?",
-        "ground_truth": "three"
+        "ground_truth": "four"
     },
     {
         "image_path": "./videos/test_frame_10_detail.jpg",
