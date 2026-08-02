@@ -47,3 +47,5 @@ pip install qwen-vl-utils
 .\venv\Scripts\python.exe -m pip install scikit-learn pandas
 .\venv\Scripts\python.exe -m pip install datasets
 & "f:\Project CSE499\Project_A-R-G-U-S\venv\Scripts\python.exe" -m pip install peft accelerate
+pip install uvicorn websockets
+pip install fastapi
