@@ -1,8 +1,7 @@
 import torch
 import os
 import time
-import glob
-from datasets import load_dataset, Dataset
+from datasets import load_dataset
 from transformers import (
     Qwen2VLForConditionalGeneration, 
     AutoProcessor, 
@@ -16,97 +15,76 @@ from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
 from qwen_vl_utils import process_vision_info
 
 # ==========================================
-# CONFIGURATION & PATHS
+# 1. 100GB CONFIGURATION
 # ==========================================
-LOCAL_DATASET_DIR = "./LLaVA-OneVision-Data"  # Path to your manually downloaded dataset folder
-OUTPUT_DIR = "./qwen2-vl-argus-checkpoints"    # Directory where checkpoints will be saved
-MAX_SAMPLES = 10000                           # Number of samples to train on
-SAVE_EVERY_STEPS = 100                        # Save a checkpoint every N steps
+LOCAL_DATASET_DIR = "../LLaVA-OneVision-Data" 
+OUTPUT_DIR = "./qwen2-vl-argus-100gb-checkpoints"
+DATASET_CONFIG = "sharegpt4v(llava)"
 
-print("\n[SYSTEM] Booting QLoRA Training Pipeline for A.R.G.U.S...")
+# 100GB is roughly 350,000 samples. 
+MAX_SAMPLES = 350000       
+
+# Save a checkpoint every 1,000 steps (roughly every ~45 mins)
+SAVE_EVERY_STEPS = 1000    
+
+print("\n[SYSTEM] Booting 100GB Production QLoRA Pipeline...")
 
 # ==========================================
-# 1. CHECKPOINT RESUME DETECTOR
+# 2. CHECKPOINT RESUME DETECTOR
 # ==========================================
 last_checkpoint = None
 if os.path.exists(OUTPUT_DIR):
     last_checkpoint = get_last_checkpoint(OUTPUT_DIR)
     if last_checkpoint is not None:
         print("=" * 65)
-        print(f"🔄 [RESUME DETECTED] Found existing checkpoint:")
-        print(f"   -> {last_checkpoint}")
-        print("   Training will resume seamlessly from this step!")
+        print(f"🔄 [RESUME DETECTED] Resuming 100GB run from: {last_checkpoint}")
         print("=" * 65)
-    else:
-        print("[SYSTEM] Output folder exists, but no previous checkpoint was found. Starting fresh.")
-else:
-    print("[SYSTEM] No existing checkpoint directory found. Starting new training run.")
-
 
 # ==========================================
-# 2. LOCAL DATASET PARSER
+# 3. INDUSTRIAL DATASET PROCESSING (.map)
 # ==========================================
-def prepare_llava_sample(sample):
-    """Formats raw dataset items into Qwen2-VL conversational structure."""
-    try:
-        if "image" not in sample or sample["image"] is None:
-            return None
-        
-        conversations = sample["conversations"]
-        user_text = conversations[0]["value"].replace("<image>\n", "").replace("\n<image>", "").strip()
-        assistant_text = conversations[1]["value"].strip()
-        
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": sample["image"]},
-                    {"type": "text", "text": f"You are A.R.G.U.S., a highly observant AI. Answer concisely.\n\nQuestion: {user_text}"}
-                ]
-            },
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "text", "text": assistant_text}
-                ]
-            }
-        ]
-        return {"messages": messages}
-    except Exception:
-        return None
+# We use separate functions so Hugging Face can process the 100GB on the hard drive
+# without loading it all into your System RAM.
+def filter_invalid(sample):
+    return "image" in sample and sample["image"] is not None
 
-print(f"\n[SYSTEM] Loading local dataset from: {LOCAL_DATASET_DIR}...")
+def format_sample(sample):
+    conversations = sample["conversations"]
+    user_text = conversations[0]["value"].replace("<image>\n", "").replace("\n<image>", "").strip()
+    assistant_text = conversations[1]["value"].strip()
+    
+    messages = [
+        {
+            "role": "user",
+            "content": [
+                {"type": "image", "image": sample["image"]},
+                {"type": "text", "text": f"You are A.R.G.U.S., a highly observant AI. Answer concisely.\n\nQuestion: {user_text}"}
+            ]
+        },
+        {
+            "role": "assistant",
+            "content": [{"type": "text", "text": assistant_text}]
+        }
+    ]
+    return {"messages": messages}
 
-# Support loading from local folder or arrow/parquet files
-if os.path.exists(LOCAL_DATASET_DIR):
-    raw_dataset = load_dataset(LOCAL_DATASET_DIR, split="train")
-else:
-    print(f"[WARNING] Local path '{LOCAL_DATASET_DIR}' not found! Falling back to cached HuggingFace dataset...")
-    raw_dataset = load_dataset("lmms-lab/LLaVA-OneVision-Data", split="train")
+print(f"\n[SYSTEM] Accessing Local 600GB Repository...")
+raw_dataset = load_dataset(LOCAL_DATASET_DIR, DATASET_CONFIG, split="train")
 
-processed_dataset = []
-print("[SYSTEM] Pre-processing samples into Qwen format...")
+print(f"[SYSTEM] Slicing out {MAX_SAMPLES} samples (~100GB)...")
+sliced_dataset = raw_dataset.select(range(min(MAX_SAMPLES, len(raw_dataset))))
 
-for i, sample in enumerate(raw_dataset):
-    formatted = prepare_llava_sample(sample)
-    if formatted is not None:
-        processed_dataset.append(formatted)
-        
-    if len(processed_dataset) % 1000 == 0 and len(processed_dataset) > 0:
-        print(f"   -> Processed {len(processed_dataset)} / {MAX_SAMPLES} samples...")
-        
-    if len(processed_dataset) >= MAX_SAMPLES:
-        break
+print("[SYSTEM] Filtering and formatting data directly on disk (This takes a few minutes)...")
+# .filter and .map write cached files to disk, saving your System RAM
+valid_dataset = sliced_dataset.filter(filter_invalid)
+train_dataset = valid_dataset.map(format_sample, remove_columns=valid_dataset.column_names)
 
-train_dataset = Dataset.from_list(processed_dataset)
-print(f"[SYSTEM] Dataset locked with {len(train_dataset)} training samples.")
-
+print(f"[SYSTEM] 100GB Dataset locked! Final training size: {len(train_dataset)} samples.")
 
 # ==========================================
-# 3. REAL-TIME PROGRESS & ETA CALLBACK
+# 4. REAL-TIME PROGRESS TRACKER
 # ==========================================
 class ProgressTrackerCallback(TrainerCallback):
-    """Calculates exact elapsed time, ETA, and sample count."""
     def __init__(self, total_samples, batch_size, grad_accum):
         self.start_time = None
         self.total_samples = total_samples
@@ -120,23 +98,20 @@ class ProgressTrackerCallback(TrainerCallback):
             elapsed = time.time() - self.start_time
             current_sample = min(state.global_step * self.effective_batch, self.total_samples)
             
-            # Estimate remaining time
             samples_per_sec = current_sample / max(elapsed, 1.0)
             remaining_samples = max(0, self.total_samples - current_sample)
             eta_sec = remaining_samples / max(samples_per_sec, 0.001)
 
-            # Format times
             elapsed_str = time.strftime("%Hh:%Mm:%Ss", time.gmtime(elapsed))
             eta_str = time.strftime("%Hh:%Mm:%Ss", time.gmtime(eta_sec))
 
             print(f"📍 [PROGRESS] Step {state.global_step}/{state.max_steps} "
                   f"| Image ~{current_sample}/{self.total_samples} "
                   f"| Elapsed: {elapsed_str} "
-                  f"| ETA Remaining: {eta_str}")
-
+                  f"| ETA: {eta_str}")
 
 # ==========================================
-# 4. DATA COLLATOR FOR QWEN2-VL
+# 5. DATA COLLATOR
 # ==========================================
 class Qwen2VLDataCollator:
     def __init__(self, processor):
@@ -168,9 +143,8 @@ class Qwen2VLDataCollator:
         
         return batch
 
-
 # ==========================================
-# 5. MODEL & QUANTIZATION SETUP (4-BIT)
+# 6. MODEL & LORA INJECTION
 # ==========================================
 print("\n[SYSTEM] Loading 4-bit Quantized Qwen2-VL Model...")
 
@@ -204,11 +178,9 @@ peft_config = LoraConfig(
 )
 
 model = get_peft_model(model, peft_config)
-model.print_trainable_parameters()
-
 
 # ==========================================
-# 6. TRAINING ARGUMENTS & EXECUTION
+# 7. 100GB TRAINING EXECUTION
 # ==========================================
 batch_size = 2
 grad_accum = 4
@@ -220,12 +192,10 @@ training_args = TrainingArguments(
     gradient_accumulation_steps=grad_accum,
     learning_rate=2e-4,
     
-    # Checkpoint settings
     save_strategy="steps",
     save_steps=SAVE_EVERY_STEPS,
-    save_total_limit=3,                # Keeps the 3 latest checkpoints to save disk space
+    save_total_limit=3,                
     
-    # Logging settings
     logging_steps=10,
     optim="paged_adamw_8bit",
     bf16=True,
@@ -242,10 +212,7 @@ trainer = Trainer(
     callbacks=[ProgressTrackerCallback(len(train_dataset), batch_size, grad_accum)]
 )
 
-print("\n🔥 [SYSTEM] LAUNCHING TRAINING ENGINE 🔥")
-if last_checkpoint:
-    print(f"[SYSTEM] Resuming directly from checkpoint: {last_checkpoint}")
-
+print("\n🔥 [SYSTEM] LAUNCHING MASSIVE TRAINING ENGINE 🔥")
 trainer.train(resume_from_checkpoint=last_checkpoint)
 
 # Save final adapter model
@@ -254,5 +221,5 @@ trainer.model.save_pretrained(final_adapter_dir)
 processor.save_pretrained(final_adapter_dir)
 
 print("\n" + "=" * 65)
-print(f"🎉 [TRAINING COMPLETE] Final LoRA adapter saved to:\n   -> {final_adapter_dir}")
+print(f"🎉 [100GB TRAINING COMPLETE] Final LoRA adapter saved to:\n   -> {final_adapter_dir}")
 print("=" * 65)
