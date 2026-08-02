@@ -1,17 +1,19 @@
 import torch
 import os
 import time
+import copy
+import io
+from PIL import Image
 from datasets import load_dataset
 from transformers import (
     Qwen2VLForConditionalGeneration, 
     AutoProcessor, 
-    BitsAndBytesConfig, 
     TrainingArguments, 
     Trainer,
     TrainerCallback
 )
 from transformers.trainer_utils import get_last_checkpoint
-from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
+from peft import LoraConfig, get_peft_model
 from qwen_vl_utils import process_vision_info
 
 # ==========================================
@@ -19,15 +21,15 @@ from qwen_vl_utils import process_vision_info
 # ==========================================
 LOCAL_DATASET_DIR = "../LLaVA-OneVision-Data" 
 OUTPUT_DIR = "./qwen2-vl-argus-100gb-checkpoints"
-DATASET_CONFIG = "sharegpt4v(llava)"
+
+# THE CHANGE: Pointing to the massive subset you downloaded
+DATASET_CONFIG = "sharegpt4o"
 
 # 100GB is roughly 350,000 samples. 
 MAX_SAMPLES = 350000       
-
-# Save a checkpoint every 1,000 steps (roughly every ~45 mins)
 SAVE_EVERY_STEPS = 1000    
 
-print("\n[SYSTEM] Booting 100GB Production QLoRA Pipeline...")
+print(f"\n[SYSTEM] Booting 100GB Production LoRA Pipeline (Target: {DATASET_CONFIG})...")
 
 # ==========================================
 # 2. CHECKPOINT RESUME DETECTOR
@@ -43,8 +45,6 @@ if os.path.exists(OUTPUT_DIR):
 # ==========================================
 # 3. INDUSTRIAL DATASET PROCESSING (.map)
 # ==========================================
-# We use separate functions so Hugging Face can process the 100GB on the hard drive
-# without loading it all into your System RAM.
 def filter_invalid(sample):
     return "image" in sample and sample["image"] is not None
 
@@ -57,7 +57,7 @@ def format_sample(sample):
         {
             "role": "user",
             "content": [
-                {"type": "image", "image": sample["image"]},
+                {"type": "image", "image": "<PLACEHOLDER>"},
                 {"type": "text", "text": f"You are A.R.G.U.S., a highly observant AI. Answer concisely.\n\nQuestion: {user_text}"}
             ]
         },
@@ -75,9 +75,11 @@ print(f"[SYSTEM] Slicing out {MAX_SAMPLES} samples (~100GB)...")
 sliced_dataset = raw_dataset.select(range(min(MAX_SAMPLES, len(raw_dataset))))
 
 print("[SYSTEM] Filtering and formatting data directly on disk (This takes a few minutes)...")
-# .filter and .map write cached files to disk, saving your System RAM
+
 valid_dataset = sliced_dataset.filter(filter_invalid)
-train_dataset = valid_dataset.map(format_sample, remove_columns=valid_dataset.column_names)
+
+columns_to_remove = [col for col in valid_dataset.column_names if col != "image"]
+train_dataset = valid_dataset.map(format_sample, remove_columns=columns_to_remove)
 
 print(f"[SYSTEM] 100GB Dataset locked! Final training size: {len(train_dataset)} samples.")
 
@@ -111,7 +113,7 @@ class ProgressTrackerCallback(TrainerCallback):
                   f"| ETA: {eta_str}")
 
 # ==========================================
-# 5. DATA COLLATOR
+# 5. DATA COLLATOR (BULLETPROOF PARQUET HANDLER)
 # ==========================================
 class Qwen2VLDataCollator:
     def __init__(self, processor):
@@ -122,7 +124,23 @@ class Qwen2VLDataCollator:
         image_inputs = []
         
         for feature in features:
-            messages = feature["messages"]
+            raw_img = feature["image"]
+            if isinstance(raw_img, dict):
+                if "bytes" in raw_img and raw_img["bytes"]:
+                    pil_img = Image.open(io.BytesIO(raw_img["bytes"])).convert("RGB")
+                elif "path" in raw_img and raw_img["path"]:
+                    pil_img = Image.open(raw_img["path"]).convert("RGB")
+            else:
+                pil_img = raw_img.convert("RGB")
+
+            messages = copy.deepcopy(feature["messages"])
+            
+            for msg in messages:
+                if "content" in msg:
+                    for item in msg["content"]:
+                        if item.get("type") == "image":
+                            item["image"] = pil_img
+
             text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=False)
             texts.append(text)
             
@@ -144,29 +162,25 @@ class Qwen2VLDataCollator:
         return batch
 
 # ==========================================
-# 6. MODEL & LORA INJECTION
+# 6. MODEL & LORA INJECTION (NATIVE 16-BIT)
 # ==========================================
-print("\n[SYSTEM] Loading 4-bit Quantized Qwen2-VL Model...")
+print("\n[SYSTEM] Loading Qwen2-VL Model in Native bfloat16...")
 
 processor = AutoProcessor.from_pretrained(
     "Qwen/Qwen2-VL-2B-Instruct", 
     min_pixels=256*28*28, 
-    max_pixels=1024*28*28 
-)
-
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.bfloat16
+    # Resolution cap to protect your 16GB VRAM from 4K image spikes
+    max_pixels=768*28*28 
 )
 
 model = Qwen2VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2-VL-2B-Instruct",
-    quantization_config=bnb_config,
+    torch_dtype=torch.bfloat16,
     device_map="cuda"
 )
-model = prepare_model_for_kbit_training(model)
+
+# Enable gradient checkpointing in the base model for 50% VRAM savings
+model.enable_input_require_grads()
 
 peft_config = LoraConfig(
     r=16,
@@ -180,10 +194,11 @@ peft_config = LoraConfig(
 model = get_peft_model(model, peft_config)
 
 # ==========================================
-# 7. 100GB TRAINING EXECUTION
+# 7. 100GB TRAINING EXECUTION (MEMORY OPTIMIZED)
 # ==========================================
-batch_size = 2
-grad_accum = 4
+# Micro-batching setup: 1 image in VRAM at a time, but calculates 8 before updating
+batch_size = 1  
+grad_accum = 8  
 
 training_args = TrainingArguments(
     output_dir=OUTPUT_DIR,
@@ -192,13 +207,18 @@ training_args = TrainingArguments(
     gradient_accumulation_steps=grad_accum,
     learning_rate=2e-4,
     
+    # --- MEMORY SAVING MAGIC ---
+    gradient_checkpointing=True,
+    gradient_checkpointing_kwargs={"use_reentrant": False},
+    # ---------------------------
+    
     save_strategy="steps",
     save_steps=SAVE_EVERY_STEPS,
     save_total_limit=3,                
     
     logging_steps=10,
-    optim="paged_adamw_8bit",
-    bf16=True,
+    optim="adamw_torch",           
+    bf16=True,                     
     fp16=False,
     remove_unused_columns=False,
     report_to="none"
