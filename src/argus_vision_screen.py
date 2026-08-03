@@ -22,13 +22,6 @@ from transformers import Qwen2VLForConditionalGeneration, AutoProcessor
 from qwen_vl_utils import process_vision_info
 from faster_whisper import WhisperModel
 
-MODEL_SIZE = "large-v3"
-whisper_model = WhisperModel(
-    MODEL_SIZE, 
-    device="cuda", 
-    compute_type="int8" 
-)
-
 try:
     import winsound
 except ImportError:
@@ -145,8 +138,12 @@ def process_prompt(user_spoken_prompt):
         rgb_frame = cv2.cvtColor(current_cv2_frame, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_frame)
 
-        print(f"[QWEN-VL] Scanning live desktop frame for prompt: '{user_spoken_prompt}'")
+        # === SPEED OPTIMIZATION FIX ===
+        pil_image.thumbnail((960, 960)) 
         
+        print(f"[QWEN-VL] Scanning optimized desktop frame for prompt: '{user_spoken_prompt}'")
+        
+        # --- RESTORED AI GENERATION LOGIC ---
         memory_context = ""
         if len(conversation_memory) > 0:
             memory_context = "Recent conversation context:\n"
