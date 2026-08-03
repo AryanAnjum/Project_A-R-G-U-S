@@ -143,28 +143,29 @@ def process_prompt(user_spoken_prompt):
         
         print(f"[QWEN-VL] Scanning optimized desktop frame for prompt: '{user_spoken_prompt}'")
         
-        # --- RESTORED AI GENERATION LOGIC ---
-        memory_context = ""
-        if len(conversation_memory) > 0:
-            memory_context = "Recent conversation context:\n"
-            for past_q, past_a in conversation_memory:
-                memory_context += f"User: {past_q}\nYou: {past_a}\n"
-        
+        # --- FIX: PREVENTING THE "REPEATING ANSWER" LOOP ---
         system_prompt = (
             "You are A.R.G.U.S., a highly observant and friendly AI companion. "
-            "Look very closely at the fine details and text in the image of the user's screen. "
+            "Look very closely at the fine details in the image. "
             "Answer the user's question naturally and conversationally in one or two short sentences."
         )
         
-        messages = [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "image": pil_image},
-                    {"type": "text", "text": f"{system_prompt}\n\n{memory_context}\nQuestion: {user_spoken_prompt}"}
-                ]
-            }
-        ]
+        # We must use the exact ChatML format, otherwise the AI gets confused and repeats itself!
+        messages = []
+        
+        # 1. Load past memory as actual conversation turns, NOT as a giant text block
+        for past_q, past_a in conversation_memory:
+            messages.append({"role": "user", "content": [{"type": "text", "text": past_q}]})
+            messages.append({"role": "assistant", "content": [{"type": "text", "text": past_a}]})
+        
+        # 2. Add the current question with the live image
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil_image},
+                {"type": "text", "text": f"{system_prompt}\n\nQuestion: {user_spoken_prompt}"}
+            ]
+        })
         
         text = spatial_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
@@ -177,7 +178,14 @@ def process_prompt(user_spoken_prompt):
             return_tensors="pt"
         ).to("cuda")
         
-        generated_ids = spatial_model.generate(**inputs, max_new_tokens=60, temperature=0.3, do_sample=True)
+        # Added repetition_penalty to mathematically force it to stop looping
+        generated_ids = spatial_model.generate(
+            **inputs, 
+            max_new_tokens=60, 
+            temperature=0.3, 
+            repetition_penalty=1.1, 
+            do_sample=True
+        )
         
         generated_ids_trimmed = [
             out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
