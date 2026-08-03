@@ -78,7 +78,7 @@
         .msg-sender { font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan); margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
         .msg-user .msg-sender { color: #a5b4fc; }
         
-        /* New styling for the bottom console strictly inside the middle column */
+        /* Console inside the middle column */
         .bottom-console { height: 64px; flex-shrink: 0; background: rgba(13, 19, 32, 0.85); backdrop-filter: blur(20px); border: 1px solid var(--border-glass-bright); border-radius: 16px; display: flex; align-items: center; justify-content: space-between; padding: 0 12px 0 20px; width: 100%; }
         
         .wakeword-toggle-group { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-glass); }
@@ -133,7 +133,7 @@
             </div>
         </div>
 
-        <!-- CENTER COLUMN (Now contains the input bar) -->
+        <!-- CENTER COLUMN -->
         <div class="center-column">
             <div class="glass-panel feed-container">
                 <canvas id="cameraFeedCanvas"></canvas>
@@ -160,7 +160,7 @@
                 <div class="core-status-text" id="ttsStateTag">Awaiting Multimodal Input</div>
             </div>
 
-            <!-- PROMPT CONSOLE is now securely locked inside the center column -->
+            <!-- PROMPT CONSOLE is firmly inside the center column -->
             <div class="bottom-console" id="bottomConsole">
                 <div class="wakeword-toggle-group active">
                     <div class="radar-dot"></div>
@@ -194,6 +194,7 @@
         let socket = null;
         let activeMode = 'screen'; 
         let audioEnergy = 0.2;
+        let isSpeaking = false; // <-- The new variable tracking speech animation
         let backendScreenImg = new Image();
 
         function connectWebSocket() {
@@ -347,6 +348,9 @@
 
             const typeBody = msg.querySelector('.type-body');
             let index = 0;
+            
+            // Turn the animation ON
+            isSpeaking = true;
             document.getElementById('ttsStateTag').innerText = "SPEAKING";
             document.getElementById('ttsStateTag').style.color = "var(--accent-cyan)";
             
@@ -355,10 +359,13 @@
                 index++;
                 chatBox.scrollTop = chatBox.scrollHeight;
                 audioEnergy = 0.4 + Math.random() * 0.5; 
+                
                 if (index >= fullText.length) {
                     clearInterval(interval);
                     setTimeout(() => {
+                        // Turn the animation OFF
                         audioEnergy = 0.2;
+                        isSpeaking = false; 
                         document.getElementById('ttsStateTag').innerText = "IDLE";
                         document.getElementById('ttsStateTag').style.color = "var(--text-dim)";
                     }, 800);
@@ -390,8 +397,13 @@
         function drawArgusCore() {
             const w = coreCanvas.width, h = coreCanvas.height, centerX = w / 2, centerY = h / 2;
             coreCtx.clearRect(0, 0, w, h);
-            coreAngle += 0.015;
-            const pulse = Math.sin(Date.now() * 0.003) * 0.1 + audioEnergy;
+            
+            // ANIMATION LOGIC: Only spin and pulse if A.R.G.U.S. is speaking
+            let pulse = 0.2; // Default frozen size
+            if (isSpeaking) {
+                coreAngle += 0.025; // Spin speed
+                pulse = Math.sin(Date.now() * 0.005) * 0.1 + audioEnergy; // Dynamic pulsing
+            }
 
             const glowGrad = coreCtx.createRadialGradient(centerX, centerY, 10, centerX, centerY, 110 * pulse);
             glowGrad.addColorStop(0, 'rgba(0, 240, 255, 0.35)'); glowGrad.addColorStop(0.5, 'rgba(99, 102, 241, 0.12)'); glowGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
