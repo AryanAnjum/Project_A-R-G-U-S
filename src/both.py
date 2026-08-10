@@ -111,10 +111,55 @@ spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
 print("[SYSTEM] Loading Audio Brain (Whisper)...")
 audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if device == "cuda" else "int8")
 
-print("[SYSTEM] Initializing DXcam Desktop Optical Sensors...")
-dxcam_camera = dxcam.create(output_color="BGR")
+print("[SYSTEM] Initializing Desktop Optical Sensors...")
+
+# We will try DXCam first. If Windows blocks it, we instantly fall back to MSS.
+try:
+    import dxcam
+    dxcam_camera = dxcam.create(output_color="BGR")
+    if dxcam_camera is not None:
+        dxcam_camera.start(target_fps=30)
+        print("[SYSTEM] DXCam initialized successfully.")
+    else:
+        raise Exception("DXCam returned None")
+except Exception as e:
+    print("[WARNING] DXGI Capture unsupported on this hardware routing.")
+    print("[SYSTEM] Engaging MSS Universal Capture Fallback...")
+    
+    import mss
+    import numpy as np
+    
+    # We create a custom class that behaves EXACTLY like DXCam so we 
+    # don't have to rewrite any other parts of your A.R.G.U.S. code!
+    class UniversalCamera:
+        def __init__(self):
+            self.sct = mss.mss()
+            self.monitor = self.sct.monitors[1] # Capture primary monitor
+            
+        def start(self, target_fps=30):
+            pass # MSS captures on-demand, no background thread needed
+            
+        def get_latest_frame(self):
+            sct_img = self.sct.grab(self.monitor)
+            # Convert raw BGRA pixels to BGR for OpenCV/Qwen
+            return np.array(sct_img)[:, :, :3]
+            
+    dxcam_camera = UniversalCamera()
+except Exception as e:
+    print(f"[WARNING] Default DXCam adapter failed (Hybrid GPU detected). Switching to Secondary Adapter...")
+    try:
+        # Attempt 2: Try the secondary GPU adapter (Fix for most laptops)
+        dxcam_camera = dxcam.create(device_idx=1, output_color="BGR")
+    except Exception as e2:
+        print(f"[WARNING] Secondary adapter failed. Trying alternate display output...")
+        # Attempt 3: Try alternate monitor output
+        dxcam_camera = dxcam.create(device_idx=0, output_idx=1, output_color="BGR")
+
 # --- Start DXCam continuously so we can stream it to HTML ---
-dxcam_camera.start(target_fps=30) 
+if dxcam_camera is not None:
+    dxcam_camera.start(target_fps=30)
+else:
+    print("[ERROR] DXCam could not hook into any display adapter!")
 
 
 # ==========================================
