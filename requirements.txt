@@ -50,3 +50,4 @@ pip install qwen-vl-utils
 pip install uvicorn websockets
 pip install fastapi
 pip install dxcam opencv-python
+pip install scikit-learn seaborn matplotlib peft
