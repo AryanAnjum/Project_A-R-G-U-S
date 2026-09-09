@@ -1,0 +1,510 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ARGUS // Multimodal Edge AI Engine</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">  
+    <style>
+        :root {
+            --bg-base: #06080e; --bg-surface: rgba(13, 19, 32, 0.65);
+            --border-glass: rgba(255, 255, 255, 0.08); --border-glass-bright: rgba(0, 240, 255, 0.3);
+            --accent-cyan: #00f0ff; --accent-indigo: #6366f1; --accent-emerald: #10b981;
+            --accent-rose: #f43f5e; --accent-amber: #f59e0b;
+            --text-main: #f8fafc; --text-muted: #94a3b8; --text-dim: #64748b;
+            --font-sans: 'Inter', sans-serif; --font-mono: 'JetBrains Mono', monospace;
+        }
+        * { box-sizing: border-box; margin: 0; padding: 0; user-select: none; }
+        
+        body { 
+            background-color: var(--bg-base); 
+            background-image: radial-gradient(circle at 15% 15%, rgba(99, 102, 241, 0.12) 0%, transparent 40%), radial-gradient(circle at 85% 85%, rgba(0, 240, 255, 0.08) 0%, transparent 40%); 
+            color: var(--text-main); 
+            font-family: var(--font-sans); 
+            height: 100vh; 
+            overflow: hidden; 
+            display: flex; 
+            flex-direction: column; 
+        }
+        
+        .glass-panel { background: var(--bg-surface); backdrop-filter: blur(16px); border: 1px solid var(--border-glass); border-radius: 16px; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.4); position: relative; overflow: hidden; transition: border-color 0.3s ease; }
+        
+        header { height: auto; min-height: 64px; padding: 12px 24px; display: flex; align-items: center; justify-content: space-between; border-bottom: 1px solid var(--border-glass); background: rgba(6, 8, 14, 0.8); backdrop-filter: blur(12px); z-index: 100; flex-wrap: wrap; gap: 12px; }
+        .logo-group { display: flex; align-items: center; gap: 12px; }
+        .logo-icon { width: 36px; height: 36px; background: linear-gradient(135deg, var(--accent-cyan), var(--accent-indigo)); border-radius: 10px; display: flex; align-items: center; justify-content: center; color: #000; font-size: 18px; box-shadow: 0 0 16px rgba(0, 240, 255, 0.4); flex-shrink: 0; }
+        .logo-title { font-size: 20px; font-weight: 700; letter-spacing: 2px; }
+        .logo-tag { font-family: var(--font-mono); font-size: 10px; background: rgba(0, 240, 255, 0.1); color: var(--accent-cyan); border: 1px solid rgba(0, 240, 255, 0.3); padding: 2px 6px; border-radius: 4px; white-space: nowrap; }
+        .header-status-group { display: flex; align-items: center; gap: 20px; font-family: var(--font-mono); font-size: 12px; flex-wrap: wrap; justify-content: center; }
+        .status-badge { display: flex; align-items: center; gap: 8px; background: rgba(16, 185, 129, 0.1); border: 1px solid rgba(16, 185, 129, 0.3); color: var(--accent-emerald); padding: 6px 12px; border-radius: 20px; white-space: nowrap; }
+        .status-badge.disconnected { background: rgba(244, 63, 94, 0.1); border-color: rgba(244, 63, 94, 0.3); color: var(--accent-rose); }
+        .pulse-dot { width: 8px; height: 8px; background-color: var(--accent-emerald); border-radius: 50%; box-shadow: 0 0 8px var(--accent-emerald); animation: pulse-ring 2s infinite; flex-shrink: 0; }
+        
+        @keyframes pulse-ring { 0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.7); } 70% { transform: scale(1); box-shadow: 0 0 0 8px rgba(16, 185, 129, 0); } 100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); } }
+        
+        main { flex: 1; display: grid; grid-template-columns: 320px 1fr 360px; gap: 16px; padding: 16px 24px 24px 24px; height: calc(100vh - 64px); min-height: 0; }
+        
+        .panel-header { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px; border-bottom: 1px solid var(--border-glass); font-weight: 600; font-size: 13px; color: var(--text-muted); text-transform: uppercase; }
+        .panel-header i { color: var(--accent-cyan); }
+        .left-column { display: flex; flex-direction: column; gap: 16px; height: 100%; min-height: 0; }
+        .resource-card { padding: 16px; display: flex; flex-direction: column; gap: 16px; flex-shrink: 0; }
+        .metric-group { display: flex; flex-direction: column; gap: 6px; }
+        .metric-label { display: flex; justify-content: space-between; font-size: 12px; color: var(--text-muted); font-family: var(--font-mono); }
+        .progress-bar-bg { height: 8px; background: rgba(255, 255, 255, 0.05); border-radius: 4px; overflow: hidden; }
+        .progress-bar-fill { height: 100%; background: linear-gradient(90deg, var(--accent-indigo), var(--accent-cyan)); border-radius: 4px; width: 72.5%; transition: width 0.5s ease; }
+        .gauge-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+        .gauge-box { background: rgba(255, 255, 255, 0.02); border: 1px solid var(--border-glass); border-radius: 10px; padding: 12px; display: flex; flex-direction: column; gap: 4px; }
+        .gauge-val { font-family: var(--font-mono); font-size: 20px; font-weight: 700; color: var(--text-main); }
+        .gauge-lbl { font-size: 11px; color: var(--text-dim); }
+        
+        .logs-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 250px; }
+        .log-scroll { flex: 1; padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; font-family: var(--font-mono); font-size: 11px; }
+        
+        .log-entry { background: rgba(255, 255, 255, 0.02); border-left: 2px solid var(--accent-indigo); padding: 8px 10px; border-radius: 0 6px 6px 0; display: flex; flex-direction: column; gap: 2px; }
+        .log-entry.qwen { border-left-color: var(--accent-amber); }
+        .log-entry.whisper { border-left-color: var(--accent-emerald); }
+        .log-time { color: var(--text-dim); font-size: 10px; } 
+        
+        .center-column { display: flex; flex-direction: column; gap: 16px; height: 100%; min-height: 0; }
+        .feed-container { flex: 1.5; min-height: 250px; position: relative; background: #000; display: flex; align-items: center; justify-content: center; border-radius: 16px; overflow: hidden; border: 1px solid var(--border-glass); }
+        #cameraFeedCanvas { width: 100%; height: 100%; object-fit: cover; }
+        .feed-overlay { position: absolute; inset: 0; pointer-events: none; padding: 16px; display: flex; flex-direction: column; justify-content: space-between; }
+        .feed-hud-top { display: flex; justify-content: space-between; align-items: flex-start; pointer-events: auto; flex-wrap: wrap; gap: 8px; }
+        .mode-selector { display: flex; background: rgba(6, 8, 14, 0.85); border: 1px solid var(--border-glass-bright); border-radius: 12px; padding: 3px; gap: 4px; flex-wrap: wrap; max-width: 100%; }
+        .mode-btn { background: transparent; border: none; color: var(--text-muted); padding: 5px 10px; font-family: var(--font-mono); font-size: 10px; font-weight: 600; border-radius: 8px; cursor: pointer; display: flex; align-items: center; gap: 6px; transition: all 0.2s; white-space: nowrap; }
+        .mode-btn.active { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-indigo)); color: #000; font-weight: 700; }
+        .scanlines { position: absolute; inset: 0; background: linear-gradient(rgba(18,16,16,0) 50%, rgba(0,0,0,0.25) 50%); background-size: 100% 3px; pointer-events: none; opacity: 0.6; }
+        .core-visualizer-container { flex: 1; min-height: 200px; display: flex; flex-direction: column; align-items: center; justify-content: center; position: relative; background: radial-gradient(circle at center, rgba(15, 23, 42, 0.8) 0%, rgba(6, 8, 14, 0.9) 100%); }
+        #coreCanvas { width: 100%; height: 100%; }
+        .core-status-text { position: absolute; bottom: 12px; font-family: var(--font-mono); font-size: 11px; color: var(--text-dim); text-align: center; width: 100%; }
+        
+        .right-column { display: flex; flex-direction: column; height: 100%; min-height: 0; }
+        .chat-container { flex: 1; display: flex; flex-direction: column; overflow: hidden; min-height: 250px; }
+        .chat-messages { flex: 1; padding: 16px; overflow-y: auto; display: flex; flex-direction: column; gap: 14px; }
+        
+        .msg-bubble { max-width: 90%; padding: 12px 14px; border-radius: 12px; font-size: 13px; line-height: 1.5; }
+        .msg-user { align-self: flex-end; background: linear-gradient(135deg, var(--accent-indigo), rgba(99, 102, 241, 0.7)); color: #fff; border-bottom-right-radius: 2px; }
+        .msg-argus { align-self: flex-start; background: rgba(255, 255, 255, 0.04); border: 1px solid var(--border-glass); color: var(--text-main); border-bottom-left-radius: 2px; }
+        .msg-sender { font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan); margin-bottom: 4px; display: flex; align-items: center; gap: 6px; }
+        .msg-user .msg-sender { color: #a5b4fc; }
+        
+        .bottom-console { height: auto; min-height: 64px; flex-shrink: 0; background: rgba(13, 19, 32, 0.85); backdrop-filter: blur(20px); border: 1px solid var(--border-glass-bright); border-radius: 16px; display: flex; align-items: center; justify-content: space-between; padding: 8px 12px 8px 20px; width: 100%; flex-wrap: wrap; gap: 10px; }
+        
+        .wakeword-toggle-group { display: flex; align-items: center; gap: 10px; padding: 8px 12px; border-radius: 12px; background: rgba(255, 255, 255, 0.03); border: 1px solid var(--border-glass); }
+        .radar-dot { width: 10px; height: 10px; border-radius: 50%; background: var(--accent-emerald); box-shadow: 0 0 10px var(--accent-emerald); animation: pulse-ring 1.5s infinite; flex-shrink: 0; }
+        .wakeword-label { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); font-weight: 500; white-space: nowrap; }
+        .input-wrapper { flex: 1; min-width: 200px; display: flex; align-items: center; }
+        .input-field { width: 100%; background: transparent; border: none; outline: none; color: var(--text-main); font-family: var(--font-sans); font-size: 14px; padding: 10px 0; }
+        .control-buttons { display: flex; align-items: center; gap: 10px; flex-shrink: 0; }
+        .btn-icon { width: 44px; height: 44px; border-radius: 14px; border: 1px solid var(--border-glass); background: rgba(255, 255, 255, 0.05); color: var(--text-main); display: flex; align-items: center; justify-content: center; cursor: pointer; transition: all 0.2s; }
+        .btn-mic { background: linear-gradient(135deg, var(--accent-cyan), var(--accent-indigo)); color: #000; border: none; }
+
+        /* =========================================
+           RESPONSIVE MEDIA QUERIES 
+           ========================================= */
+
+        /* Laptops & Smaller Desktops */
+        @media (max-width: 1300px) {
+            main { grid-template-columns: 260px 1fr 300px; padding: 16px; gap: 12px; }
+        }
+
+        /* Tablets & iPads */
+        @media (max-width: 1024px) {
+            body { height: auto; min-height: 100vh; overflow-y: auto; overflow-x: hidden; }
+            main { display: flex; flex-direction: column; height: auto; }
+            .center-column { order: -1; min-height: 65vh; }
+            .left-column { min-height: 500px; }
+            .right-column { min-height: 500px; }
+            .feed-container { min-height: 40vh; }
+        }
+
+        /* Mobile Phones */
+        @media (max-width: 768px) {
+            header { flex-direction: column; text-align: center; padding: 16px; gap: 16px; }
+            .header-status-group { justify-content: center; width: 100%; }
+            main { padding: 12px; gap: 16px; }
+            .center-column { min-height: 80vh; }
+            .feed-container { min-height: 35vh; }
+            .bottom-console { flex-direction: column; padding: 16px; align-items: stretch; border-radius: 16px; }
+            .input-wrapper { margin: 4px 0; width: 100%; background: rgba(255,255,255,0.03); border-radius: 8px; padding: 0 12px; }
+            .wakeword-toggle-group { justify-content: center; }
+            .control-buttons { justify-content: center; width: 100%; }
+            .btn-icon { flex: 1; max-width: 100px; }
+            .feed-hud-top { flex-direction: column; align-items: center; }
+            .mode-selector { justify-content: center; }
+        }
+    </style>
+</head>
+<body>
+
+    <header>
+        <div class="logo-group">
+            <div class="logo-icon"><i class="fa-solid fa-eye"></i></div>
+            <div>
+                <span class="logo-title">ARGUS</span>
+                <span class="logo-tag">EDGE v2.1</span>
+            </div>
+        </div>
+        <div class="header-status-group">
+            <div><span style="color: var(--text-dim);">DEVICE:</span> RTX 5060 8GB</div>
+            <div class="status-badge disconnected" id="connectionBadge">
+                <div class="pulse-dot"></div>
+                <span id="connectionText">CONNECTING...</span>
+            </div>
+        </div>
+    </header>
+
+    <main>
+        <!-- LEFT COLUMN -->
+        <div class="left-column">
+            <div class="glass-panel resource-card">
+                <div class="panel-header" style="padding:0 0 12px 0; border:none;">
+                    <span><i class="fa-solid fa-microchip"></i> Resource Monitor</span>
+                    <span style="font-family: var(--font-mono); font-size: 10px; color: var(--accent-cyan);">8GB CAP</span>
+                </div>
+                <div class="metric-group">
+                    <div class="metric-label"><span>VRAM Usage</span><span id="vramText" style="color: var(--accent-cyan);">5.8 / 8.0 GB</span></div>
+                    <div class="progress-bar-bg"><div class="progress-bar-fill" id="vramBar"></div></div>
+                </div>
+                <div class="gauge-grid">
+                    <div class="gauge-box"><span class="gauge-val" id="gpuTemp">62°C</span><span class="gauge-lbl">GPU TEMP</span></div>
+                    <div class="gauge-box"><span class="gauge-val" id="inferenceTime">-- ms</span><span class="gauge-lbl">LATENCY</span></div>
+                </div>
+            </div>
+            <div class="glass-panel logs-container">
+                <div class="panel-header"><span><i class="fa-solid fa-stream"></i> Perception Stream</span></div>
+                <div class="log-scroll" id="perceptionLog"></div>
+            </div>
+        </div>
+
+        <!-- CENTER COLUMN -->
+        <div class="center-column">
+            <div class="feed-container">
+                <canvas id="cameraFeedCanvas"></canvas>
+                <div class="scanlines"></div>
+                <div class="feed-overlay">
+                    <div class="feed-hud-top">
+                        <div class="mode-selector">
+                            <button type="button" id="modeScreenBtn" class="mode-btn active" onclick="switchMode('screen')">
+                                <i class="fa-solid fa-desktop"></i> Screen
+                            </button>
+                            <button type="button" id="modeLiveBtn" class="mode-btn" onclick="switchMode('live')">
+                                <i class="fa-solid fa-video"></i> Live
+                            </button>
+                            <button type="button" id="modeLectureBtn" class="mode-btn" onclick="switchMode('lecture')">
+                                <i class="fa-solid fa-chalkboard-user"></i> Lecture
+                            </button>
+                            <button type="button" id="modeAssistiveBtn" class="mode-btn" onclick="switchMode('assistive')">
+                                <i class="fa-solid fa-eye-low-vision"></i> Assistive
+                            </button>
+                        </div>
+                        <div class="feed-tag" id="activeModeTag" style="background: rgba(0,0,0,0.6); border: 1px solid var(--accent-amber); color: var(--accent-amber); font-family: var(--font-mono); font-size: 11px; padding: 4px 10px; border-radius: 6px; white-space: nowrap;">
+                            <i class="fa-solid fa-desktop"></i> SCREEN CAPTURE (DXCAM)
+                        </div>
+                    </div>
+                </div>
+            </div>
+            
+            <div class="glass-panel core-visualizer-container">
+                <canvas id="coreCanvas"></canvas>
+                <div class="core-status-text" id="ttsStateTag">Awaiting Multimodal Input</div>
+            </div>
+
+            <!-- PROMPT CONSOLE -->
+            <div class="bottom-console" id="bottomConsole">
+                <div class="wakeword-toggle-group active">
+                    <div class="radar-dot"></div>
+                    <span class="wakeword-label">Mic Managed by Python</span>
+                </div>
+                <div class="input-wrapper">
+                    <input type="text" id="promptInput" class="input-field" placeholder="Ask A.R.G.U.S. something..." onkeydown="if(event.key==='Enter') sendPrompt()">
+                </div>
+                <div class="control-buttons">
+                    <button type="button" class="btn-icon" onclick="sendPrompt()" title="Send Prompt"><i class="fa-solid fa-paper-plane"></i></button>
+                    <button type="button" class="btn-icon btn-mic" title="Mic Active"><i class="fa-solid fa-microphone"></i></button>
+                </div>
+            </div>
+        </div>
+
+        <!-- RIGHT COLUMN -->
+        <div class="right-column">
+            <div class="glass-panel chat-container">
+                <div class="panel-header"><span><i class="fa-solid fa-comments"></i> Multimodal Dialogue</span></div>
+                <div class="chat-messages" id="chatBox">
+                    <div class="msg-bubble msg-argus">
+                        <div class="msg-sender"><i class="fa-solid fa-robot"></i> ARGUS ENGINE</div>
+                        System online. 4 operational modes enabled. Speak or select a mode to begin.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </main>
+
+    <script>
+        let socket = null;
+        let activeMode = 'screen'; 
+        let audioEnergy = 0.2;
+        let isSpeaking = false; 
+        let backendScreenImg = new Image();
+
+        function connectWebSocket() {
+            const wsUrl = `ws://${window.location.hostname || 'localhost'}:8000/ws`;
+            socket = new WebSocket(wsUrl);
+            socket.onopen = () => {
+                document.getElementById('connectionBadge').classList.remove('disconnected');
+                document.getElementById('connectionText').innerText = 'SYSTEM ACTIVE';
+                socket.send(JSON.stringify({ event: 'set_mode', mode: activeMode }));
+            };
+            socket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.event === 'speech_recognized') appendMessage('YOU (VOCAL)', data.text, 'msg-user');
+                else if (data.event === 'argus_reply') typewriterArgusResponse(data.text);
+                else if (data.event === 'perception_log') addLogEntry(data.engine || 'SYSTEM', data.text);
+                else if (data.event === 'lecture_transcript') addLogEntry('WHISPER (LECTURE)', data.text);
+                else if (data.event === 'screen_frame') {
+                    backendScreenImg.src = data.image_data;
+                }
+            };
+            socket.onclose = () => {
+                document.getElementById('connectionBadge').classList.add('disconnected');
+                document.getElementById('connectionText').innerText = 'OFFLINE';
+                setTimeout(connectWebSocket, 3000); 
+            };
+        }
+
+        window.addEventListener('load', () => {
+            connectWebSocket();
+            drawCameraFeed();
+        });
+
+        /* --- WEBCAM MANAGEMENT --- */
+        const feedCanvas = document.getElementById('cameraFeedCanvas');
+        const feedCtx = feedCanvas.getContext('2d');
+        const hardwareVideo = document.createElement('video');
+        hardwareVideo.autoplay = true; hardwareVideo.muted = true;
+        let cameraActive = false;
+
+        // NEW: ResizeObserver ensures canvases accurately redraw resolution when flex/grid layouts snap.
+        function resizeFeedCanvas() { feedCanvas.width = feedCanvas.parentElement.clientWidth; feedCanvas.height = feedCanvas.parentElement.clientHeight; }
+        function resizeCoreCanvas() { coreCanvas.width = coreCanvas.parentElement.clientWidth; coreCanvas.height = coreCanvas.parentElement.clientHeight; }
+        
+        const resObserver = new ResizeObserver(() => { resizeFeedCanvas(); resizeCoreCanvas(); });
+        resObserver.observe(feedCanvas.parentElement);
+        resObserver.observe(document.getElementById('coreCanvas').parentElement);
+
+        async function initializeWebcam() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({ video: { width: 1280, height: 720, facingMode: "user" } });
+                hardwareVideo.srcObject = stream;
+                cameraActive = true;
+                addLogEntry('SYSTEM', 'Hardware webcam activated for optical streaming.');
+            } catch (err) { addLogEntry('SYSTEM ERROR', 'Webcam access denied.'); }
+        }
+
+        function stopWebcam() {
+            if (hardwareVideo.srcObject) {
+                hardwareVideo.srcObject.getTracks().forEach(track => track.stop());
+                hardwareVideo.srcObject = null;
+            }
+            cameraActive = false;
+            addLogEntry('SYSTEM', 'Hardware webcam powered down (Screen Mode active).');
+        }
+
+        function switchMode(mode) {
+            if (activeMode === mode) return;
+            activeMode = mode;
+            const tag = document.getElementById('activeModeTag');
+
+            ['screen', 'live', 'lecture', 'assistive'].forEach(m => {
+                const btn = document.getElementById(`mode${m.charAt(0).toUpperCase() + m.slice(1)}Btn`);
+                if (btn) btn.classList.remove('active');
+            });
+            const activeBtn = document.getElementById(`mode${mode.charAt(0).toUpperCase() + mode.slice(1)}Btn`);
+            if (activeBtn) activeBtn.classList.add('active');
+
+            if (mode === 'screen') {
+                tag.innerHTML = `<i class="fa-solid fa-desktop"></i> SCREEN CAPTURE`;
+                tag.style.borderColor = "var(--accent-amber)"; tag.style.color = "var(--accent-amber)";
+                stopWebcam();
+            } else if (mode === 'live') {
+                tag.innerHTML = `<i class="fa-solid fa-video"></i> LIVE CAMERA FEED`;
+                tag.style.borderColor = "var(--accent-cyan)"; tag.style.color = "var(--accent-cyan)";
+                initializeWebcam();
+            } else if (mode === 'lecture') {
+                tag.innerHTML = `<i class="fa-solid fa-chalkboard-user"></i> SMART LECTURE EVALUATOR`;
+                tag.style.borderColor = "var(--accent-indigo)"; tag.style.color = "var(--accent-indigo)";
+                initializeWebcam();
+            } else if (mode === 'assistive') {
+                tag.innerHTML = `<i class="fa-solid fa-eye-low-vision"></i> ASSISTIVE VISION`;
+                tag.style.borderColor = "var(--accent-emerald)"; tag.style.color = "var(--accent-emerald)";
+                initializeWebcam();
+            }
+
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ event: 'set_mode', mode: mode }));
+            }
+        }
+
+        let boxX = 120, boxY = 80, targetX = 180, targetY = 110;
+
+        function drawCameraFeed() {
+            const w = feedCanvas.width, h = feedCanvas.height;
+            if (w === 0 || h === 0) { requestAnimationFrame(drawCameraFeed); return; } // Prevent zero-size draw errors
+            
+            if (activeMode !== 'screen' && cameraActive && hardwareVideo.readyState >= 2) {
+                feedCtx.drawImage(hardwareVideo, 0, 0, w, h);
+            } 
+            else if (activeMode === 'screen' && backendScreenImg.src) {
+                feedCtx.drawImage(backendScreenImg, 0, 0, w, h);
+            } 
+            else {
+                feedCtx.fillStyle = '#070b12'; feedCtx.fillRect(0, 0, w, h);
+                feedCtx.fillStyle = 'rgba(255,255,255,0.1)'; feedCtx.font = '500 14px "JetBrains Mono"';
+                feedCtx.textAlign = 'center';
+                feedCtx.fillText('WAITING FOR VIDEO STREAM...', w/2, h/2);
+                feedCtx.textAlign = 'left';
+            }
+
+            boxX += (targetX - boxX) * 0.05; boxY += (targetY - boxY) * 0.05;
+            if (Math.abs(targetX - boxX) < 5) { targetX = Math.random() * (w - 180) + 40; targetY = Math.random() * (h - 140) + 40; }
+
+            let strokeColor = '#00f0ff';
+            if (activeMode === 'screen') strokeColor = '#f59e0b';
+            else if (activeMode === 'lecture') strokeColor = '#6366f1';
+            else if (activeMode === 'assistive') strokeColor = '#10b981';
+
+            feedCtx.strokeStyle = strokeColor;
+            feedCtx.lineWidth = 2; feedCtx.shadowBlur = 8; feedCtx.shadowColor = feedCtx.strokeStyle;
+            const cornerLen = 15, boxW = 150, boxH = 100;
+            
+            // Constrain box bounds for narrow screens
+            const drawX = Math.min(boxX, w - boxW - 10);
+            const drawY = Math.min(boxY, h - boxH - 10);
+
+            feedCtx.beginPath();
+            feedCtx.moveTo(drawX, drawY + cornerLen); feedCtx.lineTo(drawX, drawY); feedCtx.lineTo(drawX + cornerLen, drawY);
+            feedCtx.moveTo(drawX + boxW, drawY + boxH - cornerLen); feedCtx.lineTo(drawX + boxW, drawY + boxH); feedCtx.lineTo(drawX + boxW - cornerLen, drawY + boxH);
+            feedCtx.stroke();
+            
+            feedCtx.fillStyle = strokeColor;
+            feedCtx.globalAlpha = 0.85;
+            feedCtx.fillRect(drawX, drawY - 22, 160, 18);
+            feedCtx.globalAlpha = 1.0;
+            feedCtx.fillStyle = '#000'; feedCtx.font = '700 10px "JetBrains Mono"';
+            feedCtx.fillText(`ARGUS // ${activeMode.toUpperCase()}`, drawX + 4, drawY - 9);
+
+            requestAnimationFrame(drawCameraFeed);
+        }
+
+        setInterval(() => {
+            if (activeMode !== 'screen' && socket && socket.readyState === WebSocket.OPEN && cameraActive) {
+                const frameBase64 = feedCanvas.toDataURL('image/jpeg', 0.5); 
+                socket.send(JSON.stringify({ event: 'video_frame', image_data: frameBase64 }));
+            }
+        }, 1500);
+
+        const chatBox = document.getElementById('chatBox');
+        const promptInput = document.getElementById('promptInput');
+
+        function sendPrompt() {
+            const text = promptInput.value.trim();
+            if (!text) return;
+            appendMessage('YOU', text, 'msg-user');
+            promptInput.value = '';
+            if (socket && socket.readyState === WebSocket.OPEN) {
+                socket.send(JSON.stringify({ event: 'user_prompt', text: text }));
+            }
+        }
+
+        function appendMessage(sender, text, styleClass) {
+            const msg = document.createElement('div');
+            msg.className = `msg-bubble ${styleClass}`;
+            msg.innerHTML = `<div class="msg-sender">${sender}</div><div>${text}</div>`;
+            chatBox.appendChild(msg);
+            chatBox.scrollTop = chatBox.scrollHeight;
+        }
+
+        function typewriterArgusResponse(fullText) {
+            const msg = document.createElement('div');
+            msg.className = 'msg-bubble msg-argus';
+            msg.innerHTML = `<div class="msg-sender"><i class="fa-solid fa-robot"></i> ARGUS ENGINE</div><div class="type-body"></div>`;
+            chatBox.appendChild(msg);
+
+            const typeBody = msg.querySelector('.type-body');
+            let index = 0;
+            
+            isSpeaking = true;
+            document.getElementById('ttsStateTag').innerText = "SPEAKING";
+            document.getElementById('ttsStateTag').style.color = "var(--accent-cyan)";
+            
+            const interval = setInterval(() => {
+                typeBody.textContent += fullText[index];
+                index++;
+                chatBox.scrollTop = chatBox.scrollHeight;
+                audioEnergy = 0.4 + Math.random() * 0.5; 
+                
+                if (index >= fullText.length) {
+                    clearInterval(interval);
+                    setTimeout(() => {
+                        audioEnergy = 0.2;
+                        isSpeaking = false; 
+                        document.getElementById('ttsStateTag').innerText = "IDLE";
+                        document.getElementById('ttsStateTag').style.color = "var(--text-dim)";
+                    }, 800);
+                }
+            }, 30);
+        }
+
+        const logsContainer = document.getElementById('perceptionLog');
+        function addLogEntry(engine, message) {
+            const timeStr = new Date().toLocaleTimeString().split(' ')[0];
+            const entry = document.createElement('div');
+            let engineClass = 'moondream';
+            if (engine.toUpperCase().includes('QWEN')) engineClass = 'qwen';
+            if (engine.toUpperCase().includes('WHISPER')) engineClass = 'whisper';
+            
+            entry.className = `log-entry ${engineClass}`;
+            entry.innerHTML = `<div class="log-time">[${timeStr}] ${engine.toUpperCase()}</div><div class="log-msg">${message}</div>`;
+            logsContainer.prepend(entry);
+            if (logsContainer.children.length > 20) logsContainer.removeChild(logsContainer.lastChild);
+        }
+
+        /* --- VISUALIZER --- */
+        const coreCanvas = document.getElementById('coreCanvas');
+        const coreCtx = coreCanvas.getContext('2d');
+        let coreAngle = 0;
+
+        function drawArgusCore() {
+            const w = coreCanvas.width, h = coreCanvas.height;
+            if (w === 0 || h === 0) { requestAnimationFrame(drawArgusCore); return; }
+            
+            const centerX = w / 2, centerY = h / 2;
+            coreCtx.clearRect(0, 0, w, h);
+            
+            let pulse = 0.2; 
+            if (isSpeaking) {
+                coreAngle += 0.025; 
+                pulse = Math.sin(Date.now() * 0.005) * 0.1 + audioEnergy; 
+            }
+
+            const glowGrad = coreCtx.createRadialGradient(centerX, centerY, 10, centerX, centerY, 110 * pulse);
+            glowGrad.addColorStop(0, 'rgba(0, 240, 255, 0.35)'); glowGrad.addColorStop(0.5, 'rgba(99, 102, 241, 0.12)'); glowGrad.addColorStop(1, 'rgba(0, 0, 0, 0)');
+            coreCtx.fillStyle = glowGrad; coreCtx.beginPath(); coreCtx.arc(centerX, centerY, 130 * pulse, 0, Math.PI * 2); coreCtx.fill();
+
+            for (let i = 0; i < 3; i++) {
+                coreCtx.save(); coreCtx.translate(centerX, centerY); coreCtx.rotate(coreAngle * (i % 2 === 0 ? 1 : -1) * (i + 1) * 0.5);
+                coreCtx.beginPath(); coreCtx.arc(0, 0, 30 + i * 20 + pulse * 12, 0, Math.PI * 1.5);
+                coreCtx.strokeStyle = i === 0 ? '#00f0ff' : (i === 1 ? '#6366f1' : '#a855f7');
+                coreCtx.lineWidth = 2 - i * 0.4; coreCtx.shadowBlur = 10; coreCtx.shadowColor = coreCtx.strokeStyle;
+                coreCtx.stroke(); coreCtx.restore();
+            }
+            coreCtx.beginPath(); coreCtx.arc(centerX, centerY, 10 + pulse * 8, 0, Math.PI * 2);
+            coreCtx.fillStyle = '#ffffff'; coreCtx.shadowBlur = 18; coreCtx.shadowColor = '#00f0ff'; coreCtx.fill();
+            requestAnimationFrame(drawArgusCore);
+        }
+        drawArgusCore();
+    </script>
+</body>
+</html>
