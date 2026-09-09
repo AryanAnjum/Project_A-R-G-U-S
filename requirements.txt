@@ -32,23 +32,35 @@ fvcore
 iopath
 packaging
 
-pip install opencv-python
-pip install pandas
-pip install faster-whisper SpeechRecognition pyaudio
-pip install SpeechRecognition
-pip install faster-whisper pyaudio
-pip install tqdm
-pip install pyttsx3
+opencv-python
+pandas
+faster-whisper 
+SpeechRecognition 
+pyaudio
+SpeechRecognition
+faster-whisper 
+pyaudio
+tqdm
+pyttsx3
 
-pip install transformers==4.56.1 einops accelerate
-pip install edge-tts pygame
-pip install qwen-vl-utils
+transformers==4.56.1 einops accelerate
+edge-tts
+pygame
+qwen-vl-utils
 
-.\venv\Scripts\python.exe -m pip install scikit-learn pandas
-.\venv\Scripts\python.exe -m pip install datasets
-& "f:\Project CSE499\Project_A-R-G-U-S\venv\Scripts\python.exe" -m pip install peft accelerate
-pip install uvicorn websockets
-pip install fastapi
-pip install dxcam opencv-python
-pip install scikit-learn seaborn matplotlib peft
-pip install pyvips-binary pyvips
+scikit-learn 
+pandas
+datasets
+peft 
+accelerate
+uvicorn 
+websockets
+fastapi
+dxcam 
+opencv-python
+scikit-learn 
+seaborn 
+matplotlib 
+peft
+pyvips-binary 
+pyvips
