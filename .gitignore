@@ -244,3 +244,5 @@ Desktop.ini
 
 # Local Environment Variables (API Keys)
 .env
+
+math_data/
