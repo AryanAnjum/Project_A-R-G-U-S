@@ -234,7 +234,7 @@ models/
 *.pt
 *.pth
 *.bin
-*.safetensors
+
 *.onnx
 
 # Ignore IDE/OS specific files (often created by Windows/VS Code)
