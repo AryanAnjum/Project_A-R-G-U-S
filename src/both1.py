@@ -180,12 +180,6 @@ except Exception as e:
         # Attempt 3: Try alternate monitor output
         dxcam_camera = dxcam.create(device_idx=0, output_idx=1, output_color="BGR")
 
-# --- Start DXCam continuously so we can stream it to HTML ---
-if dxcam_camera is not None:
-    dxcam_camera.start(target_fps=30)
-else:
-    print("[ERROR] DXCam could not hook into any display adapter!")
-
 
 # ==========================================
 # 3. STATE TRACKERS 
