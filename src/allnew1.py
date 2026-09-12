@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-from peft import PeftModel # <-- ADDED PEFT IMPORT
+from peft import PeftModel
 from qwen_vl_utils import process_vision_info
 from faster_whisper import WhisperModel
 
@@ -100,7 +100,6 @@ print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Note: Reverted path based on your latest file structure where the adapters are in the root directory
 GENERAL_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-200gb-checkpoints", "final_adapter"))
 MATH_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-math-adapter", "final_adapter"))
 
@@ -166,14 +165,11 @@ conversation_memory = collections.deque(maxlen=3)
 system_is_running = True
 assistant_state = "idle"
 
-# Rolling buffer storing the last 45-60 seconds of lecture speech for App 2
 lecture_audio_buffer = collections.deque(maxlen=8)
-
 tts_queue = queue.Queue()
 prompt_queue = queue.Queue() 
 tts_done_event = threading.Event()
 tts_interrupt_requested = False
-
 
 # ==========================================
 # 4. AUDIO & TTS HELPERS
@@ -235,14 +231,14 @@ def process_prompt(user_spoken_prompt):
     frame_to_process = None
     active_mode = ws_manager.current_mode
 
-    # Visual Frame Routing
-    if active_mode == "screen":
+    # --- CHANGED: Now "lecture" mode pulls from DXCam Screen Capture ---
+    if active_mode in ["screen", "lecture"]:
         frame_to_process = dxcam_camera.get_latest_frame()
         if frame_to_process is None:
             time.sleep(0.05)
             frame_to_process = dxcam_camera.get_latest_frame()
     else:
-        # "live", "lecture", and "assistive" all leverage the optical webcam feed
+        # "live" and "assistive" leverage the optical webcam feed
         frame_to_process = latest_cv2_frame
 
     if frame_to_process is None:
@@ -257,7 +253,7 @@ def process_prompt(user_spoken_prompt):
 
     # Dynamic Task Prompting based on Active Module
     if active_mode == "lecture":
-        print("[ROUTER] Executing Smart Lecture Evaluator Pipeline...")
+        print("[ROUTER] Executing Smart Lecture Evaluator Pipeline (Screen Source)...")
         recent_lecture = " ".join(lecture_audio_buffer)
         if not recent_lecture.strip():
             recent_lecture = "[No speech registered in buffer.]"
@@ -269,7 +265,7 @@ def process_prompt(user_spoken_prompt):
             "Identify any mathematical inconsistencies, missing variables, or conceptual discrepancies. "
             "Respond with a concise, structured evaluation report."
         )
-        task_query = user_spoken_prompt if user_spoken_prompt else "Audit the current whiteboard against lecture speech."
+        task_query = user_spoken_prompt if user_spoken_prompt else "Audit the current screen content against lecture speech."
 
     elif active_mode == "assistive":
         print("[ROUTER] Executing Assistive Vision Pipeline (Blind Support)...")
@@ -289,14 +285,13 @@ def process_prompt(user_spoken_prompt):
         )
         task_query = user_spoken_prompt
 
-    else: # Default "live" camera mode
+    else: 
         system_prompt = (
             "You are A.R.G.U.S., a friendly multimodal companion. "
             "Look at the scene and answer the user's query naturally in one or two sentences."
         )
         task_query = user_spoken_prompt
 
-    # Construct Conversation History & Multimodal Payload
     messages = []
     if active_mode not in ["lecture", "assistive"]:
         for past_q, past_a in conversation_memory:
@@ -311,7 +306,6 @@ def process_prompt(user_spoken_prompt):
         ]
     })
 
-    # Inference Execution
     text = spatial_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     
@@ -319,14 +313,12 @@ def process_prompt(user_spoken_prompt):
         text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
     ).to("cuda")
 
-    # --- DYNAMIC ADAPTER ROUTING LOGIC ---
     if active_mode == "lecture":
         print("[SYSTEM] 🧠 Switching Brain to MATH Mode...")
         spatial_model.set_adapter("argus_math")
     else:
         print("[SYSTEM] 🧠 Switching Brain to GENERAL Mode...")
         spatial_model.set_adapter("argus_general")
-    # -------------------------------------
     
     max_tokens = 150 if active_mode == "lecture" else 70
     generated_ids = spatial_model.generate(
@@ -344,13 +336,11 @@ def process_prompt(user_spoken_prompt):
     if active_mode not in ["lecture", "assistive"]:
         conversation_memory.append((user_spoken_prompt, answer))
 
-    # WebSocket Broadcasts
     ws_manager.broadcast_sync({"event": "argus_reply", "text": answer, "mode": active_mode})
     ws_manager.broadcast_sync({"event": "perception_log", "engine": "Qwen2-VL", "text": f"Processed ({active_mode.upper()}): {task_query}"})
     
     tts_queue.put(answer)
     
-    # 8GB VRAM Eviction Guard
     del inputs, generated_ids, generated_ids_trimmed
     torch.cuda.empty_cache()
 
@@ -394,7 +384,6 @@ def audio_worker():
     while system_is_running:
         try:
             with mic as source:
-                # In Lecture Mode, continuously listen to record the ongoing presentation
                 if ws_manager.current_mode == "lecture":
                     try:
                         audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=6.0)
@@ -408,14 +397,12 @@ def audio_worker():
                             lecture_audio_buffer.append(spoken_chunk)
                             ws_manager.broadcast_sync({"event": "lecture_transcript", "text": spoken_chunk})
 
-                            # Allow vocal trigger to evaluate whiteboard
                             if any(trigger in spoken_chunk.lower() for trigger in ["evaluate", "check board", "argus"]):
                                 play_capture_chime()
                                 prompt_queue.put("Evaluate the whiteboard against current lecture notes.")
                     except sr.WaitTimeoutError:
                         continue
 
-                # Standard Conversational Modes (Screen / Live / Assistive)
                 elif assistant_state == "active":
                     try:
                         command_audio = recognizer.listen(source, timeout=6.0, phrase_time_limit=10.0)
@@ -476,7 +463,8 @@ def llm_worker():
 def screen_stream_worker():
     global system_is_running
     while system_is_running:
-        if ws_manager.current_mode == "screen":
+        # --- CHANGED: Broadcast DXCam stream to UI when in Lecture Mode too ---
+        if ws_manager.current_mode in ["screen", "lecture"]:
             frame = dxcam_camera.get_latest_frame()
             if frame is not None:
                 preview = cv2.resize(frame, (960, 540)) 
@@ -518,14 +506,12 @@ async def websocket_endpoint(websocket: WebSocket):
             data = json.loads(data_text)
             event = data.get("event")
 
-            # Mode Switcher (accepts "screen", "live", "lecture", "assistive")
             if event == "set_mode":
                 mode = data.get("mode", "screen").lower()
                 ws_manager.current_mode = mode
                 print(f"[SYSTEM] Operation mode switched to: {mode.upper()}")
                 ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode})
 
-            # Video feed frame ingestion from client browser
             elif event == "video_frame":
                 try:
                     base64_data = data.get("image_data", "")
@@ -541,13 +527,11 @@ async def websocket_endpoint(websocket: WebSocket):
                 except Exception:
                     pass
 
-            # Explicit trigger to audit whiteboard lecture from dashboard UI
             elif event == "trigger_lecture_evaluation":
                 print("[SYSTEM] Manual Lecture Evaluation Triggered from UI.")
                 play_capture_chime()
                 prompt_queue.put("Cross-reference the whiteboard equations against spoken lecture speech and highlight errors.")
 
-            # Text prompt sent directly from frontend input box
             elif event == "user_prompt":
                 prompt_text = data.get("text", "")
                 print(f"[WEBSITE PROMPT]: {prompt_text}")

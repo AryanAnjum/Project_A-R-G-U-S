@@ -22,6 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
+from peft import PeftModel # <-- ADDED PEFT IMPORT
 from qwen_vl_utils import process_vision_info
 from faster_whisper import WhisperModel
 
@@ -93,18 +94,43 @@ app.add_middleware(
 )
 
 # ==========================================
-# 2. LOAD AI MODELS & SENSORS
+# 2. LOAD AI MODELS & SENSORS (MULTI-ADAPTER)
 # ==========================================
 print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
-print("[SYSTEM] Loading Spatial Brain (Qwen2-VL 2B)...")
-spatial_model = Qwen2VLForConditionalGeneration.from_pretrained(
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+# Note: Reverted path based on your latest file structure where the adapters are in the root directory
+GENERAL_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-200gb-checkpoints", "final_adapter"))
+MATH_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-math-adapter", "final_adapter"))
+
+print("[SYSTEM] Loading Base Qwen2-VL 2B Backbone (Frozen)...")
+base_model = Qwen2VLForConditionalGeneration.from_pretrained(
     "Qwen/Qwen2-VL-2B-Instruct", 
     torch_dtype=torch.bfloat16, 
     device_map="cuda"
 )
-spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
+
+print("[SYSTEM] Injecting Adapter 1: General Intelligence...")
+spatial_model = PeftModel.from_pretrained(
+    base_model, 
+    GENERAL_ADAPTER_PATH, 
+    adapter_name="argus_general"
+)
+
+print("[SYSTEM] Injecting Adapter 2: Mathematical / Lecture Logic...")
+spatial_model.load_adapter(
+    MATH_ADAPTER_PATH, 
+    adapter_name="argus_math"
+)
+spatial_model.eval()
+
+try:
+    spatial_processor = AutoProcessor.from_pretrained(GENERAL_ADAPTER_PATH)
+    print("[SYSTEM] Custom A.R.G.U.S. processor loaded successfully.")
+except Exception:
+    print("[WARNING] Loading default base processor fallback...")
+    spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
 
 print("[SYSTEM] Loading Audio Brain (Whisper)...")
 audio_model = WhisperModel("tiny.en", device=device, compute_type="float16" if device == "cuda" else "int8")
@@ -292,6 +318,15 @@ def process_prompt(user_spoken_prompt):
     inputs = spatial_processor(
         text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
     ).to("cuda")
+
+    # --- DYNAMIC ADAPTER ROUTING LOGIC ---
+    if active_mode == "lecture":
+        print("[SYSTEM] 🧠 Switching Brain to MATH Mode...")
+        spatial_model.set_adapter("argus_math")
+    else:
+        print("[SYSTEM] 🧠 Switching Brain to GENERAL Mode...")
+        spatial_model.set_adapter("argus_general")
+    # -------------------------------------
     
     max_tokens = 150 if active_mode == "lecture" else 70
     generated_ids = spatial_model.generate(

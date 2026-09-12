@@ -68,6 +68,3 @@ pyvips-binary
 pyvips
 bitsandbytes 
 accelerate
-
-
-python -m pip install fastapi uvicorn websockets
