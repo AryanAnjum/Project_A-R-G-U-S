@@ -489,12 +489,12 @@ threading.Thread(target=screen_stream_worker, daemon=True).start()
 # ==========================================
 @app.get("/")
 async def serve_dashboard():
-    html_path = os.path.join(os.path.dirname(__file__), "new.html")
+    html_path = os.path.join(os.path.dirname(__file__), "new1.html")
     try:
         with open(html_path, "r", encoding="utf-8") as f:
             return HTMLResponse(content=f.read())
     except FileNotFoundError:
-        return HTMLResponse(content="<h1>new.html not found! Ensure it sits alongside this script.</h1>")
+        return HTMLResponse(content="<h1>new1.html not found! Ensure it sits alongside this script.</h1>")
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
