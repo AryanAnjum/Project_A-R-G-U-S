@@ -43,7 +43,9 @@ pyaudio
 tqdm
 pyttsx3
 
-transformers==4.56.1 einops accelerate
+transformers==4.56.1 
+einops 
+accelerate
 edge-tts
 pygame
 qwen-vl-utils
@@ -64,3 +66,5 @@ matplotlib
 peft
 pyvips-binary 
 pyvips
+bitsandbytes 
+accelerate
