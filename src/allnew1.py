@@ -52,7 +52,6 @@ class ConnectionManager:
     def __init__(self):
         self.active_connections = []
         self.loop = None
-        # Available modes: "screen", "live", "lecture", "assistive"
         self.current_mode = "screen"
 
     async def connect(self, websocket: WebSocket):
@@ -94,14 +93,13 @@ app.add_middleware(
 )
 
 # ==========================================
-# 2. LOAD AI MODELS & SENSORS (MULTI-ADAPTER)
+# 2. LOAD AI MODELS & SENSORS
 # ==========================================
 print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 GENERAL_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-200gb-checkpoints", "final_adapter"))
-MATH_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-math-adapter", "final_adapter"))
 
 print("[SYSTEM] Loading Base Qwen2-VL 2B Backbone (Frozen)...")
 base_model = Qwen2VLForConditionalGeneration.from_pretrained(
@@ -110,17 +108,11 @@ base_model = Qwen2VLForConditionalGeneration.from_pretrained(
     device_map="cuda"
 )
 
-print("[SYSTEM] Injecting Adapter 1: General Intelligence...")
+print("[SYSTEM] Injecting Adapter 1: General Intelligence & Tutor Logic...")
 spatial_model = PeftModel.from_pretrained(
     base_model, 
     GENERAL_ADAPTER_PATH, 
     adapter_name="argus_general"
-)
-
-print("[SYSTEM] Injecting Adapter 2: Mathematical / Lecture Logic...")
-spatial_model.load_adapter(
-    MATH_ADAPTER_PATH, 
-    adapter_name="argus_math"
 )
 spatial_model.eval()
 
@@ -158,14 +150,17 @@ except Exception:
     dxcam_camera = UniversalCamera()
 
 # ==========================================
-# 3. STATE TRACKERS & ROLLING BUFFERS
+# 3. STATE TRACKERS & OBSERVER MEMORY
 # ==========================================
 latest_cv2_frame = None 
 conversation_memory = collections.deque(maxlen=3) 
 system_is_running = True
 assistant_state = "idle"
 
-lecture_audio_buffer = collections.deque(maxlen=8)
+class_transcript = [] 
+class_whiteboard_frames = collections.deque(maxlen=5) 
+last_snapshot_time = time.time()
+
 tts_queue = queue.Queue()
 prompt_queue = queue.Queue() 
 tts_done_event = threading.Event()
@@ -227,85 +222,98 @@ def interrupt_tts():
 # 5. MULTI-APP VISION LOGIC (CORE ROUTER)
 # ==========================================
 def process_prompt(user_spoken_prompt):
-    global conversation_memory, latest_cv2_frame
+    global conversation_memory, latest_cv2_frame, class_whiteboard_frames, class_transcript
     frame_to_process = None
     active_mode = ws_manager.current_mode
-
-    # --- CHANGED: Now "lecture" mode pulls from DXCam Screen Capture ---
-    if active_mode in ["screen", "lecture"]:
+    messages = []
+    
+    # --- FIX: Routing updated so Lecture uses the Camo webcam, not the screen ---
+    if active_mode == "screen":
         frame_to_process = dxcam_camera.get_latest_frame()
         if frame_to_process is None:
             time.sleep(0.05)
             frame_to_process = dxcam_camera.get_latest_frame()
     else:
-        # "live" and "assistive" leverage the optical webcam feed
+        # live, assistive, and lecture all use the iPhone Camo feed
         frame_to_process = latest_cv2_frame
 
-    if frame_to_process is None:
+    if frame_to_process is None and active_mode != "lecture":
         err_msg = "Optical feed unavailable for processing."
         ws_manager.broadcast_sync({"event": "argus_reply", "text": err_msg})
         tts_queue.put(err_msg)
         return
 
-    rgb_frame = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
-    pil_image = Image.fromarray(rgb_frame)
-    pil_image.thumbnail((960, 960)) 
-
-    # Dynamic Task Prompting based on Active Module
+    # POST-CLASS TUTOR PIPELINE
     if active_mode == "lecture":
-        print("[ROUTER] Executing Smart Lecture Evaluator Pipeline (Screen Source)...")
-        recent_lecture = " ".join(lecture_audio_buffer)
-        if not recent_lecture.strip():
-            recent_lecture = "[No speech registered in buffer.]"
+        print("[ROUTER] Executing Post-Class Tutor Pipeline...")
+        full_transcript = " ".join(class_transcript)
+        if not full_transcript.strip():
+            full_transcript = "[No speech registered during class.]"
 
         system_prompt = (
-            "You are A.R.G.U.S. Smart Lecture Evaluator. "
-            "Examine the whiteboard equations, diagrams, and handwriting in this image. "
-            f"Cross-reference them against the teacher's spoken lecture transcript: \"{recent_lecture}\". "
-            "Identify any mathematical inconsistencies, missing variables, or conceptual discrepancies. "
-            "Respond with a concise, structured evaluation report."
+            "You are A.R.G.U.S., an intelligent post-class tutor. "
+            "You have observed a class. Review the provided chronological whiteboard snapshots and the "
+            f"transcribed audio from the teacher: \"{full_transcript[-3000:]}\". " 
+            "Based on this material, fulfill the student's request comprehensively. Structure your answer clearly."
         )
-        task_query = user_spoken_prompt if user_spoken_prompt else "Audit the current screen content against lecture speech."
+        task_query = user_spoken_prompt if user_spoken_prompt else "Summarize the key concepts taught in this class and provide 3 practice questions."
 
-    elif active_mode == "assistive":
-        print("[ROUTER] Executing Assistive Vision Pipeline (Blind Support)...")
-        system_prompt = (
-            "You are A.R.G.U.S. Assistive Eye, an AI assistant for a visually impaired user. "
-            "Prioritize physical safety and high-accuracy text extraction. "
-            "If analyzing a medicine container, read the exact medicine name, dosage, and warnings. "
-            "If scanning the surrounding room, warn immediately about physical hazards, drops, or approaching obstacles. "
-            "Answer directly and concisely without conversational fluff."
-        )
-        task_query = user_spoken_prompt if user_spoken_prompt else "Describe the object held or warn of hazards in view."
+        content_list = []
+        for img_arr in class_whiteboard_frames:
+            pil_img = Image.fromarray(cv2.cvtColor(img_arr, cv2.COLOR_BGR2RGB))
+            pil_img.thumbnail((512, 512)) 
+            content_list.append({"type": "image", "image": pil_img})
+        
+        if not content_list and frame_to_process is not None:
+            pil_img = Image.fromarray(cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB))
+            pil_img.thumbnail((720, 720))
+            content_list.append({"type": "image", "image": pil_img})
 
-    elif active_mode == "screen":
-        system_prompt = (
-            "You are A.R.G.U.S. Desktop Copilot. "
-            "Analyze the user's screen carefully and answer their question clearly in one or two short sentences."
-        )
-        task_query = user_spoken_prompt
+        content_list.append({"type": "text", "text": f"{system_prompt}\n\nStudent Request: {task_query}"})
+        messages.append({"role": "user", "content": content_list})
 
-    else: 
-        system_prompt = (
-            "You are A.R.G.U.S., a friendly multimodal companion. "
-            "Look at the scene and answer the user's query naturally in one or two sentences."
-        )
-        task_query = user_spoken_prompt
+    # ASSISTIVE / SCREEN / LIVE PIPELINES (Single Image)
+    else:
+        rgb_frame = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(rgb_frame)
+        pil_image.thumbnail((960, 960)) 
 
-    messages = []
-    if active_mode not in ["lecture", "assistive"]:
+        if active_mode == "assistive":
+            print("[ROUTER] Executing Assistive Vision Pipeline...")
+            system_prompt = (
+                "You are A.R.G.U.S. Assistive Eye, an AI assistant for a visually impaired user. "
+                "Prioritize physical safety and high-accuracy text extraction. "
+                "Answer directly and concisely without conversational fluff."
+            )
+            task_query = user_spoken_prompt if user_spoken_prompt else "Describe the object held or warn of hazards in view."
+
+        elif active_mode == "screen":
+            system_prompt = (
+                "You are A.R.G.U.S. Desktop Copilot. "
+                "Analyze the user's screen carefully and answer their question clearly in one or two short sentences."
+            )
+            task_query = user_spoken_prompt
+
+        else: 
+            system_prompt = (
+                "You are A.R.G.U.S., a friendly multimodal companion. "
+                "Look at the scene and answer the user's query naturally in one or two sentences."
+            )
+            task_query = user_spoken_prompt
+
         for past_q, past_a in conversation_memory:
             messages.append({"role": "user", "content": [{"type": "text", "text": past_q}]})
             messages.append({"role": "assistant", "content": [{"type": "text", "text": past_a}]})
-    
-    messages.append({
-        "role": "user",
-        "content": [
-            {"type": "image", "image": pil_image},
-            {"type": "text", "text": f"{system_prompt}\n\nQuery: {task_query}"}
-        ]
-    })
+        
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "image", "image": pil_image},
+                {"type": "text", "text": f"{system_prompt}\n\nQuery: {task_query}"}
+            ]
+        })
 
+    # Execute Inference
     text = spatial_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     
@@ -313,16 +321,9 @@ def process_prompt(user_spoken_prompt):
         text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
     ).to("cuda")
 
-    if active_mode == "lecture":
-        print("[SYSTEM] 🧠 Switching Brain to MATH Mode...")
-        spatial_model.set_adapter("argus_math")
-    else:
-        print("[SYSTEM] 🧠 Switching Brain to GENERAL Mode...")
-        spatial_model.set_adapter("argus_general")
-    
-    max_tokens = 150 if active_mode == "lecture" else 70
+    max_tokens = 300 if active_mode == "lecture" else 70 
     generated_ids = spatial_model.generate(
-        **inputs, max_new_tokens=max_tokens, temperature=0.2, repetition_penalty=1.1, do_sample=True
+        **inputs, max_new_tokens=max_tokens, temperature=0.3, repetition_penalty=1.1, do_sample=True
     )
     
     generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
@@ -362,19 +363,20 @@ def tts_worker():
             pass
 
 def audio_worker():
-    global system_is_running, assistant_state
+    global system_is_running, assistant_state, class_transcript
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 3000  
+    recognizer.energy_threshold = 300   # <--- CHANGED FROM 3000 to 300
     recognizer.dynamic_energy_threshold = True
     recognizer.pause_threshold = 0.8
-
     temp_wav_path = os.path.join(tempfile.gettempdir(), "argus_mic.wav")
 
+
+# --- FIX: Strictly use Windows Default Input (Headphones) ---
     try:
-        mic = sr.Microphone()
+        mic = sr.Microphone() # No override! Forces it to use your Windows settings
         with mic as source:
             recognizer.adjust_for_ambient_noise(source, duration=1.2)
-            print("[AUDIO] Microphone calibrated and online.")
+            print("[AUDIO] Headphone/Default Microphone calibrated and online.")
     except Exception as e:
         print(f"[AUDIO ERROR] No microphone detected: {e}")
         return
@@ -386,7 +388,7 @@ def audio_worker():
             with mic as source:
                 if ws_manager.current_mode == "lecture":
                     try:
-                        audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=6.0)
+                        audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=10.0)
                         with open(temp_wav_path, "wb") as f:
                             f.write(audio_data.get_wav_data())
                         
@@ -394,12 +396,10 @@ def audio_worker():
                         spoken_chunk = "".join([s.text for s in segments]).strip()
                         
                         if len(spoken_chunk) > 2:
-                            lecture_audio_buffer.append(spoken_chunk)
+                            class_transcript.append(spoken_chunk)
                             ws_manager.broadcast_sync({"event": "lecture_transcript", "text": spoken_chunk})
-
-                            if any(trigger in spoken_chunk.lower() for trigger in ["evaluate", "check board", "argus"]):
-                                play_capture_chime()
-                                prompt_queue.put("Evaluate the whiteboard against current lecture notes.")
+                            print(f"[OBSERVER AUDIO] Logged: '{spoken_chunk}'")
+                            
                     except sr.WaitTimeoutError:
                         continue
 
@@ -461,10 +461,10 @@ def llm_worker():
             pass
 
 def screen_stream_worker():
-    global system_is_running
+    global system_is_running, last_snapshot_time, class_whiteboard_frames, latest_cv2_frame
     while system_is_running:
-        # --- CHANGED: Broadcast DXCam stream to UI when in Lecture Mode too ---
-        if ws_manager.current_mode in ["screen", "lecture"]:
+        # 1. Desktop Copilot Stream
+        if ws_manager.current_mode == "screen":
             frame = dxcam_camera.get_latest_frame()
             if frame is not None:
                 preview = cv2.resize(frame, (960, 540)) 
@@ -475,6 +475,16 @@ def screen_stream_worker():
                         "event": "screen_frame",
                         "image_data": "data:image/jpeg;base64," + b64
                     })
+        
+        # 2. OBSERVER MODE: Snapshot the Camo iPhone stream every 60s
+        elif ws_manager.current_mode == "lecture":
+            current_time = time.time()
+            if current_time - last_snapshot_time >= 60.0:
+                if latest_cv2_frame is not None:
+                    class_whiteboard_frames.append(latest_cv2_frame.copy())
+                    last_snapshot_time = current_time
+                    print(f"[OBSERVER VISION] Camo Whiteboard snapshot saved. (Images in memory: {len(class_whiteboard_frames)}/5)")
+
         time.sleep(0.06) 
 
 # Start Threads
@@ -498,7 +508,7 @@ async def serve_dashboard():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global latest_cv2_frame
+    global latest_cv2_frame, class_transcript, class_whiteboard_frames, last_snapshot_time
     await ws_manager.connect(websocket)
     try:
         while True:
@@ -511,6 +521,12 @@ async def websocket_endpoint(websocket: WebSocket):
                 ws_manager.current_mode = mode
                 print(f"[SYSTEM] Operation mode switched to: {mode.upper()}")
                 ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode})
+                
+                if mode == "lecture":
+                    class_transcript.clear()
+                    class_whiteboard_frames.clear()
+                    last_snapshot_time = time.time()
+                    print("[SYSTEM] Cleared previous lecture memory. Ready to observe new class via Camo.")
 
             elif event == "video_frame":
                 try:
@@ -528,9 +544,9 @@ async def websocket_endpoint(websocket: WebSocket):
                     pass
 
             elif event == "trigger_lecture_evaluation":
-                print("[SYSTEM] Manual Lecture Evaluation Triggered from UI.")
+                print("[SYSTEM] Manual Post-Class Tutor Triggered from UI.")
                 play_capture_chime()
-                prompt_queue.put("Cross-reference the whiteboard equations against spoken lecture speech and highlight errors.")
+                prompt_queue.put("Provide a comprehensive summary of today's class and generate 3 practice questions to test my knowledge.")
 
             elif event == "user_prompt":
                 prompt_text = data.get("text", "")
