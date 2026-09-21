@@ -373,21 +373,38 @@ def tts_worker():
 
 def audio_worker():
     global system_is_running, assistant_state
+    
+    # 1. Print the actual Windows Default Microphone name so you know it's working
+    try:
+        import pyaudio
+        p = pyaudio.PyAudio()
+        default_mic_info = p.get_default_input_device_info()
+        print(f"\n[SYSTEM] Auto-selected Windows Default Mic: {default_mic_info['name']}")
+        p.terminate()
+    except Exception as e:
+        print("[WARNING] Could not read default mic name, but will still attempt to connect.")
+
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 3000  
+    # 2. Lower this from 3000 to 300 so quiet laptop microphones are detected!
+    recognizer.energy_threshold = 300  
     recognizer.dynamic_energy_threshold = True
     recognizer.pause_threshold = 0.8
 
     temp_wav_path = os.path.join(tempfile.gettempdir(), "argus_mic.wav")
 
     try:
+        # Leaving this empty forces it to use the Windows Default device
         mic = sr.Microphone()
         with mic as source:
-            recognizer.adjust_for_ambient_noise(source, duration=1.2)
+            print("[AUDIO] Calibrating to background noise. Please wait 2 seconds...")
+            # 3. Increased calibration time to 2.0s to better adapt to laptop fan noise
+            recognizer.adjust_for_ambient_noise(source, duration=2.0)
             print("[AUDIO] Microphone calibrated and online.")
     except Exception as e:
         print(f"[AUDIO ERROR] No microphone detected: {e}")
         return
+        
+    # ... (Rest of your audio_worker code remains exactly the same below this)
 
     wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "hey argus"]
 
