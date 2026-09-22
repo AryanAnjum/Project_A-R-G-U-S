@@ -68,3 +68,4 @@ pyvips-binary
 pyvips
 bitsandbytes 
 accelerate
+pip install nvidia-ml-py

@@ -22,7 +22,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 
 from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
-from peft import PeftModel # <-- ADDED PEFT IMPORT
+from peft import PeftModel 
 from qwen_vl_utils import process_vision_info
 from faster_whisper import WhisperModel
 
@@ -30,6 +30,15 @@ try:
     import winsound
 except ImportError:
     winsound = None
+
+# --- NVIDIA Hardware Monitoring ---
+try:
+    import pynvml
+    pynvml.nvmlInit()
+    NVML_AVAILABLE = True
+except ImportError:
+    NVML_AVAILABLE = False
+    print("[WARNING] nvidia-ml-py not installed. GPU Temperature will be mocked.")
 
 # Initialize audio mixer
 pygame.mixer.init()
@@ -100,7 +109,6 @@ print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-# Note: Reverted path based on your latest file structure where the adapters are in the root directory
 GENERAL_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-200gb-checkpoints", "final_adapter"))
 MATH_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-math-adapter", "final_adapter"))
 
@@ -165,6 +173,7 @@ latest_cv2_frame = None
 conversation_memory = collections.deque(maxlen=3) 
 system_is_running = True
 assistant_state = "idle"
+last_latency = 0  # Global tracker for UI latency gauge
 
 # Rolling buffer storing the last 45-60 seconds of lecture speech for App 2
 lecture_audio_buffer = collections.deque(maxlen=8)
@@ -231,7 +240,7 @@ def interrupt_tts():
 # 5. MULTI-APP VISION LOGIC (CORE ROUTER)
 # ==========================================
 def process_prompt(user_spoken_prompt):
-    global conversation_memory, latest_cv2_frame
+    global conversation_memory, latest_cv2_frame, last_latency
     frame_to_process = None
     active_mode = ws_manager.current_mode
 
@@ -311,7 +320,6 @@ def process_prompt(user_spoken_prompt):
         ]
     })
 
-    # Inference Execution
     text = spatial_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     
@@ -329,9 +337,15 @@ def process_prompt(user_spoken_prompt):
     # -------------------------------------
     
     max_tokens = 150 if active_mode == "lecture" else 70
+    
+    start_time = time.time()
+    
     generated_ids = spatial_model.generate(
         **inputs, max_new_tokens=max_tokens, temperature=0.2, repetition_penalty=1.1, do_sample=True
     )
+    
+    # Update global latency for the background worker to broadcast
+    last_latency = int((time.time() - start_time) * 1000)
     
     generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
     answer = spatial_processor.batch_decode(
@@ -358,6 +372,36 @@ def process_prompt(user_spoken_prompt):
 # ==========================================
 # 6. ASYNC BACKGROUND WORKERS
 # ==========================================
+def hardware_metrics_worker():
+    global system_is_running, last_latency
+    while system_is_running:
+        try:
+            # Fetch VRAM
+            vram_used = torch.cuda.memory_reserved() / (1024 ** 3) 
+            vram_total = 8.0 
+            
+            # Fetch Temp
+            gpu_temp = "--" 
+            if NVML_AVAILABLE:
+                try:
+                    handle = pynvml.nvmlDeviceGetHandleByIndex(0)
+                    gpu_temp = pynvml.nvmlDeviceGetTemperature(handle, pynvml.NVML_TEMPERATURE_GPU)
+                except Exception:
+                    pass
+
+            # Broadcast every 1 second
+            ws_manager.broadcast_sync({
+                "event": "system_metrics",
+                "vram_used": round(vram_used, 1),
+                "vram_total": vram_total,
+                "temperature": gpu_temp,
+                "latency": last_latency if last_latency > 0 else "--"
+            })
+        except Exception:
+            pass
+            
+        time.sleep(1.0)
+
 def tts_worker():
     global system_is_running, tts_done_event, tts_interrupt_requested
     while system_is_running:
@@ -374,7 +418,6 @@ def tts_worker():
 def audio_worker():
     global system_is_running, assistant_state
     
-    # 1. Print the actual Windows Default Microphone name so you know it's working
     try:
         import pyaudio
         p = pyaudio.PyAudio()
@@ -385,7 +428,6 @@ def audio_worker():
         print("[WARNING] Could not read default mic name, but will still attempt to connect.")
 
     recognizer = sr.Recognizer()
-    # 2. Lower this from 3000 to 300 so quiet laptop microphones are detected!
     recognizer.energy_threshold = 300  
     recognizer.dynamic_energy_threshold = True
     recognizer.pause_threshold = 0.8
@@ -393,19 +435,15 @@ def audio_worker():
     temp_wav_path = os.path.join(tempfile.gettempdir(), "argus_mic.wav")
 
     try:
-        # Leaving this empty forces it to use the Windows Default device
         mic = sr.Microphone()
         with mic as source:
             print("[AUDIO] Calibrating to background noise. Please wait 2 seconds...")
-            # 3. Increased calibration time to 2.0s to better adapt to laptop fan noise
             recognizer.adjust_for_ambient_noise(source, duration=2.0)
             print("[AUDIO] Microphone calibrated and online.")
     except Exception as e:
         print(f"[AUDIO ERROR] No microphone detected: {e}")
         return
         
-    # ... (Rest of your audio_worker code remains exactly the same below this)
-
     wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "hey argus"]
 
     while system_is_running:
@@ -425,7 +463,6 @@ def audio_worker():
                             lecture_audio_buffer.append(spoken_chunk)
                             ws_manager.broadcast_sync({"event": "lecture_transcript", "text": spoken_chunk})
 
-                            # Allow vocal trigger to evaluate whiteboard
                             if any(trigger in spoken_chunk.lower() for trigger in ["evaluate", "check board", "argus"]):
                                 play_capture_chime()
                                 prompt_queue.put("Evaluate the whiteboard against current lecture notes.")
@@ -511,6 +548,7 @@ threading.Thread(target=tts_worker, daemon=True).start()
 threading.Thread(target=audio_worker, daemon=True).start()
 threading.Thread(target=llm_worker, daemon=True).start()
 threading.Thread(target=screen_stream_worker, daemon=True).start() 
+threading.Thread(target=hardware_metrics_worker, daemon=True).start() 
 
 
 # ==========================================
