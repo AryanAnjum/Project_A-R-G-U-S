@@ -36,7 +36,7 @@ except ImportError:
 pygame.mixer.init()
 
 # ==========================================
-# MOONDREAM2 / TRANSFORMERS COMPATIBILITY PATCH
+# TRANSFORMERS COMPATIBILITY PATCH
 # ==========================================
 _orig_getattr = torch.nn.Module.__getattr__
 def _patched_getattr(self, name):
@@ -124,7 +124,7 @@ except Exception:
     print("[WARNING] Loading default base processor fallback...")
     spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
 
-print("[SYSTEM] Loading Audio Brain (Whisper)...")
+print("[SYSTEM] Loading Audio Brain (Whisper base.en)...")
 audio_model = WhisperModel("base.en", device=device, compute_type="float16" if device == "cuda" else "int8")
 
 print("[SYSTEM] Initializing Desktop Optical Sensors...")
@@ -154,7 +154,7 @@ except Exception:
 # 3. STATE TRACKERS & OBSERVER MEMORY
 # ==========================================
 latest_cv2_frame = None 
-conversation_memory = collections.deque(maxlen=3) 
+conversation_memory = collections.deque(maxlen=4) 
 system_is_running = True
 assistant_state = "idle"
 
@@ -164,15 +164,11 @@ last_snapshot_time = time.time()
 
 tts_queue = queue.Queue()
 prompt_queue = queue.Queue() 
-tts_done_event = threading.Event()
 tts_interrupt_requested = False
 
-# This lock prevents the microphone from hearing the AI's own voice
-ready_for_audio_event = threading.Event()
-ready_for_audio_event.set()
 
 # ==========================================
-# 4. AUDIO & TTS HELPERS
+# 4. AUDIO & TTS HELPERS (WITH BARGE-IN)
 # ==========================================
 def play_beep(frequency=1800, duration=120):
     if winsound is None: return
@@ -180,24 +176,23 @@ def play_beep(frequency=1800, duration=120):
     except Exception: pass
 
 def play_startup_chime():
-    play_beep(1800, 140)
-    time.sleep(0.08)
-    play_beep(2200, 110)
+    play_beep(1800, 100)
+    time.sleep(0.04)
+    play_beep(2400, 120)
 
 def play_capture_chime():
-    play_beep(2200, 110)
-    time.sleep(0.05)
-    play_beep(2600, 130)
+    play_beep(2200, 80)
+    time.sleep(0.04)
+    play_beep(2600, 100)
 
-def play_hazard_alert():
-    play_beep(3000, 100)
-    time.sleep(0.05)
-    play_beep(3000, 200)
+def play_cancel_chime():
+    play_beep(1400, 150)
 
-def speak_text(text_to_say, speech_rate="+10%"):
+def speak_text(text_to_say, speech_rate="+12%"):
     global tts_interrupt_requested
     async def _speak():
-        communicate = edge_tts.Communicate(text_to_say, "en-US-ChristopherNeural", rate=speech_rate)
+        # CHANGED VOICE TO GUY (More natural/conversational male voice)
+        communicate = edge_tts.Communicate(text_to_say, "en-US-GuyNeural", rate=speech_rate)
         temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
         temp_file.close()
         await communicate.save(temp_file.name)
@@ -208,7 +203,7 @@ def speak_text(text_to_say, speech_rate="+10%"):
             if tts_interrupt_requested:
                 pygame.mixer.music.stop()
                 break
-            time.sleep(0.05)
+            time.sleep(0.03)
             
         pygame.mixer.music.unload()
         try: os.remove(temp_file.name)
@@ -217,27 +212,43 @@ def speak_text(text_to_say, speech_rate="+10%"):
     asyncio.run(_speak())
 
 def interrupt_tts():
+    """Immediately halts audio playback and drains pending speech."""
     global tts_interrupt_requested
     tts_interrupt_requested = True
-    if pygame.mixer.music.get_busy():
-        pygame.mixer.music.stop()
+    try:
+        if pygame.mixer.music.get_busy():
+            pygame.mixer.music.stop()
+            pygame.mixer.music.unload()
+    except Exception:
+        pass
+    
+    # Flush pending queue so previous answers don't speak later
+    while not tts_queue.empty():
+        try: tts_queue.get_nowait()
+        except queue.Empty: break
 
 def is_hallucination(text):
-    # Removes punctuation to check if Whisper hallucinated background static as common words
     clean = text.translate(str.maketrans('', '', string.punctuation)).lower().strip()
-    hallucinations = ["thank you", "thanks", "thanks for watching", "subscribe", "you", "bye", "okay", "ok", "amaraorg"]
+    hallucinations = ["thank you", "thanks", "thanks for watching", "subscribe", "you", "bye", "okay", "ok", "amaraorg", "yeah"]
     return clean in hallucinations or len(clean) < 2
 
+def is_stop_command(text):
+    clean = text.translate(str.maketrans('', '', string.punctuation)).lower().strip()
+    stop_words = ["stop", "shut up", "be quiet", "cancel", "never mind", "no need", "enough", "stop talking", "dont answer", "hold on", "pause", "thanks stop"]
+    return any(w in clean for w in stop_words)
+
 
 # ==========================================
-# 5. MULTI-APP VISION LOGIC (CORE ROUTER)
+# 5. MULTI-APP VISION LOGIC (HUMAN-LIKE CONVERSATIONAL)
 # ==========================================
 def process_prompt(user_spoken_prompt):
-    global conversation_memory, latest_cv2_frame, class_whiteboard_frames, class_transcript
+    global conversation_memory, latest_cv2_frame, class_whiteboard_frames, class_transcript, tts_interrupt_requested
     frame_to_process = None
     active_mode = ws_manager.current_mode
     messages = []
     
+    tts_interrupt_requested = False
+
     if active_mode == "screen":
         frame_to_process = dxcam_camera.get_latest_frame()
         if frame_to_process is None:
@@ -247,11 +258,12 @@ def process_prompt(user_spoken_prompt):
         frame_to_process = latest_cv2_frame
 
     if frame_to_process is None and active_mode != "lecture":
-        err_msg = "Optical feed unavailable for processing."
+        err_msg = "I can't see the feed right now."
         ws_manager.broadcast_sync({"event": "argus_reply", "text": err_msg})
         tts_queue.put(err_msg)
         return
 
+    # LECTURE OBSERVER & TUTOR
     if active_mode == "lecture":
         print("[ROUTER] Executing Post-Class Tutor Pipeline...")
         full_transcript = " ".join(class_transcript)
@@ -259,12 +271,12 @@ def process_prompt(user_spoken_prompt):
             full_transcript = "[No speech registered during class.]"
 
         system_prompt = (
-            "You are A.R.G.U.S., an intelligent post-class tutor. "
-            "You have observed a class. Review the provided chronological whiteboard snapshots and the "
-            f"transcribed audio from the teacher: \"{full_transcript[-3000:]}\". " 
-            "Based on this material, fulfill the student's request comprehensively. Structure your answer clearly."
+            "You are A.R.G.U.S., a sharp and supportive academic tutor. "
+            "Review the whiteboard snapshots and the teacher's lecture transcript: "
+            f"\"{full_transcript[-2500:]}\". "
+            "Answer the student's request in a natural, clear, conversational way. Keep explanations concise."
         )
-        task_query = user_spoken_prompt if user_spoken_prompt else "Summarize the key concepts taught in this class and provide 3 practice questions."
+        task_query = user_spoken_prompt if user_spoken_prompt else "Summarize today's main lesson and give me 2 practice questions."
 
         content_list = []
         for img_arr in class_whiteboard_frames:
@@ -277,37 +289,47 @@ def process_prompt(user_spoken_prompt):
             pil_img.thumbnail((720, 720))
             content_list.append({"type": "image", "image": pil_img})
 
-        content_list.append({"type": "text", "text": f"{system_prompt}\n\nStudent Request: {task_query}"})
+        content_list.append({"type": "text", "text": f"{system_prompt}\n\nStudent asks: {task_query}"})
         messages.append({"role": "user", "content": content_list})
+        max_tokens = 220
 
+    # CONVERSATIONAL MODES (SCREEN / LIVE / ASSISTIVE)
     else:
         rgb_frame = cv2.cvtColor(frame_to_process, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(rgb_frame)
         pil_image.thumbnail((960, 960)) 
 
         if active_mode == "assistive":
-            print("[ROUTER] Executing Assistive Vision Pipeline...")
             system_prompt = (
-                "You are A.R.G.U.S. Assistive Eye, an AI assistant for a visually impaired user. "
-                "Prioritize physical safety and high-accuracy text extraction. "
-                "Answer directly and concisely without conversational fluff."
+                "You are A.R.G.U.S. Assistive Voice for a visually impaired user. "
+                "Describe key objects, read exact medicine labels, or call out immediate physical hazards. "
+                "Be direct, calm, and concise (1-2 sentences)."
             )
-            task_query = user_spoken_prompt if user_spoken_prompt else "Describe the object held or warn of hazards in view."
-
+            task_query = user_spoken_prompt if user_spoken_prompt else "What is in front of me?"
+            
         elif active_mode == "screen":
+            # COMPLETELY REWRITTEN PROMPT FOR HUMAN PERSONALITY
             system_prompt = (
-                "You are A.R.G.U.S. Desktop Copilot. "
-                "Analyze the user's screen carefully and answer their question clearly in one or two short sentences."
+                "You are A.R.G.U.S., a friendly human acting as a real-time copilot looking at my screen. "
+                "Talk casually like we are friends on a Discord or FaceTime call. "
+                "Use conversational fillers naturally, like 'Hmm...', 'Oh wow', 'Haha!', or 'Uh, looks like...'. "
+                "Answer in 1 or 2 extremely short spoken sentences. "
+                "NEVER use markdown, bullet points, or robotic phrases like 'Certainly', 'As an AI', or 'I can see'."
             )
             task_query = user_spoken_prompt
-
+            
         else: 
+            # COMPLETELY REWRITTEN PROMPT FOR HUMAN PERSONALITY
             system_prompt = (
-                "You are A.R.G.U.S., a friendly multimodal companion. "
-                "Look at the scene and answer the user's query naturally in one or two sentences."
+                "You are A.R.G.U.S., a friendly human companion looking through my camera. "
+                "Talk casually like we are hanging out on a video call. "
+                "React like a human using words like 'Hmm...', 'Whoa!', or 'Haha!'. "
+                "Answer in 1 or 2 extremely short spoken sentences. "
+                "NEVER use robotic AI language, markdown, or formal lists."
             )
             task_query = user_spoken_prompt
 
+        # Append rolling dialogue memory for smooth back-and-forth
         for past_q, past_a in conversation_memory:
             messages.append({"role": "user", "content": [{"type": "text", "text": past_q}]})
             messages.append({"role": "assistant", "content": [{"type": "text", "text": past_a}]})
@@ -316,10 +338,12 @@ def process_prompt(user_spoken_prompt):
             "role": "user",
             "content": [
                 {"type": "image", "image": pil_image},
-                {"type": "text", "text": f"{system_prompt}\n\nQuery: {task_query}"}
+                {"type": "text", "text": f"{system_prompt}\n\nUser: {task_query}"}
             ]
         })
+        max_tokens = 60 # Strictly limited to short spoken sentences
 
+    # Execute Inference
     text = spatial_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
     image_inputs, video_inputs = process_vision_info(messages)
     
@@ -327,9 +351,12 @@ def process_prompt(user_spoken_prompt):
         text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
     ).to("cuda")
 
-    max_tokens = 300 if active_mode == "lecture" else 70 
     generated_ids = spatial_model.generate(
-        **inputs, max_new_tokens=max_tokens, temperature=0.3, repetition_penalty=1.1, do_sample=True
+        **inputs, 
+        max_new_tokens=max_tokens, 
+        temperature=0.6, # Increased temperature to make it more creative and less robotic
+        repetition_penalty=1.15, 
+        do_sample=True
     )
     
     generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
@@ -337,14 +364,20 @@ def process_prompt(user_spoken_prompt):
         generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
     )[0].replace('"', '').strip()
 
-    if active_mode == "assistive" and any(k in answer.lower() for k in ["hazard", "warning", "caution", "danger", "step"]):
+    # If the user interrupted while Qwen was generating, discard the result
+    if tts_interrupt_requested:
+        del inputs, generated_ids, generated_ids_trimmed
+        torch.cuda.empty_cache()
+        return
+
+    if active_mode == "assistive" and any(k in answer.lower() for k in ["hazard", "warning", "caution", "danger", "step", "fall"]):
         play_hazard_alert()
 
     if active_mode not in ["lecture", "assistive"]:
         conversation_memory.append((user_spoken_prompt, answer))
 
     ws_manager.broadcast_sync({"event": "argus_reply", "text": answer, "mode": active_mode})
-    ws_manager.broadcast_sync({"event": "perception_log", "engine": "Qwen2-VL", "text": f"Processed ({active_mode.upper()}): {task_query}"})
+    ws_manager.broadcast_sync({"event": "perception_log", "engine": "Qwen2-VL", "text": f"Reply: {answer}"})
     
     tts_queue.put(answer)
     
@@ -353,31 +386,25 @@ def process_prompt(user_spoken_prompt):
 
 
 # ==========================================
-# 6. ASYNC BACKGROUND WORKERS
+# 6. ASYNC BACKGROUND WORKERS (FULL DUPLEX)
 # ==========================================
 def tts_worker():
-    global system_is_running, tts_done_event, tts_interrupt_requested, ready_for_audio_event
+    global system_is_running, tts_interrupt_requested
     while system_is_running:
         try:
-            text_to_say = tts_queue.get(timeout=0.5)
+            text_to_say = tts_queue.get(timeout=0.3)
             tts_interrupt_requested = False
-            tts_done_event.clear()
-            rate = "+15%" if ws_manager.current_mode == "assistive" else "+10%"
-            
+            rate = "+15%" if ws_manager.current_mode == "assistive" else "+8%" # Slowed down slightly for natural human pacing
             speak_text(text_to_say, speech_rate=rate)
-            
-            tts_done_event.set()
-            # Once the AI has completely finished talking out loud, unlock the microphone
-            ready_for_audio_event.set() 
         except queue.Empty:
             pass
 
 def audio_worker():
-    global system_is_running, assistant_state, class_transcript, ready_for_audio_event
+    global system_is_running, assistant_state, class_transcript, tts_interrupt_requested
     recognizer = sr.Recognizer()
-    recognizer.energy_threshold = 300   
+    recognizer.energy_threshold = 280   
     recognizer.dynamic_energy_threshold = True
-    recognizer.pause_threshold = 0.8
+    recognizer.pause_threshold = 0.65   # Quicker response turnaround
 
     temp_wav_path = os.path.join(tempfile.gettempdir(), "argus_mic.wav")
 
@@ -385,7 +412,7 @@ def audio_worker():
         mic = sr.Microphone() 
         with mic as source:
             recognizer.adjust_for_ambient_noise(source, duration=1.2)
-            print("[AUDIO] Headphone/Default Microphone calibrated and online.")
+            print("[AUDIO] Headphone Microphone calibrated and active (Full Duplex).")
     except Exception as e:
         print(f"[AUDIO ERROR] No microphone detected: {e}")
         return
@@ -393,22 +420,15 @@ def audio_worker():
     wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "hey argus"]
 
     while system_is_running:
-        # Prevent the mic from picking up the AI's own voice
-        ready_for_audio_event.wait()
-        
-        # Double check no audio is playing
-        while pygame.mixer.music.get_busy():
-            time.sleep(0.1)
-
         try:
             with mic as source:
+                # 1. LECTURE OBSERVER MODE
                 if ws_manager.current_mode == "lecture":
                     try:
-                        audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=10.0)
+                        audio_data = recognizer.listen(source, timeout=3.0, phrase_time_limit=8.0)
                         with open(temp_wav_path, "wb") as f:
                             f.write(audio_data.get_wav_data())
                         
-                        # vad_filter prevents hallucinating static as words
                         segments, _ = audio_model.transcribe(temp_wav_path, beam_size=3, language="en", vad_filter=True, initial_prompt="Argus.")
                         spoken_chunk = "".join([s.text for s in segments]).strip()
                         
@@ -416,62 +436,79 @@ def audio_worker():
                             class_transcript.append(spoken_chunk)
                             ws_manager.broadcast_sync({"event": "lecture_transcript", "text": spoken_chunk})
                             print(f"[OBSERVER AUDIO] Logged: '{spoken_chunk}'")
-                            
                     except sr.WaitTimeoutError:
                         continue
 
-                elif assistant_state == "active":
+                # 2. CONVERSATIONAL MODES (Screen / Live / Assistive)
+                else:
+                    listen_timeout = 5.0 if assistant_state == "active" else 2.0
                     try:
-                        command_audio = recognizer.listen(source, timeout=6.0, phrase_time_limit=10.0)
+                        audio_data = recognizer.listen(source, timeout=listen_timeout, phrase_time_limit=8.0)
                     except sr.WaitTimeoutError:
-                        assistant_state = "idle"
-                        ws_manager.broadcast_sync({"event": "perception_log", "engine": "SYSTEM", "text": "Auditory listener entered idle state."})
-                        continue
-
-                    with open(temp_wav_path, "wb") as f:
-                        f.write(command_audio.get_wav_data())
-
-                    segments, _ = audio_model.transcribe(temp_wav_path, beam_size=5, language="en", vad_filter=True, initial_prompt="Argus.")
-                    user_spoken_prompt = "".join([s.text for s in segments]).strip()
-
-                    if not is_hallucination(user_spoken_prompt):
-                        play_capture_chime()
-                        ws_manager.broadcast_sync({"event": "speech_recognized", "text": user_spoken_prompt})
-                        
-                        # Lock the mic so we don't hear the TTS response!
-                        ready_for_audio_event.clear()
-                        prompt_queue.put(user_spoken_prompt)
-
-                elif assistant_state == "idle":
-                    try:
-                        audio_data = recognizer.listen(source, timeout=2.0, phrase_time_limit=4.0)
-                    except sr.WaitTimeoutError:
+                        if assistant_state == "active" and not pygame.mixer.music.get_busy():
+                            assistant_state = "idle"
+                            ws_manager.broadcast_sync({"event": "perception_log", "engine": "SYSTEM", "text": "Listening timed out. Standing by."})
                         continue
 
                     with open(temp_wav_path, "wb") as f:
                         f.write(audio_data.get_wav_data())
 
                     segments, _ = audio_model.transcribe(temp_wav_path, beam_size=3, language="en", vad_filter=True, initial_prompt="Argus.")
-                    transcription = "".join([s.text for s in segments]).strip()
-                    
-                    # Clean punctuation to reliably catch "Hey, Argus!" or "Argus."
-                    clean_trans = transcription.translate(str.maketrans('', '', string.punctuation)).lower()
+                    user_spoken = "".join([s.text for s in segments]).strip()
+                    clean_text = user_spoken.translate(str.maketrans('', '', string.punctuation)).lower()
 
-                    if any(variant in clean_trans for variant in wake_variants):
+                    if is_hallucination(user_spoken):
+                        continue
+
+                    # --- ACTIVE BARGE-IN & INTERRUPTION CHECK ---
+                    is_currently_speaking = pygame.mixer.music.get_busy() or not tts_queue.empty()
+
+                    # CASE A: User gave a stop/cancel command
+                    if is_stop_command(clean_text):
+                        print(f"[INTERRUPT] User commanded: '{user_spoken}' -> Stopping immediately.")
                         interrupt_tts()
-                        play_startup_chime()
-                        ws_manager.broadcast_sync({"event": "speech_recognized", "text": transcription})
-                        ws_manager.broadcast_sync({"event": "perception_log", "engine": "WHISPER", "text": "Wake Word Detected!"})
-                        
-                        # Lock mic so it doesn't process its own greeting
-                        ready_for_audio_event.clear()
-                        greeting = "I'm with you. What do you need?" if ws_manager.current_mode != "assistive" else "A.R.G.U.S. ready. Point the camera."
-                        tts_queue.put(greeting)
+                        play_cancel_chime()
+                        assistant_state = "idle"
+                        ws_manager.broadcast_sync({"event": "perception_log", "engine": "SYSTEM", "text": "Interrupted and silenced."})
+                        continue
+
+                    # CASE B: AI is talking and the user speaks a new question/input
+                    if is_currently_speaking:
+                        print(f"[BARGE-IN] Interrupted speech with new question: '{user_spoken}'")
+                        interrupt_tts()
+                        play_capture_chime()
+                        ws_manager.broadcast_sync({"event": "speech_recognized", "text": user_spoken})
+                        prompt_queue.put(user_spoken)
                         assistant_state = "active"
+                        continue
+
+                    # CASE C: Wake word detected while idle
+                    if assistant_state == "idle":
+                        if any(variant in clean_text for variant in wake_variants):
+                            play_startup_chime()
+                            ws_manager.broadcast_sync({"event": "speech_recognized", "text": user_spoken})
+                            
+                            remainder = clean_text
+                            for v in wake_variants:
+                                remainder = remainder.replace(v, "").strip()
+
+                            if len(remainder) > 3:
+                                prompt_queue.put(remainder)
+                            else:
+                                greeting = "Yeah? I'm here." if ws_manager.current_mode != "assistive" else "I'm listening."
+                                tts_queue.put(greeting)
+                            
+                            assistant_state = "active"
+
+                    # CASE D: Already active, user asking follow-up question
+                    elif assistant_state == "active":
+                        play_capture_chime()
+                        ws_manager.broadcast_sync({"event": "speech_recognized", "text": user_spoken})
+                        prompt_queue.put(user_spoken)
 
         except Exception:
             pass
-        time.sleep(0.05)
+        time.sleep(0.04)
 
 def llm_worker():
     global system_is_running
@@ -507,7 +544,7 @@ def screen_stream_worker():
 
         time.sleep(0.06) 
 
-# Start Threads
+# Start Background Threads
 threading.Thread(target=tts_worker, daemon=True).start()
 threading.Thread(target=audio_worker, daemon=True).start()
 threading.Thread(target=llm_worker, daemon=True).start()
@@ -528,7 +565,7 @@ async def serve_dashboard():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global latest_cv2_frame, class_transcript, class_whiteboard_frames, last_snapshot_time, ready_for_audio_event
+    global latest_cv2_frame, class_transcript, class_whiteboard_frames, last_snapshot_time
     await ws_manager.connect(websocket)
     try:
         while True:
@@ -565,14 +602,14 @@ async def websocket_endpoint(websocket: WebSocket):
 
             elif event == "trigger_lecture_evaluation":
                 print("[SYSTEM] Manual Post-Class Tutor Triggered from UI.")
+                interrupt_tts()
                 play_capture_chime()
-                ready_for_audio_event.clear()
-                prompt_queue.put("Provide a comprehensive summary of today's class and generate 3 practice questions to test my knowledge.")
+                prompt_queue.put("Provide a comprehensive summary of today's class and generate 2 practice questions to test my knowledge.")
 
             elif event == "user_prompt":
                 prompt_text = data.get("text", "")
                 print(f"[WEBSITE PROMPT]: {prompt_text}")
-                ready_for_audio_event.clear()
+                interrupt_tts()
                 prompt_queue.put(prompt_text)
 
     except WebSocketDisconnect:
