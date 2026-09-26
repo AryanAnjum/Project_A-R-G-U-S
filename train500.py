@@ -1,51 +1,42 @@
-import torch
 import os
-import time
+import sys
 import copy
 import io
+import torch
 from PIL import Image
 from datasets import load_dataset, interleave_datasets
 from transformers import (
     Qwen2VLForConditionalGeneration, 
     AutoProcessor, 
     TrainingArguments, 
-    Trainer,
-    TrainerCallback
+    Trainer
 )
-from transformers.trainer_utils import get_last_checkpoint
-from peft import LoraConfig, get_peft_model
-from qwen_vl_utils import process_vision_info
+from peft import LoraConfig, get_peft_model, PeftModel
 
 # ==========================================
-# 1. 500GB 20-SUBSET CONFIGURATION
+# 1. 5-PART SUBSET PARTITIONS (~100GB EACH)
 # ==========================================
 LOCAL_DATASET_DIR = "../LLaVA-OneVision-Data" 
-OUTPUT_DIR = "./qwen2-vl-argus-500gb-checkpoints"
+BASE_OUTPUT_DIR = "./argus_phased_adapters"
+os.makedirs(BASE_OUTPUT_DIR, exist_ok=True)
 
-# Add all your targeted subset names to this array
-SUBSETS = [
-    "sharegpt4o", "mathqa", "scienceqa", "docvqa", "chartqa",
-    "textvqa", "ocrvqa", "ai2d", "geometry3k", "clevr",
-    "vqav2", "vizwiz", "infographicvqa", "gqa", "websight",
-    "synthdog", "mathvista", "theoremqa", "scibench", "coco"
-]
+# 20 subsets split logically into 5 distinct training phases
+DATASET_PARTS = {
+    1: ["sharegpt4o", "mathqa", "scienceqa", "docvqa"],
+    2: ["chartqa", "textvqa", "ocrvqa", "ai2d"],
+    3: ["geometry3k", "clevr", "vqav2", "vizwiz"],
+    4: ["infographicvqa", "gqa", "websight", "synthdog"],
+    5: ["mathvista", "theoremqa", "scibench", "coco"]
+}
 
-MAX_TRAINING_STEPS = 50000       
-SAVE_EVERY_STEPS = 1000    
-
-print(f"\n[SYSTEM] Booting 500GB Iterable Pipeline with {len(SUBSETS)} Subsets...")
-
-# ==========================================
-# 2. CHECKPOINT RESUME DETECTOR
-# ==========================================
-last_checkpoint = get_last_checkpoint(OUTPUT_DIR)
-if last_checkpoint:
-    print(f"[SYSTEM] Resuming from fault-tolerant checkpoint: {last_checkpoint}")
-else:
-    print("[SYSTEM] No checkpoint found. Starting fresh training loop.")
+# 2,000 steps per part takes roughly 3 to 4 hours on an RTX 5060 Ti
+# Total across 5 parts = 10,000 steps (160,000 samples trained)
+STEPS_PER_PART = 2000 
+BATCH_SIZE = 1
+GRAD_ACCUM = 16
 
 # ==========================================
-# 3. DYNAMIC 20-STREAM MULTIPLEXING
+# 2. DATA COLLATOR & STREAMING HELPERS
 # ==========================================
 def filter_invalid(sample):
     return "image" in sample and sample["image"] is not None
@@ -60,7 +51,7 @@ def format_sample(sample):
             "role": "user",
             "content": [
                 {"type": "image", "image": "<PLACEHOLDER>"},
-                {"type": "text", "text": f"You are A.R.G.U.S., a highly observant AI. Answer concisely.\n\nQuestion: {user_text}"}
+                {"type": "text", "text": f"You are A.R.G.U.S., a sharp multimodal assistant.\n\nQuestion: {user_text}"}
             ]
         },
         {
@@ -70,35 +61,6 @@ def format_sample(sample):
     ]
     return {"messages": messages}
 
-print(f"\n[SYSTEM] Initializing Zero-RAM SSD Streams...")
-
-# Dynamically generate a streaming pipeline for every subset in your list
-dataset_streams = []
-for subset in SUBSETS:
-    print(f" -> Opening pipeline for: {subset}")
-    stream = load_dataset(LOCAL_DATASET_DIR, subset, split="train", streaming=True)
-    dataset_streams.append(stream)
-
-# Calculate an equal probability fraction (1 / 20 = 0.05 for each stream)
-equal_probabilities = [1.0 / len(SUBSETS)] * len(SUBSETS)
-
-# Multiplex all 20 streams together dynamically
-mixed_stream = interleave_datasets(
-    dataset_streams, 
-    probabilities=equal_probabilities
-)
-
-train_dataset = (
-    mixed_stream
-    .filter(filter_invalid)
-    .map(format_sample, remove_columns=["id", "conversations"])
-)
-
-print("[SYSTEM] 20-Stream Multiplexer locked. Data will be fetched on demand.")
-
-# ==========================================
-# 4. DATA COLLATOR
-# ==========================================
 class Qwen2VLDataCollator:
     def __init__(self, processor):
         self.processor = processor
@@ -118,7 +80,6 @@ class Qwen2VLDataCollator:
                 pil_img = raw_img.convert("RGB")
 
             messages = copy.deepcopy(feature["messages"])
-            
             for msg in messages:
                 if "content" in msg:
                     for item in msg["content"]:
@@ -146,70 +107,160 @@ class Qwen2VLDataCollator:
         return batch
 
 # ==========================================
-# 5. MODEL & LORA INJECTION
+# 3. INTERACTIVE PART SELECTOR
 # ==========================================
-print("\n[SYSTEM] Loading Qwen2-VL Model in Native bfloat16...")
-
-processor = AutoProcessor.from_pretrained(
-    "Qwen/Qwen2-VL-2B-Instruct", 
-    min_pixels=256*28*28, 
-    max_pixels=640*28*28
-)
-
-model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2-VL-2B-Instruct",
-    torch_dtype=torch.bfloat16,
-    device_map="cuda"
-)
-
-model.enable_input_require_grads()
-
-peft_config = LoraConfig(
-    r=32, 
-    lora_alpha=64,
-    lora_dropout=0.05,
-    bias="none",
-    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
-    task_type="CAUSAL_LM",
-)
-
-model = get_peft_model(model, peft_config)
+def get_user_choice():
+    print("\n" + "="*50)
+    print("      A.R.G.U.S. PHASED 500GB TRAINING MENU")
+    print("="*50)
+    for p in range(1, 6):
+        path = os.path.join(BASE_OUTPUT_DIR, f"part_{p}_adapter")
+        status = "[COMPLETED]" if os.path.exists(path) else "[NOT STARTED]"
+        print(f" Part {p}: {DATASET_PARTS[p]} -> {status}")
+    print("="*50)
+    
+    while True:
+        choice = input("\nWhich Part do you want to train? (1-5) or 'q' to quit: ").strip().lower()
+        if choice == 'q':
+            sys.exit(0)
+        if choice in ["1", "2", "3", "4", "5"]:
+            return int(choice)
+        print("Invalid input. Enter a number between 1 and 5.")
 
 # ==========================================
-# 6. 500GB TRAINING EXECUTION
+# 4. TRAINING WORKER
 # ==========================================
-batch_size = 1  
-grad_accum = 16 
-
-training_args = TrainingArguments(
-    output_dir=OUTPUT_DIR,
-    max_steps=MAX_TRAINING_STEPS,
-    per_device_train_batch_size=batch_size,
-    gradient_accumulation_steps=grad_accum,
-    learning_rate=2e-4,
+def run_part_training(part_num):
+    print(f"\n[SYSTEM] Preparing Environment for Part {part_num}...")
+    current_save_path = os.path.join(BASE_OUTPUT_DIR, f"part_{part_num}_adapter")
+    subsets_to_train = DATASET_PARTS[part_num]
     
-    gradient_checkpointing=True,
-    gradient_checkpointing_kwargs={"use_reentrant": False},
-    
-    save_strategy="steps",
-    save_steps=SAVE_EVERY_STEPS,
-    save_total_limit=3,                
-    
-    logging_steps=10,
-    optim="paged_adamw_8bit",
-    bf16=True,                     
-    fp16=False,
-    remove_unused_columns=False,
-    report_to="none",
-    dataloader_num_workers=4, 
-)
+    # 1. Load Data Streams for this Phase
+    dataset_streams = []
+    for subset in subsets_to_train:
+        print(f" -> Connecting to stream: {subset}")
+        stream = load_dataset(LOCAL_DATASET_DIR, subset, split="train", streaming=True)
+        dataset_streams.append(stream)
 
-trainer = Trainer(
-    model=model,
-    args=training_args,
-    train_dataset=train_dataset,
-    data_collator=Qwen2VLDataCollator(processor)
-)
+    equal_probs = [1.0 / len(subsets_to_train)] * len(subsets_to_train)
+    mixed_stream = interleave_datasets(dataset_streams, probabilities=equal_probs)
+    train_dataset = (
+        mixed_stream
+        .filter(filter_invalid)
+        .map(format_sample, remove_columns=["id", "conversations"])
+    )
 
-print("\n[SYSTEM] Initializing 500GB Streaming Training Loop...")
-trainer.train(resume_from_checkpoint=last_checkpoint)
+    # 2. Load Base Backbone & Processor
+    processor = AutoProcessor.from_pretrained(
+        "Qwen/Qwen2-VL-2B-Instruct", 
+        min_pixels=256*28*28, 
+        max_pixels=640*28*28
+    )
+
+    model = Qwen2VLForConditionalGeneration.from_pretrained(
+        "Qwen/Qwen2-VL-2B-Instruct",
+        torch_dtype=torch.bfloat16,
+        device_map="cuda"
+    )
+
+    # Anti-crash cache setting
+    model.config.use_cache = False
+    model.enable_input_require_grads()
+
+    # 3. Model Architecture Wiring
+    if part_num == 1:
+        # Part 1: Initialize fresh LoRA adapters
+        print("[SYSTEM] Initializing fresh LoRA weights for Part 1...")
+        peft_config = LoraConfig(
+            r=32, 
+            lora_alpha=64,
+            lora_dropout=0.05,
+            bias="none",
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+            task_type="CAUSAL_LM",
+        )
+        model = get_peft_model(model, peft_config)
+    else:
+        # Subsequent Parts: Load adapter from previous part in TRAINABLE mode
+        prev_part = part_num - 1
+        prev_adapter_path = os.path.join(BASE_OUTPUT_DIR, f"part_{prev_part}_adapter")
+        if not os.path.exists(prev_adapter_path):
+            print(f"[ERROR] Cannot start Part {part_num} because previous adapter '{prev_adapter_path}' does not exist!")
+            print(f"[ACTION] Please train Part {prev_part} first.")
+            return False
+            
+        print(f"[SYSTEM] Loading and chaining adapter weights from Part {prev_part}...")
+        model = PeftModel.from_pretrained(model, prev_adapter_path, is_trainable=True)
+
+    model.base_model.config.use_cache = False
+
+    # 4. Training Arguments
+    training_args = TrainingArguments(
+        output_dir=os.path.join(BASE_OUTPUT_DIR, f"temp_run_part_{part_num}"),
+        max_steps=STEPS_PER_PART,
+        per_device_train_batch_size=BATCH_SIZE,
+        gradient_accumulation_steps=GRAD_ACCUM,
+        learning_rate=1e-4 if part_num > 1 else 2e-4, # Slightly lower LR on chained passes
+        
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        
+        save_strategy="no", # We save cleanly at the end of the part
+        logging_steps=10,
+        optim="paged_adamw_8bit",
+        bf16=True,                     
+        fp16=False,
+        remove_unused_columns=False,
+        report_to="none",
+        dataloader_num_workers=0, # Prevents Windows threading crashes
+    )
+
+    trainer = Trainer(
+        model=model,
+        args=training_args,
+        train_dataset=train_dataset,
+        data_collator=Qwen2VLDataCollator(processor)
+    )
+
+    print(f"\n[TRAINING] Starting Part {part_num} ({STEPS_PER_PART} steps)...")
+    trainer.train()
+
+    # 5. Clean Save
+    print(f"\n[SYSTEM] Part {part_num} complete! Saving adapter to: {current_save_path}")
+    model.save_pretrained(current_save_path)
+    processor.save_pretrained(current_save_path)
+    print(f"[SUCCESS] Part {part_num} successfully archived to disk.")
+
+    # 6. Memory Cleanup
+    del model, trainer, processor, train_dataset
+    torch.cuda.empty_cache()
+    return True
+
+# ==========================================
+# 5. MAIN LOOP
+# ==========================================
+def main():
+    while True:
+        part_to_train = get_user_choice()
+        success = run_part_training(part_to_train)
+        
+        if not success:
+            continue
+            
+        if part_to_train == 5:
+            print("\n" + "="*50)
+            print("CONGRATULATIONS! ALL 5 PARTS (500GB) ARE FULLY TRAINED!")
+            print(f"Final model adapter is stored at: {BASE_OUTPUT_DIR}/part_5_adapter")
+            print("="*50)
+            break
+
+        # Prompt to continue or quit
+        next_part = part_to_train + 1
+        user_response = input(f"\nPart {part_to_train} is finished and saved. Do you want to continue to Part {next_part} right now? (y/n): ").strip().lower()
+        
+        if user_response != 'y':
+            print(f"\n[SYSTEM] Exiting cleanly. When you run this script again, select Part {next_part} to resume.")
+            break
+
+if __name__ == "__main__":
+    main()
