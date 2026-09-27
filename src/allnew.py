@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import string
+import difflib # <-- NEW: Used for fuzzy matching to prevent echo loops
 from PIL import Image
 from contextlib import asynccontextmanager
 
@@ -164,9 +165,10 @@ except Exception:
 # ==========================================
 latest_cv2_frame = None 
 conversation_memory = collections.deque(maxlen=4) 
+ai_recent_speech = collections.deque(maxlen=4) # <-- NEW: Tracks what the AI just said
 system_is_running = True
 assistant_state = "idle"
-last_latency = 0  # <--- RE-ADDED: Global tracker for UI latency gauge
+last_latency = 0 
 
 class_transcript = [] 
 class_whiteboard_frames = collections.deque(maxlen=5) 
@@ -250,7 +252,7 @@ def is_stop_command(text):
 # 5. MULTI-APP VISION LOGIC (HUMAN-LIKE CONVERSATIONAL)
 # ==========================================
 def process_prompt(user_spoken_prompt):
-    global conversation_memory, latest_cv2_frame, class_whiteboard_frames, class_transcript, tts_interrupt_requested, last_latency
+    global conversation_memory, latest_cv2_frame, class_whiteboard_frames, class_transcript, tts_interrupt_requested, last_latency, ai_recent_speech
     frame_to_process = None
     active_mode = ws_manager.current_mode
     messages = []
@@ -356,7 +358,6 @@ def process_prompt(user_spoken_prompt):
         text=[text], images=image_inputs, videos=video_inputs, padding=True, return_tensors="pt"
     ).to("cuda")
 
-    # --- RE-ADDED: Start Tracking Inference Time ---
     start_time = time.time()
 
     generated_ids = spatial_model.generate(
@@ -367,7 +368,6 @@ def process_prompt(user_spoken_prompt):
         do_sample=True
     )
     
-    # --- RE-ADDED: End Tracking Inference Time ---
     last_latency = int((time.time() - start_time) * 1000)
     
     generated_ids_trimmed = [out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)]
@@ -385,6 +385,10 @@ def process_prompt(user_spoken_prompt):
 
     if active_mode not in ["lecture", "assistive"]:
         conversation_memory.append((user_spoken_prompt, answer))
+        
+    # --- NEW: Store the clean answer into the Echo Shield memory ---
+    clean_ai_answer = answer.translate(str.maketrans('', '', string.punctuation)).lower().strip()
+    ai_recent_speech.append(clean_ai_answer)
 
     ws_manager.broadcast_sync({"event": "argus_reply", "text": answer, "mode": active_mode})
     ws_manager.broadcast_sync({"event": "perception_log", "engine": "Qwen2-VL", "text": f"Reply: {answer}"})
@@ -398,7 +402,6 @@ def process_prompt(user_spoken_prompt):
 # ==========================================
 # 6. ASYNC BACKGROUND WORKERS (FULL DUPLEX & METRICS)
 # ==========================================
-# --- RE-ADDED: Hardware Polling Worker ---
 def hardware_metrics_worker():
     global system_is_running, last_latency
     while system_is_running:
@@ -438,7 +441,7 @@ def tts_worker():
             pass
 
 def audio_worker():
-    global system_is_running, assistant_state, class_transcript, tts_interrupt_requested
+    global system_is_running, assistant_state, class_transcript, tts_interrupt_requested, ai_recent_speech
     recognizer = sr.Recognizer()
     recognizer.energy_threshold = 280   
     recognizer.dynamic_energy_threshold = True
@@ -495,9 +498,27 @@ def audio_worker():
 
                     if is_hallucination(user_spoken):
                         continue
+                        
+                    # ==========================================
+                    # --- NEW: SOFTWARE ECHO SHIELD (AEC) ---
+                    # Prevents the AI from hearing itself and triggering an infinite loop
+                    # ==========================================
+                    is_echo = False
+                    for ai_text in ai_recent_speech:
+                        # 1. Exact short matches (e.g. mic hears "yes" and AI just said "yes")
+                        if clean_text == ai_text:
+                            is_echo = True
+                            break
+                        # 2. Substring match (e.g. mic hears "you are coding" and AI said "looks like you are coding")
+                        if len(clean_text) > 4 and clean_text in ai_text:
+                            is_echo = True
+                            break
+                        # 3. Fuzzy match (Handles minor Whisper transcription typos of the TTS)
+                        if len(clean_text) > 4 and difflib.SequenceMatcher(None, clean_text, ai_text).ratio() > 0.65:
+                            is_echo = True
+                            break
 
-                    is_currently_speaking = pygame.mixer.music.get_busy() or not tts_queue.empty()
-
+                    # Always honor strict Stop Commands, even if it flags as an echo
                     if is_stop_command(clean_text):
                         print(f"[INTERRUPT] User commanded: '{user_spoken}' -> Stopping immediately.")
                         interrupt_tts()
@@ -505,6 +526,14 @@ def audio_worker():
                         assistant_state = "idle"
                         ws_manager.broadcast_sync({"event": "perception_log", "engine": "SYSTEM", "text": "Interrupted and silenced."})
                         continue
+                        
+                    # If the microphone just picked up the AI's own voice, drop it entirely
+                    if is_echo:
+                        print(f"[ECHO SHIELD] Dropped self-recorded audio (Infinite Loop Prevented): '{user_spoken}'")
+                        continue
+                    # ==========================================
+
+                    is_currently_speaking = pygame.mixer.music.get_busy() or not tts_queue.empty()
 
                     if is_currently_speaking:
                         print(f"[BARGE-IN] Interrupted speech with new question: '{user_spoken}'")
@@ -580,7 +609,7 @@ threading.Thread(target=tts_worker, daemon=True).start()
 threading.Thread(target=audio_worker, daemon=True).start()
 threading.Thread(target=llm_worker, daemon=True).start()
 threading.Thread(target=screen_stream_worker, daemon=True).start() 
-threading.Thread(target=hardware_metrics_worker, daemon=True).start() # <--- RE-ADDED
+threading.Thread(target=hardware_metrics_worker, daemon=True).start()
 
 
 # ==========================================
