@@ -134,8 +134,23 @@ except Exception:
     print("[WARNING] Loading default base processor fallback...")
     spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
 
-print("[SYSTEM] Loading Audio Brain (Whisper base.en)...")
-audio_model = WhisperModel("base.en", device=device, compute_type="float16" if device == "cuda" else "int8")
+# Fast English speech recognition. The smaller model is much quicker for
+# wake-word detection and short commands than large-v3.
+# Override with ARGUS_WHISPER_MODEL / ARGUS_WHISPER_DEVICE / ARGUS_WHISPER_COMPUTE_TYPE.
+WHISPER_MODEL_NAME = os.getenv("ARGUS_WHISPER_MODEL", "base")
+# Force Whisper to use the NVIDIA GPU with FP16.
+WHISPER_DEVICE = os.getenv("ARGUS_WHISPER_DEVICE", "cuda").lower()
+WHISPER_COMPUTE_TYPE = os.getenv("ARGUS_WHISPER_COMPUTE_TYPE", "float16")
+
+print(
+    f"[SYSTEM] Loading Whisper model {WHISPER_MODEL_NAME} "
+    f"(device={WHISPER_DEVICE}, compute={WHISPER_COMPUTE_TYPE})..."
+)
+audio_model = WhisperModel(
+    WHISPER_MODEL_NAME,
+    device=WHISPER_DEVICE,
+    compute_type=WHISPER_COMPUTE_TYPE,
+)
 
 print("[SYSTEM] Initializing Desktop Optical Sensors...")
 dxcam_camera = None
@@ -163,7 +178,10 @@ except Exception:
 # ==========================================
 # 3. STATE TRACKERS & OBSERVER MEMORY
 # ==========================================
-latest_cv2_frame = None 
+latest_cv2_frame = None
+latest_cv2_frame_timestamp = 0.0
+latest_cv2_frame_lock = threading.Lock()
+# Kept for compatibility with the existing app; visual prompts intentionally do not replay it.
 conversation_memory = collections.deque(maxlen=4) 
 system_is_running = True
 assistant_state = "idle"
@@ -281,9 +299,13 @@ def is_stop_command(text):
         "stop", "ok stop", "okay stop", "argus stop", "stop argus",
         "stop talking", "stop speaking", "be quiet", "quiet", "shut up",
         "cancel", "hold on", "pause", "enough", "thats enough",
-        "please stop", "okay thats enough", "ok thats enough"
+        "please stop", "okay thats enough", "ok thats enough",
+        "argus please stop", "argus stop talking", "please be quiet"
     }
-    return clean in phrases
+    if clean in phrases:
+        return True
+    # Handle common ASR padding, e.g. "Hey Argus, stop" or "please stop now".
+    return bool(re.fullmatch(r"(?:(?:hey )?argus )?(?:please )?(?:stop|stop talking|stop speaking|be quiet|quiet|cancel|pause)(?: now| please)?", clean))
 
 
 def is_sleep_command(text):
@@ -292,9 +314,27 @@ def is_sleep_command(text):
     phrases = {
         "bye", "goodbye", "good bye", "bye argus", "goodbye argus",
         "good bye argus", "go to sleep", "sleep", "argus sleep",
-        "thats all", "im done", "im finished", "end conversation"
+        "thats all", "im done", "im finished", "end conversation",
+        "okay bye", "ok bye", "okay goodbye", "ok goodbye",
+        "argus goodbye", "argus good bye", "goodnight argus", "good night argus"
     }
-    return clean in phrases
+    if clean in phrases:
+        return True
+    return bool(re.fullmatch(r"(?:(?:hey )?argus )?(?:okay |ok )?(?:goodbye|good bye|bye)(?: argus)?", clean))
+
+
+def extract_wake_remainder(clean_text):
+    """Return text after an explicit "Hey Argus" phrase, otherwise None."""
+    # Prefer full wake phrase and require it at the beginning so a random mention
+    # of ARGUS inside ordinary speech does not wake the assistant.
+    # Require an explicit greeting; do not wake on "Argus" alone.
+    match = re.match(
+        r"^hey argus\b[ ,:;.!?]*\s*(.*)$",
+        clean_text,
+    )
+    if not match:
+        return None
+    return " ".join(match.group(1).split()).strip()
 
 
 def clear_pending_queues():
@@ -311,7 +351,7 @@ def clear_pending_queues():
 # 5. MULTI-APP VISION LOGIC (HUMAN-LIKE CONVERSATIONAL)
 # ==========================================
 def process_prompt(user_spoken_prompt):
-    global conversation_memory, latest_cv2_frame, class_whiteboard_frames, class_transcript, tts_interrupt_requested, last_latency
+    global conversation_memory, latest_cv2_frame, latest_cv2_frame_timestamp, class_whiteboard_frames, class_transcript, tts_interrupt_requested, last_latency
     frame_to_process = None
     active_mode = ws_manager.current_mode
     messages = []
@@ -324,7 +364,22 @@ def process_prompt(user_spoken_prompt):
             time.sleep(0.05)
             frame_to_process = dxcam_camera.get_latest_frame()
     else:
-        frame_to_process = latest_cv2_frame
+        # Take a stable copy of the newest webcam frame so inference cannot reuse
+        # a mutable/stale reference while the WebSocket updates the camera feed.
+        with latest_cv2_frame_lock:
+            frame_to_process = latest_cv2_frame.copy() if latest_cv2_frame is not None else None
+            frame_timestamp = latest_cv2_frame_timestamp
+
+        if frame_to_process is not None:
+            frame_age = time.time() - frame_timestamp if frame_timestamp else float("inf")
+            print(
+                f"[VISION] Captured current webcam frame: "
+                f"{frame_to_process.shape[1]}x{frame_to_process.shape[0]}, "
+                f"age={frame_age:.2f}s"
+            )
+            if frame_age > 3.0:
+                print("[VISION WARNING] Camera frame is stale; refusing to answer from an old image.")
+                frame_to_process = None
 
     if frame_to_process is None and active_mode != "lecture":
         err_msg = "I can't see the feed right now."
@@ -343,7 +398,7 @@ def process_prompt(user_spoken_prompt):
             "You are A.R.G.U.S., a sharp and supportive academic tutor. "
             "Review the whiteboard snapshots and the teacher's lecture transcript: "
             f"\"{full_transcript[-2500:]}\". "
-            "Answer the student's request in a natural, clear, conversational way. Keep explanations concise."
+            "Answer in at most 2 short sentences. Give only the key point; avoid long explanations unless the student asks for details."
         )
         task_query = user_spoken_prompt if user_spoken_prompt else "Summarize today's main lesson and give me 2 practice questions."
 
@@ -360,7 +415,7 @@ def process_prompt(user_spoken_prompt):
 
         content_list.append({"type": "text", "text": f"{system_prompt}\n\nStudent asks: {task_query}"})
         messages.append({"role": "user", "content": content_list})
-        max_tokens = 220
+        max_tokens = 65
 
     # CONVERSATIONAL MODES (SCREEN / LIVE / ASSISTIVE)
     else:
@@ -372,7 +427,7 @@ def process_prompt(user_spoken_prompt):
             system_prompt = (
                 "You are A.R.G.U.S. Assistive Voice for a visually impaired user. "
                 "Describe key objects, read exact medicine labels, or call out immediate physical hazards. "
-                "Be direct, calm, and concise (1-2 sentences)."
+                "Be direct and calm. Answer in one short sentence, or two only if needed."
             )
             task_query = user_spoken_prompt if user_spoken_prompt else "What is in front of me?"
             
@@ -381,7 +436,7 @@ def process_prompt(user_spoken_prompt):
                 "You are A.R.G.U.S., a friendly human acting as a real-time copilot looking at my screen. "
                 "Talk casually like we are friends on a Discord or FaceTime call. "
                 "Use conversational fillers naturally, like 'Hmm...', 'Oh wow', 'Haha!', or 'Uh, looks like...'. "
-                "Answer in 1 or 2 extremely short spoken sentences. "
+                "Answer in one very short spoken sentence (maximum 20 words). "
                 "NEVER use markdown, bullet points, or robotic phrases like 'Certainly', 'As an AI', or 'I can see'. "
                 "Only answer the user's actual request. Never invent or write a User: or Assistant: dialogue, "
                 "never ask or answer questions on the user's behalf, and do not continue the conversation by yourself."
@@ -393,25 +448,25 @@ def process_prompt(user_spoken_prompt):
                 "You are A.R.G.U.S., a friendly human companion looking through my camera. "
                 "Talk casually like we are hanging out on a video call. "
                 "React like a human using words like 'Hmm...', 'Whoa!', or 'Haha!'. "
-                "Answer in 1 or 2 extremely short spoken sentences. "
+                "Answer in one very short spoken sentence (maximum 20 words). "
                 "NEVER use robotic AI language, markdown, or formal lists. "
                 "Only answer the user's actual request. Never invent or write a User: or Assistant: dialogue, "
                 "never ask or answer questions on the user's behalf, and do not continue the conversation by yourself."
             )
             task_query = user_spoken_prompt
 
-        for past_q, past_a in conversation_memory:
-            messages.append({"role": "user", "content": [{"type": "text", "text": past_q}]})
-            messages.append({"role": "assistant", "content": [{"type": "text", "text": past_a}]})
-        
+        # Deliberately do not include previous Q/A turns here. Each visual request
+        # should be grounded in the current frame and current question, not an old image.
+        conversation_memory.clear()
+
         messages.append({
             "role": "user",
             "content": [
                 {"type": "image", "image": pil_image},
-                {"type": "text", "text": f"{system_prompt}\n\nCurrent user request: {task_query}\nRespond only to this request. Do not generate dialogue labels or invent another speaker."}
+                {"type": "text", "text": f"{system_prompt}\n\nVISUAL GROUNDING RULES: The image attached to THIS message is the only visual evidence. Do not rely on earlier images, earlier answers, or assumptions. First inspect the visible image and identify the actual object/equation/text in it. Answer the current request using only details actually visible in this image. If the image is unclear or the requested content cannot be read, say that plainly; never substitute a topic from a previous turn.\nCurrent user request: {task_query}\nRespond only to this request. Do not generate dialogue labels or invent another speaker."}
             ]
         })
-        max_tokens = 200
+        max_tokens = 45
 
     # Execute Inference
     text = spatial_processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -454,8 +509,8 @@ def process_prompt(user_spoken_prompt):
     if active_mode == "assistive" and any(k in answer.lower() for k in ["hazard", "warning", "caution", "danger", "step", "fall"]):
         play_hazard_alert()
 
-    if active_mode not in ["lecture", "assistive"]:
-        conversation_memory.append((user_spoken_prompt, answer))
+    # Do not persist visual Q/A turns: stale image context caused repeated answers.
+    conversation_memory.clear()
 
     ws_manager.broadcast_sync({"event": "argus_reply", "text": answer, "mode": active_mode})
     ws_manager.broadcast_sync({"event": "perception_log", "engine": "Qwen2-VL", "text": f"Reply: {answer}"})
@@ -515,9 +570,9 @@ def audio_worker():
     recognizer = sr.Recognizer()
     recognizer.energy_threshold = 280
     recognizer.dynamic_energy_threshold = True
-    # A longer pause threshold helps keep one spoken question together.
-    recognizer.pause_threshold = 1.15
-    recognizer.non_speaking_duration = 0.45
+    # Shorter end-of-speech silence means quicker response after the user finishes.
+    recognizer.pause_threshold = 0.65
+    recognizer.non_speaking_duration = 0.30
 
     temp_wav_path = os.path.join(tempfile.gettempdir(), "argus_mic.wav")
 
@@ -530,7 +585,8 @@ def audio_worker():
         print(f"[AUDIO ERROR] No microphone detected: {e}")
         return
 
-    wake_variants = ["argus", "aragus", "arghas", "argas", "arghus", "argos", "hey argus"]
+    # Wake phrase variants are matched only at the beginning of a recognized clip.
+    # Strict wake phrase: require an explicit "Hey Argus" lead-in.
 
     def transcribe_clip(audio_data, command_only=False):
         """Transcribe one complete mic clip without carrying Whisper context forward."""
@@ -539,13 +595,15 @@ def audio_worker():
 
         segments, _ = audio_model.transcribe(
             temp_wav_path,
-            beam_size=3,
+            beam_size=1,
+            best_of=1,
             language="en",
             vad_filter=True,
+            vad_parameters={"min_silence_duration_ms": 250},
             condition_on_previous_text=False,
             temperature=0.0,
             no_speech_threshold=0.6,
-            initial_prompt=None if command_only else "A.R.G.U.S."
+            # Avoid biasing transcription toward the wake word.\n            initial_prompt=None
         )
         return " ".join(segment.text.strip() for segment in segments).strip()
 
@@ -626,7 +684,9 @@ def audio_worker():
                 listen_timeout = 2.0 if assistant_state == "idle" else 8.0
                 try:
                     audio_data = recognizer.listen(
-                        source, timeout=listen_timeout, phrase_time_limit=15.0
+                        source,
+                        timeout=listen_timeout,
+                        phrase_time_limit=7.0 if assistant_state == "idle" else 12.0,
                     )
                 except sr.WaitTimeoutError:
                     continue
@@ -639,33 +699,36 @@ def audio_worker():
             if not user_spoken:
                 continue
             clean_text = normalize_command_text(user_spoken)
+            print(f"[WAKE DEBUG] Whisper heard: {user_spoken!r} | normalized: {clean_text!r} | state={assistant_state}")
 
-            # Stop and sleep commands must run before the hallucination filter.
+            # Stop/sleep commands run before hallucination filtering and work both
+            # while ARGUS is speaking and while it is waiting for the next prompt.
             command_result = handle_stop_or_sleep(user_spoken)
             if command_result:
                 continue
 
-            if is_hallucination(user_spoken):
-                continue
-
             if assistant_state == "idle":
-                # In sleep mode, only the wake phrase can activate the assistant.
-                if any(variant in clean_text for variant in wake_variants):
+                # Wake-word matching happens BEFORE hallucination filtering.
+                # "Hey Argus" alone wakes and waits; "Hey Argus, explain this" wakes
+                # and forwards only the words after the wake phrase.
+                remainder = extract_wake_remainder(clean_text)
+                if remainder is not None:
+                    print(f"[WAKE] Wake phrase detected from {user_spoken!r}; remainder={remainder!r}")
                     play_startup_chime()
                     ws_manager.broadcast_sync({
                         "event": "speech_recognized", "text": user_spoken
                     })
-                    remainder = clean_text
-                    for variant in wake_variants:
-                        remainder = remainder.replace(variant, " ").strip()
-                    remainder = " ".join(remainder.split())
-
-                    if len(remainder) > 3:
+                    assistant_state = "active"
+                    if len(remainder) >= 3:
                         prompt_queue.put(remainder)
                     else:
                         greeting = "Yeah? I'm here." if ws_manager.current_mode != "assistive" else "I'm listening."
                         tts_queue.put(greeting)
-                    assistant_state = "active"
+                elif not is_hallucination(user_spoken):
+                    print(f"[SLEEP] Ignoring speech while asleep: {user_spoken!r}")
+                continue
+
+            if is_hallucination(user_spoken):
                 continue
 
             # Active mode: one recognized phrase becomes one prompt.
@@ -735,7 +798,7 @@ async def serve_dashboard():
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
-    global latest_cv2_frame, class_transcript, class_whiteboard_frames, last_snapshot_time
+    global latest_cv2_frame, latest_cv2_frame_timestamp, class_transcript, class_whiteboard_frames, last_snapshot_time
     await ws_manager.connect(websocket)
     try:
         while True:
@@ -766,10 +829,12 @@ async def websocket_endpoint(websocket: WebSocket):
                     frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
                     if frame is not None:
-                        latest_cv2_frame = frame
+                        with latest_cv2_frame_lock:
+                            latest_cv2_frame = frame
+                            latest_cv2_frame_timestamp = time.time()
                         # Log actual incoming webcam frame size once per received frame.
                         # A 1080p feed should report 1920x1080 here.
-                        print(f"[CAMERA] Incoming frame: {frame.shape[1]}x{frame.shape[0]}")
+                        print(f"[CAMERA] Incoming frame: {frame.shape[1]}x{frame.shape[0]} | updated={latest_cv2_frame_timestamp:.3f}")
                 except Exception:
                     pass
 
