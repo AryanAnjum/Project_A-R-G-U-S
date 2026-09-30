@@ -1,64 +1,116 @@
-# Project A.R.G.U.S.
+<div align="center">
 
-## About
+# ❖ A . R . G . U . S 
 
-A.R.G.U.S. is a future-facing autonomous local AI system designed to serve as a persistent, multimodal companion for real-world productivity, decision support, and ambient assistance. The project aims to combine continuous perception, memory, reasoning, and execution into a single privacy-first system that runs on consumer hardware instead of relying on cloud infrastructure.
+```text
+[SYSTEM BOOT] .......................... SUCCESS
+[OPTICAL SENSORS] ...................... ONLINE
+[VRAM CONSTRAINT] ...................... 8.0 GB STRICT
+```
 
-The system is built around a simple idea: an AI should not only respond to prompts, but also understand context over time, observe the environment continuously, and act on behalf of the user when appropriate. A.R.G.U.S. is designed to interpret voice, vision, and task context in real time while preserving long-term memory locally for personalization and efficiency.
+**Egocentric Video Understanding // Full-Duplex Edge AI // S2S**
 
-At its core, the project explores how to reconcile performance, autonomy, and resource constraints. Instead of treating AI as a single reactive chatbot, A.R.G.U.S. is designed as a layered architecture that integrates sensing, reasoning, storage, and execution into one cohesive runtime.
+[![Stack](https://img.shields.io/badge/Stack-FastAPI%20%7C%20PyTorch-black?style=flat-square&logo=python)](https://github.com/) 
+[![Model](https://img.shields.io/badge/Core-Qwen2--VL%20%7C%20Whisper-black?style=flat-square)](https://github.com/)
+[![License](https://img.shields.io/badge/License-MIT-white?style=flat-square)](https://opensource.org/licenses/MIT)
 
-## Mission
+</div>
 
-To build a locally hosted AI operating partner that can:
-- understand and respond to natural human communication,
-- perceive the user’s environment through audio and visual input,
-- maintain contextual memory over time,
-- reason across tasks and workflows,
-- execute safe, bounded actions on the user’s machine when authorized.
+> **A.R.G.U.S. is not a chatbot.** It is a continuous, multi-modal perception engine built to see what you see, hear what you hear, and respond in real-time. Engineered to process complex spatial reasoning, OCR, and full-duplex audio strictly on consumer edge hardware (8GB VRAM).
 
-## Why it matters
+<br>
 
-Most AI systems today are designed as isolated tools: useful in a moment, but disconnected from the user’s ongoing environment. A.R.G.U.S. envisions a new category of software: an always-aware, privacy-preserving personal intelligence layer that helps users navigate digital and physical tasks with memory, context, and autonomy.
+## ▓ SYSTEM ARCHITECTURE
 
-This project is especially relevant for edge deployments, where latency, cost, privacy, and availability matter more than raw cloud-scale inference. By keeping the system local and modular, A.R.G.U.S. aims to provide a practical path toward useful autonomous assistance without exposing personal data to third-party services.
+The engine is built on a highly concurrent, zero-blocking FastAPI backend. Heavy tensor operations are isolated from I/O bounds using 5 parallel background daemons, ensuring the UI and WebSockets never drop frames.
 
-## System vision
+* **Visual Cortex:** `Qwen2-VL-2B-Instruct` (4-bit nf4) + Custom 500GB Generalist LoRA.
+* **Audio Cortex:** `faster-whisper` (base.en) + `edge-tts`.
+* **Optical Ingestion:** `DXCam` (Desktop) / `OpenCV` (Webcam).
 
-A.R.G.U.S. is structured as a modular, real-time AI pipeline with the following layers:
-- Sensory ingestion for audio and visual input
-- Perception and interpretation through multimodal models
-- Context memory for persistent user and task understanding
-- Reasoning and planning for actions and recommendations
-- Controlled execution for safe, user-approved machine operations
+```mermaid
+flowchart LR
+    subgraph SENSORS [User Input]
+        MIC(🎙️ Mic)
+        CAM(📷 Camera)
+    end
+    
+    subgraph ENGINE [A.R.G.U.S. Core]
+        VAD[VAD / Echo Shield]
+        ROUTER{Mode Router}
+        MEM[(Ring Buffers)]
+        LLM[Qwen2-VL]
+    end
+    
+    subgraph OUTPUT [System Output]
+        TTS(🔊 Speaker)
+        UI(💻 Dashboard)
+    end
 
-This architecture enables the system to move from passive models to active, context-aware assistance.
+    MIC --> VAD --> ROUTER
+    CAM --> ROUTER
+    ROUTER <--> MEM
+    ROUTER --> LLM
+    LLM --> TTS
+    LLM --> UI
+    
+    style ENGINE fill:#0a0a0a,stroke:#333,stroke-width:1px,color:#fff
+    style ROUTER fill:#1f1f1f,stroke:#fff
+```
 
-## Current direction
+## ▓ FOUR-STATE PERCEPTION ROUTING
 
-The project currently focuses on the first foundational layer: reliable sensing and local inference. This includes voice activity detection, multimodal streaming, lightweight model execution, and efficient resource usage. The long-term goal is to extend this into a more complete autonomous agentic platform capable of contextual memory and practical user assistance.
+A.R.G.U.S. dynamically reallocates its attention, memory structures, and inference settings based on the active operational state.
 
-## Future roadmap
+* `[MODE 01] SCREEN COPILOT` // Engages high-FPS desktop capture. Acts as a real-time pair-programmer and UI analyst. Speaks in brief, casual bursts.
+* `[MODE 02] LIVE COMPANION` // Egocentric webcam mode. Highly conversational, utilizing natural human speech fillers for fluid interaction.
+* `[MODE 03] ASSISTIVE VISION` // Strips away conversational latency. Prioritizes aggressive physical hazard detection and dense OCR (reading medicine bottles). Overrides system to issue direct auditory warnings.
+* `[MODE 04] SMART LECTURE` // Silent observer mode. Captures whiteboard snapshots every 60s and compiles continuous background transcripts. Merges audio/visual memory on-demand for post-class evaluation and tutoring.
 
-A.R.G.U.S. is intended to evolve through the following phases:
-1. Robust local sensing for voice, environment, and event detection
-2. Persistent memory and retrieval over user context and past interactions
-3. Reasoning and planning for real-world agent tasks
-4. Safe execution orchestration for system-level operations
-5. Personalization, adaptation, and long-term autonomy
+## ▓ THE ECHO SHIELD & FULL DUPLEX
 
-## Philosophy
+Standard AI voice agents suffer from acoustic feedback loops (hearing themselves speak). A.R.G.U.S. solves this with a proprietary **Software Echo Shield**.
 
-A.R.G.U.S. is built on a simple principle: intelligence should be useful, personal, private, and grounded in the user’s real environment. The project aims to push beyond static assistants and toward a sustainable, local-first AI companion that feels present, helpful, and trustworthy.
+* **Active Barge-in:** The mic is always hot. You can interrupt the AI at any millisecond; it immediately halts TTS and flushes the generation queue.
+* **AEC Logic:** Using fuzzy matching (`difflib`) and substring validation, incoming microphone transcripts are continuously cross-referenced against a `deque` of the AI's recent outputs. Self-feedback is silently dropped. True human interruptions pass through.
+
+## ▓ ZERO-RAM TRAINING PIPELINE 
+
+The custom vision adapter was trained on **500GB of LLaVA-OneVision** entirely on a consumer GPU. The `train500.py` script is a masterclass in hardware optimization.
+
+```python
+# Streaming Parquet chunks without touching System RAM
+load_dataset("parquet", data_dir=subset_dir, split="train", streaming=True)
+```
+
+* **Phased Checkpointing:** The dataset is partitioned into 100GB (10,000 step) phases. The script tracks progress via `resume_from_checkpoint`, allowing massive-scale training in interruptible batches.
+* **Dimension Protection:** Bypasses Hugging Face batch-looping bugs by enforcing `batch_size=1` and overriding the Data Collator to format `features[0]` natively, protecting the 2D tensor shapes.
+* **VRAM Safeguards:** Aggressive `torch.cuda.empty_cache()` sweeps and explicit variable deletion post-inference prevent VRAM fragmentation.
+
+## ▓ INITIALIZATION SEQUENCE
+
+**Prerequisites:** NVIDIA GPU ($\ge$ 8GB VRAM), 16GB System RAM, Python 3.10+.
+
+```bash
+# 01. Clone the repository
+git clone [https://github.com/YourOrg/ARGUS.git](https://github.com/YourOrg/ARGUS.git)
+cd ARGUS
+
+# 02. Build the environment
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# 03. Install dependencies (Requires transformers >= 4.45.0)
+pip install -r requirements.txt
+
+# 04. Ignite the engine
+python main.py
+```
+
+*Access the WebSocket Telemetry Dashboard at `http://localhost:8000`.*
 
 ---
-
-### Repository quick view
-
-- `src/` — prototype and experimental modules
-- `models/` — local checkpoints and adapters
-- `data/` — metadata and supporting datasets
-- `whisper/` — local model assets
-- `README.md` — project vision and architecture overview
-
-This repository is a foundation for the broader A.R.G.U.S. vision and is intended to evolve toward a more complete autonomous system over time.
+<div align="center">
+  <p><b>[ TELEMETRY ACTIVE ]</b> | VRAM Tracker • Core Temp • Latency Ms</p>
+  <sub>MIT Licensed. Built for the edge by Anik and Aryan.</sub>
+</div>
