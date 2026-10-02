@@ -1029,7 +1029,7 @@ async def websocket_endpoint(websocket: WebSocket):
         ws_manager.disconnect(websocket)
     except Exception:
         ws_manager.disconnect(websocket)
-
+ 
 
 if __name__ == "__main__":
     import uvicorn
