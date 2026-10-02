@@ -367,16 +367,18 @@ def is_sleep_command(text):
 
 
 def extract_wake_remainder(clean_text):
-    """Return text after an explicit "Hey Argus" phrase, otherwise None."""
-    # Prefer full wake phrase and require it at the beginning so a random mention
-    # of ARGUS inside ordinary speech does not wake the assistant.
-    # Require an explicit greeting; do not wake on "Argus" alone.
-    match = re.match(
-        r"^hey argus\\b[ ,:;.!?]*\\s*(.*)$",
-        clean_text,
-    )
+    """Return text after an explicit 'Hey Argus' wake phrase.
+
+    ARGUS stays asleep until the exact wake phrase is heard at the
+    beginning of a recognized utterance. Saying 'Argus' by itself does
+    not wake it.
+    """
+    clean_text = normalize_command_text(clean_text)
+
+    match = re.match(r"^hey argus(?:\\s+|$)(.*)$", clean_text)
     if not match:
         return None
+
     return " ".join(match.group(1).split()).strip()
 
 
@@ -396,7 +398,11 @@ def clear_pending_queues():
 def process_prompt(user_spoken_prompt, origin="pc", requester=None):
     global conversation_memory, latest_cv2_frame, latest_cv2_frame_timestamp, class_whiteboard_frames, class_transcript, tts_interrupt_requested, last_latency
     frame_to_process = None
-    active_mode = ws_manager.current_mode
+
+    # Phone requests must ALWAYS use the phone camera feed.
+    # The desktop dashboard can remain in SCREEN mode independently.
+    # This prevents a phone question from accidentally using DXCam.
+    active_mode = "live" if origin == "phone" else ws_manager.current_mode
     messages = []
     
     tts_interrupt_requested = False
@@ -671,7 +677,7 @@ def audio_worker():
 
         if is_stop_command(recognized_text):
             print(f"[VOICE] Stop command: {recognized_text!r}")
-            interrupt_ts()
+            interrupt_tts()
             clear_pending_queues()
             assistant_state = "active"
             ws_manager.broadcast_sync({
@@ -682,96 +688,222 @@ def audio_worker():
 
         return None
 
-    # === PASTE YOUR LOOP CODE HERE ===
+    # === WAKE-WORD / VOICE CONTROL LOOP ===
+    #
+    # PC microphone behavior:
+    #   SLEEPING -> only "Hey Argus" can wake the assistant.
+    #   ACTIVE    -> normal speech is treated as a command.
+    #   TTS       -> only stop/sleep commands are considered (barge-in).
+    #
+    # Voice controls:
+    #   "Hey Argus"                         -> wake
+    #   "Hey Argus, <question>"             -> wake + immediately ask
+    #   "Okay stop" / "Argus stop"          -> stop current speech, stay awake
+    #   "Goodbye" / "Goodbye Argus"         -> stop + go back to sleep
+    #
     while system_is_running:
         try:
             speaking_now = tts_playing.is_set() or pygame.mixer.music.get_busy()
 
-            # While TTS is playing, listen only for exact stop/sleep commands.
+            # ----------------------------------------------------------
+            # 1) While PC TTS is speaking:
+            #    listen only for stop/sleep commands.
+            # ----------------------------------------------------------
             if ws_manager.current_mode != "lecture" and speaking_now:
                 try:
                     with mic as source:
                         audio_data = recognizer.listen(
-                            source, timeout=0.8, phrase_time_limit=3.5
+                            source,
+                            timeout=0.8,
+                            phrase_time_limit=3.5,
                         )
+
                     heard = transcribe_clip(audio_data, command_only=True)
+
                     if heard:
                         command_result = handle_stop_or_sleep(heard)
                         if command_result:
                             continue
+
                 except sr.WaitTimeoutError:
                     pass
+
                 time.sleep(0.03)
                 continue
 
-            # After TTS, ignore the short acoustic tail from the speakers.
-            if ws_manager.current_mode != "lecture" and time.time() - last_tts_end < 0.65:
+            # ----------------------------------------------------------
+            # 2) Ignore the short acoustic tail after PC TTS.
+            # ----------------------------------------------------------
+            if (
+                ws_manager.current_mode != "lecture"
+                and time.time() - last_tts_end < 0.65
+            ):
                 time.sleep(0.06)
                 continue
 
+            # ----------------------------------------------------------
+            # 3) Lecture mode is intentionally always-listening because
+            #    it is an observer/transcription mode.
+            # ----------------------------------------------------------
             with mic as source:
                 if ws_manager.current_mode == "lecture":
                     try:
                         audio_data = recognizer.listen(
-                            source, timeout=3.0, phrase_time_limit=12.0
+                            source,
+                            timeout=3.0,
+                            phrase_time_limit=12.0,
                         )
+
                         spoken_chunk = transcribe_clip(audio_data)
+
                         if spoken_chunk and not is_hallucination(spoken_chunk):
                             class_transcript.append(spoken_chunk)
+
                             ws_manager.broadcast_sync({
-                                "event": "lecture_transcript", "text": spoken_chunk
+                                "event": "lecture_transcript",
+                                "text": spoken_chunk,
                             })
-                            print(f"[OBSERVER AUDIO] Logged: {spoken_chunk!r}")
+
+                            print(
+                                f"[OBSERVER AUDIO] Logged: "
+                                f"{spoken_chunk!r}"
+                            )
+
                     except sr.WaitTimeoutError:
                         continue
+
                     continue
 
-                listen_timeout = 2.0 if assistant_state == "idle" else 8.0
+                # ------------------------------------------------------
+                # 4) NORMAL PC MODE
+                #
+                #    IMPORTANT:
+                #    When assistant_state == "idle", arbitrary speech
+                #    DOES NOT become a prompt anymore.
+                #
+                #    The only thing that wakes ARGUS is:
+                #       "Hey Argus"
+                #
+                #    "Hey Argus, what is this?" is handled in one utterance.
+                # ------------------------------------------------------
+                if assistant_state == "idle":
+                    listen_timeout = 2.0
+                    phrase_limit = 5.0
+                else:
+                    listen_timeout = 8.0
+                    phrase_limit = 12.0
+
                 try:
                     audio_data = recognizer.listen(
                         source,
                         timeout=listen_timeout,
-                        phrase_time_limit=7.0 if assistant_state == "idle" else 12.0,
+                        phrase_time_limit=phrase_limit,
                     )
                 except sr.WaitTimeoutError:
                     continue
 
+            # ----------------------------------------------------------
+            # 5) Safety check: don't process audio if PC TTS started while
+            #    we were listening.
+            # ----------------------------------------------------------
             if tts_playing.is_set() or pygame.mixer.music.get_busy():
                 continue
 
             user_spoken = transcribe_clip(audio_data)
+
             if not user_spoken:
                 continue
-            clean_text = normalize_command_text(user_spoken)
-            print(f"[WAKE DEBUG] Whisper heard: {user_spoken!r} | normalized: {clean_text!r} | state={assistant_state}")
 
+            clean_text = normalize_command_text(user_spoken)
+
+            print(
+                f"[WAKE DEBUG] Whisper heard: {user_spoken!r} | "
+                f"normalized: {clean_text!r} | "
+                f"state={assistant_state}"
+            )
+
+            # ----------------------------------------------------------
+            # 6) STOP / SLEEP commands are checked before normal prompts.
+            #
+            # "Okay stop" stops speech but keeps ARGUS awake.
+            # "Goodbye" puts ARGUS back into wake-word-only mode.
+            # ----------------------------------------------------------
             command_result = handle_stop_or_sleep(user_spoken)
+
             if command_result:
                 continue
 
+            # ----------------------------------------------------------
+            # 7) SLEEPING STATE
+            #
+            # Absolutely nothing is sent to the LLM unless the utterance
+            # starts with "Hey Argus".
+            # ----------------------------------------------------------
             if assistant_state == "idle":
-                if not is_hallucination(user_spoken):
-                    print(f"[DIRECT AUDIO] Heard: {user_spoken!r}")
-                    play_capture_chime()
-                    ws_manager.broadcast_sync({
-                        "event": "speech_recognized", "text": user_spoken
-                    })
-                    assistant_state = "active"
-                    prompt_queue.put((user_spoken, "pc", None))
+                wake_remainder = extract_wake_remainder(clean_text)
+
+                if wake_remainder is None:
+                    print(
+                        f"[WAKE] Ignored while sleeping: "
+                        f"{user_spoken!r}"
+                    )
+                    continue
+
+                # Wake the assistant.
+                assistant_state = "active"
+
+                print(
+                    f"[WAKE] Wake word accepted: "
+                    f"'Hey Argus' | remainder={wake_remainder!r}"
+                )
+
+                play_capture_chime()
+
+                ws_manager.broadcast_sync({
+                    "event": "speech_recognized",
+                    "text": user_spoken,
+                })
+
+                # "Hey Argus" by itself means: wake and wait for the
+                # user's next sentence.
+                if not wake_remainder:
+                    print(
+                        "[WAKE] ARGUS is awake. "
+                        "Waiting for the user's command."
+                    )
+                    continue
+
+                # "Hey Argus, <question>" -> process the remainder only.
+                prompt_queue.put(
+                    (wake_remainder, "pc", None)
+                )
                 continue
 
+            # ----------------------------------------------------------
+            # 8) ACTIVE STATE
+            #
+            # After "Hey Argus", ordinary speech becomes commands until
+            # the user says "Goodbye".
+            # ----------------------------------------------------------
             if is_hallucination(user_spoken):
                 continue
 
             play_capture_chime()
+
             ws_manager.broadcast_sync({
-                "event": "speech_recognized", "text": user_spoken
+                "event": "speech_recognized",
+                "text": user_spoken,
             })
-            prompt_queue.put((user_spoken, "pc", None))
+
+            prompt_queue.put(
+                (user_spoken, "pc", None)
+            )
 
         except Exception as e:
             print(f"[AUDIO WORKER ERROR] {e}")
+
         time.sleep(0.04)
+
 
 def llm_worker():
     global system_is_running
@@ -817,6 +949,7 @@ threading.Thread(target=audio_worker, daemon=True).start()
 threading.Thread(target=llm_worker, daemon=True).start()
 threading.Thread(target=screen_stream_worker, daemon=True).start() 
 threading.Thread(target=hardware_metrics_worker, daemon=True).start() # <--- RE-ADDED
+print("[VOICE] PC wake word: Hey Argus | Stop: Okay stop | Sleep: Goodbye")
 
 
 # ==========================================
@@ -867,9 +1000,13 @@ async def websocket_endpoint(websocket: WebSocket):
                         with latest_cv2_frame_lock:
                             latest_cv2_frame = frame
                             latest_cv2_frame_timestamp = time.time()
-                        # Log actual incoming webcam frame size once per received frame.
-                        # A 1080p feed should report 1920x1080 here.
-                        print(f"[CAMERA] Incoming frame: {frame.shape[1]}x{frame.shape[0]} | updated={latest_cv2_frame_timestamp:.3f}")
+                        # Phone camera frames are stored separately from the desktop
+                        # DXCam path. Phone-originated prompts use this newest frame.
+                        print(
+                            f"[PHONE CAMERA] Incoming frame: "
+                            f"{frame.shape[1]}x{frame.shape[0]} | "
+                            f"updated={latest_cv2_frame_timestamp:.3f}"
+                        )
                 except Exception:
                     pass
 
@@ -884,6 +1021,7 @@ async def websocket_endpoint(websocket: WebSocket):
                 if not prompt_text:
                     continue
                 print(f"[PHONE PROMPT]: {prompt_text}")
+                print("[ROUTER] Phone prompt -> using latest phone camera frame.")
                 interrupt_tts()
                 prompt_queue.put((prompt_text, "phone", websocket))
 
