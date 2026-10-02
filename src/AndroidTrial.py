@@ -621,7 +621,6 @@ def audio_worker():
     recognizer = sr.Recognizer()
     recognizer.energy_threshold = 280
     recognizer.dynamic_energy_threshold = True
-    # Shorter end-of-speech silence means quicker response after the user finishes.
     recognizer.pause_threshold = 0.65
     recognizer.non_speaking_duration = 0.30
 
@@ -636,17 +635,13 @@ def audio_worker():
         print(f"[AUDIO ERROR] No microphone detected: {e}")
         return
 
-    # Wake phrase variants are matched only at the beginning of a recognized clip.
-    # Strict wake phrase: require an explicit "Hey Argus" lead-in.
-
     def transcribe_clip(audio_data, command_only=False):
-        """Transcribe one complete mic clip without carrying Whisper context forward."""
         with open(temp_wav_path, "wb") as f:
             f.write(audio_data.get_wav_data())
 
         segments, _ = audio_model.transcribe(
             temp_wav_path,
-            beam_size=1,
+            beam_size=2, # Slightly broader beam for better name recognition
             best_of=1,
             language="en",
             vad_filter=True,
@@ -654,12 +649,13 @@ def audio_worker():
             condition_on_previous_text=False,
             temperature=0.0,
             no_speech_threshold=0.6,
-            # Avoid biasing transcription toward the wake word.\n            initial_prompt=None
+            # FIXED: Give Whisper a hint so it stops mishearing "Argus" as "August"
+            initial_prompt="A.R.G.U.S. assistant, Hey Argus."
         )
+        
         return " ".join(segment.text.strip() for segment in segments).strip()
 
     def handle_stop_or_sleep(recognized_text):
-        """Handle stop/sleep phrases before any hallucination filtering."""
         global assistant_state, tts_interrupt_requested
 
         if is_sleep_command(recognized_text):
@@ -669,30 +665,29 @@ def audio_worker():
             assistant_state = "idle"
             ws_manager.broadcast_sync({
                 "event": "perception_log", "engine": "SYSTEM",
-                "text": "Going to sleep. Say 'Hey Argus' to wake me."
+                "text": "Going to sleep."
             })
             return "sleep"
 
         if is_stop_command(recognized_text):
             print(f"[VOICE] Stop command: {recognized_text!r}")
-            interrupt_tts()
+            interrupt_ts()
             clear_pending_queues()
-            # Stop speaking, but remain awake for the next question.
             assistant_state = "active"
             ws_manager.broadcast_sync({
                 "event": "perception_log", "engine": "SYSTEM",
-                "text": "Stopped speaking. I'm listening."
+                "text": "Stopped speaking. Listening."
             })
             return "stop"
 
         return None
 
+    # === PASTE YOUR LOOP CODE HERE ===
     while system_is_running:
         try:
             speaking_now = tts_playing.is_set() or pygame.mixer.music.get_busy()
 
             # While TTS is playing, listen only for exact stop/sleep commands.
-            # Never feed ordinary speech or TTS echo back into the LLM.
             if ws_manager.current_mode != "lecture" and speaking_now:
                 try:
                     with mic as source:
@@ -731,7 +726,6 @@ def audio_worker():
                         continue
                     continue
 
-                # Keep listening while active; don't silently fall asleep after 5 seconds.
                 listen_timeout = 2.0 if assistant_state == "idle" else 8.0
                 try:
                     audio_data = recognizer.listen(
@@ -742,7 +736,6 @@ def audio_worker():
                 except sr.WaitTimeoutError:
                     continue
 
-            # If playback began while the microphone was collecting a phrase, discard it.
             if tts_playing.is_set() or pygame.mixer.music.get_busy():
                 continue
 
@@ -752,37 +745,24 @@ def audio_worker():
             clean_text = normalize_command_text(user_spoken)
             print(f"[WAKE DEBUG] Whisper heard: {user_spoken!r} | normalized: {clean_text!r} | state={assistant_state}")
 
-            # Stop/sleep commands run before hallucination filtering and work both
-            # while ARGUS is speaking and while it is waiting for the next prompt.
             command_result = handle_stop_or_sleep(user_spoken)
             if command_result:
                 continue
 
             if assistant_state == "idle":
-                # Wake-word matching happens BEFORE hallucination filtering.
-                # "Hey Argus" alone wakes and waits; "Hey Argus, explain this" wakes
-                # and forwards only the words after the wake phrase.
-                remainder = extract_wake_remainder(clean_text)
-                if remainder is not None:
-                    print(f"[WAKE] Wake phrase detected from {user_spoken!r}; remainder={remainder!r}")
-                    play_startup_chime()
+                if not is_hallucination(user_spoken):
+                    print(f"[DIRECT AUDIO] Heard: {user_spoken!r}")
+                    play_capture_chime()
                     ws_manager.broadcast_sync({
                         "event": "speech_recognized", "text": user_spoken
                     })
                     assistant_state = "active"
-                    if len(remainder) >= 3:
-                        prompt_queue.put((remainder, "pc", None))
-                    else:
-                        greeting = "Yeah? I'm here." if ws_manager.current_mode != "assistive" else "I'm listening."
-                        tts_queue.put(greeting)
-                elif not is_hallucination(user_spoken):
-                    print(f"[SLEEP] Ignoring speech while asleep: {user_spoken!r}")
+                    prompt_queue.put((user_spoken, "pc", None))
                 continue
 
             if is_hallucination(user_spoken):
                 continue
 
-            # Active mode: one recognized phrase becomes one prompt.
             play_capture_chime()
             ws_manager.broadcast_sync({
                 "event": "speech_recognized", "text": user_spoken

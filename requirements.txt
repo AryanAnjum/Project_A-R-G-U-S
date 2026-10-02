@@ -70,3 +70,4 @@ bitsandbytes
 accelerate
 pip install nvidia-ml-py
 python -m pip install mss
+pip install coqui-tts
