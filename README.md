@@ -1,346 +1,116 @@
-<<<<<<< HEAD
-# The EPIC KITCHENS downloader
+<div align="center">
 
-We provide a `python` script to download both the EPIC KITCHENS-100 and EPIC KITCHENS-55 datasets, either in its entirety or in parts (e.g. only RGB frames). You can download data for a subset of participants, as well as a specific split for a certain challenge (e.g. the `test` split for `action retrieval`). You can also download only the dataset's extension, i.e. only the new data collected for EPIC KITCHENS-100.
+# ❖ A . R . G . U . S 
 
-#### Python version
-
-The script requires Python **3.5+** and  **no external libraries**.
-
-## `Error 404 / Errno 104 Connection reset by peer` when using the script
-
-We are aware of an issue occurring when using the download script depending on the region, e.g.
-
-```bash
-Could not download file from https://data.bris.ac.uk/datasets/3h91syskeag572hl6tvuovwv4d/frames_rgb_flow/rgb/train/P01/P01_01.tar
-Error: [Errno 104] Connection reset by peer
-```
-
-While we fix this problem, please use Academic Torrents if you face this issue. You can find [EPIC-KITCHENS-55 here](https://academictorrents.com/details/d08f4591d1865bbe3436d1eb25ed55aae8b8f043) and [EPIC-KITCHENS-100 here](https://academictorrents.com/details/c92b4a3cd3834e9af9666ac82379ff15ca289a83).
-
-# Errata
-
-**Important:** We have recently detected an error in our pre-extracted RGB and Optical flow frames for two videos in our dataset. This does not affect the videos themselves or any of the annotations in this github. 
-
-However, if you've been using our pre-extracted frames or object/hand detections and masks, you can use the script to download the correct files:
-
-```bash
-python epic_downloader.py --errata
-```
-
-This will download only the affected files:
-
-- `P01/rgb_frames/P01_109.tar`
-- `P01/flow_frames/P01_109.tar`
-- `P01/hand-objects/P01_109.pkl`
-- `P01/masks/P01_109.pkl`
-- `P27/rgb_frames/P27_103.tar`
-- `P27/flow_frames/P27_103.tar`
-- `P27/hand-objects/P27_103.pkl`
-- `P27/masks/P27_103.pkl`
-
-If you had downloaded these files previously, they will be overwritten.
-
-As of 26/09/2020, regardless of the `--errata` argument, the script will **always** download the correct version of the
-above files.
-
-As of 02/12/2020, the correct object/hand detections and masks will also be downloaded regardless of the `--errata` argument.
-
-# Using the script
-
-The script accepts a number of arguments that allow you to specify what you want to download: by default the script will download **everything** to your **home directory**. 
-
-## Metadata files
-
-The scripts read the EPIC-KITCHENS split, checksum and errata metadata from CSV files. This fork keeps the local `data/` directory untracked, so keep local copies of the metadata files there or pass explicit paths with the metadata arguments.
-
-Default metadata paths:
-
-- `data/epic_55_splits.csv`
-- `data/epic_100_splits.csv`
-- `data/md5.csv`
-- `data/errata.csv`
-
-Both verification scripts also accept `--epic55-splits`, `--epic100-splits`, `--md5` and `--errata` if your metadata files live elsewhere.
-
-## Download videos with verification
-
-`epic_video_downloader_verify.py` is a video-only downloader with progress output and MD5 verification. It reads the same metadata CSVs as `epic_downloader.py`, selects videos by participant, specific video, challenge, split, or EPIC version, and writes files to the same layout:
-
-```bash
-python epic_video_downloader_verify.py \
-  --participants P01,P02 \
-  --output-path /path/to/download/root \
-  --max-retries 3 \
-  --report epic_download_report.csv
-```
-
-The script verifies existing files before downloading and skips complete files. If a file is missing, empty, or has the wrong MD5 checksum, it downloads to a `.part` file, verifies the new file, and then replaces the old file only after verification succeeds. Interrupted `.part` downloads are resumed with HTTP Range requests when the server supports them.
-
-Useful options include:
-
-- `--specific-videos P01_01,P02_122` to download selected videos.
-- `--splits train,test` and `--challenges ar,da,cmr` to limit the selected split columns.
-- `--extension-only` or `--epic55-only` to restrict the EPIC version.
-- `--no-md5-progress` to hide checksum progress output.
-- `--verify-ssl` to enable SSL certificate verification.
-
-## Verify existing video downloads
-
-`verify_epic_kitchens_download.py` checks an existing EPIC-KITCHENS video directory without downloading files. It reports missing files, empty files, non-file paths and MD5 mismatches, and can write a CSV report for later inspection.
-
-```bash
-python verify_epic_kitchens_download.py \
-  --output-path /path/to/download/root \
-  --participants P30,P31 \
-  --videos \
-  --report epic_verify_report.csv
-```
-
-By default `--output-path` is the same base directory passed to `epic_downloader.py`, and the script appends `EPIC-KITCHENS`. If you already have the exact dataset root, use `--epic-root /path/to/EPIC-KITCHENS` instead.
-
-Useful options include:
-
-- `--participants all` or a comma-separated participant list such as `P30,P31,1`.
-- `--splits` and `--challenges` to verify only selected challenge split columns.
-- `--extension-only` or `--epic55-only` to restrict the EPIC version.
-- `--no-md5` to check only that expected files exist and are non-empty.
-- `--max-list` to control how many problem files are printed per participant.
-
-## Download only certain data types
-
-We provide videos, RGB/optical flow frames, GoPro's metadata (for the extension only) and object detection frames (for EPIC KITCHENS-55's videos only). You can also download the consent form templates.
-
-If you want to download only one (or a subset) of the above, you can do so with the following self-explanatory arguments:
-
-- `--videos`
-- `--rgb-frames`
-- `--flow-frames`
-- `--object-detection-images`
-- `--masks`
-- `--metadata`
-- `--consent-forms`
-
-If you want to download only videos, then:
-
-```bash
-python epic_downloader.py --videos
-```
-
-Note that these arguments can be **combined** to download multiple things. For example:
-
-```bash
-python epic_downloader.py --rgb-frames --flow-frames
-```
-
-Will download both RGB and optical flow frames. 
-
-For more information about objects masks (which you download with `--masks`), check out [the dedicated repository](https://github.com/epic-kitchens/epic-kitchens-100-object-masks).
-
-## Specifying participants
-
-You can use the argument `--participants` if you want to download data for only a subset of the participants. Participants can be specified with their numerical *or* string ID. 
-
-You can specify a single participant, e.g. `--participants 1` or `--participants P01` for participant `P01`, or a comma-separated list of them, e.g. `--participants 1,2,3` or `--participants P01,P02,P03` for participants `P01`, `P02` and `P03`
-
-This argument can also be combined with the aforementioned arguments. For example:
-
-```bash
-python epic_downloader.py --videos --participants 1,2,3
-```
-
-Will download only videos from `P01, P02` and `P03`.
-
-## Specifying specific videos
-
-You can use the argument `--specific-videos` if you want to download a specific subset of videos, without having to download all videos from certain participants. Videos must be specified with their string ID.
-
-You can specifiy a single video e.g. `--specific-videos P01_01` for video `P01_01`, or a comma-seperated list of them, e.g. `--specific-videos P01_01,P02_122,P03_04` for videos `P01_01`, `P02_122` and `P03_04`.
-
-This argument can also be combined with the aforementioned arguments. For example:
-
-```bash
-python epic_downloader.py --videos --participants P01 --specific-videos P02_122,P03_04 
-```
-
-Will download all the videos from participant `P01`, but only videos `P02_122` and `P03_04` from participants `P02` and `P03`. 
-
-**Note:** if the same participant is specified in the partipant and specific-videos argument, the specific video of that participant will not be exclusively downloaded. Instead, all videos from that particpant will be downloaded e.g. `--particpants P01 --specific-videos P01_01` will download all videos from participant P01, rather than just P01_01.
-
-## Specifying a challenge split
-
-You can choose to download data for a specific **split** of one of the three **challenges**: action recognition, domain adaptation and action retrieval. 
-
-To specify a **challenge**, use the following arguments:
-
-- `--action-recognition`
-- `--domain-adaptation`
-- `--action-retrieval`
-
-To specify a **split**, use one (or more) of the following arguments.
-
-| argument               | challenge(s) available                   |
-|------------------------|------------------------------------------|
-| `--train`              | action recognition, action retrieval     |
-| `--val`                | action recognition only                  |
-| `--test`               | action recognition, action retrieval     |
-| `--source-train`       | domain adaptation                        |
-| `--source-test`        | domain adaptation                        |
-| `--target-train`       | domain adaptation                        |
-| `--target-test`        | domain adaptation                        |
-| `--val-source-train`   | domain adaptation                        |
-| `--val-source-test`    | domain adaptation                        |
-| `--val-target-train`   | domain adaptation                        |
-| `--val-target-test`    | domain adaptation                        |
-
-Combine challenge and split arguments to download the relevant splits. For example:
-
-```bash
-python epic_downloader.py --action-recognition --train
-```
-
-Will download all data for the training set split for action recognition. 
-
-```bash
-python epic_downloader.py --action-retrieval --test --domain-adaptation --target-test 
-```
-
-Will download all data for the test set split for action retrieval, as well as all data for the target test split for domain adaptation. 
-
-Again, these arguments can be combined with all others. For example
-
-```bash
-python epic_downloader.py --flow-frames --participants 7 --action-recognition --test
-```
-
-Will download only optical flow frames for `P07`'s videos contained in the test split for action recognition. 
-
-Arguments can be passed in any order.
-
-You can also specify only split arguments without a challenge. For example
-
-```bash
-python epic_downloader.py --test --videos
-```
-
-Will download all videos in the test sets of the action recognition and action retrieval challenges. 
-
-```bash
-python epic_downloader.py --train --val
-```
-
-Will download all data for the training sets of action recognition and action retrieval, as well as the validation set for action recognition.
-
-Refer to the table above to check what gets downloaded with each split argument.
-
-#### Note on domain adaptation's validation sets
-
-These refer to unique splits which should be used only to validate hyper-parameters. For example, `-- val-target-test` will download the target test set used for validation. See the EPIC-KITCHENS-100 annotations repo [here](https://github.com/epic-kitchens/EPIC-Kitchens-100-Annotations) for more information about domain adaptation splits.
-
-## Download extension or EPIC KITCHENS-55 only
-
-You can do so with the `--extension-only` and `--epic55-only` arguments. For example:
-
-```bash
-python epic_downloader.py --videos --extension-only
-```
-
-Will download only the newly collected videos, while 
-
-```bash
-python epic_downloader.py --participants 3 --epic55-only
-```
-
-Will download all data from `P03` collected for EPIC KITCHENS-55.
-
-## Output
-
-By default data will be downloaded to your home directory. You can change the output folder with the `--output-path` argument. 
-
-Data will be stored in a subdirectory named `EPIC-KITCHENS`. 
-
-### Folders structure
-
-Data will be split amongst participants under the output directory:
-
-<pre><font color="#0087FF">/home/username/EPIC-KITCHENS/</font>
-├── <font color="#0087FF">ConsentForms</font>
-└── <font color="#0087FF">P01</font>
-    ├── <font color="#0087FF">flow_frames</font>
-    ├── <font color="#0087FF">hand-objects</font>
-    ├── <font color="#0087FF">masks</font>
-    ├── <font color="#0087FF">meta_data</font>
-    ├── <font color="#0087FF">rgb_frames</font>
-    └── <font color="#0087FF">videos</font>
-</pre>
-
-Each leaf directory will contain `.tar`, `.mp4` or `.pkl` files accordingly. 
-
-Previously fully downloaded files will be skipped, so you can download large batches of files over multiple runs.
-
-Errata files will be overwritten. Once you download the correct version of these files, they will be safely skipped in 
-following runs.
-
-## Download speed
-
-Download speed might be (very) slow depending on the region. 
-
-In such case we recommend using Academic Torrents instead of this script. You can find [EPIC-KITCHENS-55 here](https://academictorrents.com/details/d08f4591d1865bbe3436d1eb25ed55aae8b8f043) and [EPIC-KITCHENS-100 here](https://academictorrents.com/details/cc2d9afabcbbe33686d2ecd9844b534e3a899f4b).
-=======
-# Project A.R.G.U.S.
-### Autonomous Real-time Generative User System
-
-![Project Status](https://img.shields.io/badge/Status-Sprint%201%20Complete-green)
-![Academic Year](https://img.shields.io/badge/Course-CSE499A%20%2F%20CSE499B-blue)
-![Target Hardware](https://img.shields.io/badge/Optimized_For-RTX_3060_(8GB_VRAM)-orange)
-
----
-
-## 1. Project Abstract & Core Challenge
-Project A.R.G.U.S. is an edge-optimized, proactive multimodal AI companion designed to achieve continuous environmental awareness, long-term spatial/temporal memory, and autonomous OS-level tool execution. 
-
-### The Engineering Constraint
-Unlike typical cloud-dependent API wrappers, A.R.G.U.S. runs **entirely locally**. The primary software engineering challenge of this 7-month Capstone is optimizing a heavy multi-model pipeline (Vision, Speech-to-Text, Text-to-Speech, Vector Databases) to operate concurrently under strict consumer-grade hardware limits, specifically an **NVIDIA RTX 3060 with 8GB of VRAM**.
-
----
-
-## 2. System Architecture (Target State)
-To prevent VRAM overallocation and race conditions, the project utilizes a decoupled, asynchronous microservice pipeline:
-* **Sensory Hearing Engine:** Silero VAD + `faster-whisper` (CTranslate2)
-* **Sensory Vision Engine:** Qwen2.5-VL (Vision-Language Model)
-* **Cognitive & Execution Layer:** LangChain/LlamaIndex Agentic Framework
-* **Memory Vault:** Local Vector Database (ChromaDB / FAISS)
-* **Vocal Generation:** Kokoro-82M Text-to-Speech engine
-
----
-
-## 3. Sprint 1 Deliverables: Tactical Hearing Engine
-During the first sprint, the foundation of **Pillar 1 (Sensory Ingestion)** was successfully designed, implemented, and benchmarked.
-
-### Features Implemented:
-* **CPU-Based Voice Activity Detection (VAD):** Integrated `webrtcvad` to continually monitor ambient audio streams entirely on the CPU. The GPU remains completely idle during silence, preventing unnecessary VRAM utilization and thermal throttling.
-* **Asynchronous Audio Buffering:** Implemented a rolling memory buffer that captures audio frames when human speech is detected and cleanly cuts off after 50 frames (~1 second) of consecutive silence.
-* **Optimized GPU Inference Handoff:** Deployed the English-only `base.en` Whisper model through the highly optimized `faster-whisper` CTranslate2 backend. 
-* **VRAM Footprint Reduction:** Forced the model execution into `float16` half-precision precision, cutting model VRAM allocation in half while keeping latency remarkably low.
-* **Hallucination & Artifact Filtering:** Programmed a programmatic logic gate to catch and discard typical static artifacts (such as single-word hallucinated loops like "You", "Thank you") before passing data to the transcription console.
-* **Real-Time Latency Telemetry:** Embedded execution timers to output precise mathematical processing speed (`[Lat: X.XXs]`) alongside localized system timestamps for every spoken sentence.
-
-### Running the Engine
-Use the repository virtual environment and the PowerShell call operator to avoid interpreter path issues:
-```powershell
-cd "C:\Users\Sn1pEx\Desktop\Project_A-R-G-U-S\src"
-& "C:\Users\Sn1pEx\Desktop\Project_A-R-G-U-S\.ARGUS_venv\Scripts\python.exe" argus_hearing.py
-```
-
----
-
-## 4. Current Repository Structure
 ```text
-ARGUS-Core/
-│
-├── src/
-│   └── argus_hearing.py      # Core audio streaming, VAD gating, and Whisper inference
-│
-├── .gitignore                # Protects repository from heavy AI weights (.bin/.safetensors)
-└── README.md                 # Project technical documentation
->>>>>>> e578c5dd79cc13a1de0fb0a7c1e8553c9a00c59f
+[SYSTEM BOOT] .......................... SUCCESS
+[OPTICAL SENSORS] ...................... ONLINE
+[VRAM CONSTRAINT] ...................... 8.0 GB STRICT
+```
+
+**Egocentric Video Understanding // Full-Duplex Edge AI // S2S**
+
+[![Stack](https://img.shields.io/badge/Stack-FastAPI%20%7C%20PyTorch-black?style=flat-square&logo=python)](https://github.com/) 
+[![Model](https://img.shields.io/badge/Core-Qwen2--VL%20%7C%20Whisper-black?style=flat-square)](https://github.com/)
+[![License](https://img.shields.io/badge/License-MIT-white?style=flat-square)](https://opensource.org/licenses/MIT)
+
+</div>
+
+> **A.R.G.U.S. is not a chatbot.** It is a continuous, multi-modal perception engine built to see what you see, hear what you hear, and respond in real-time. Engineered to process complex spatial reasoning, OCR, and full-duplex audio strictly on consumer edge hardware (8GB VRAM).
+
+<br>
+
+## ▓ SYSTEM ARCHITECTURE
+
+The engine is built on a highly concurrent, zero-blocking FastAPI backend. Heavy tensor operations are isolated from I/O bounds using 5 parallel background daemons, ensuring the UI and WebSockets never drop frames.
+
+* **Visual Cortex:** `Qwen2-VL-2B-Instruct` (4-bit nf4) + Custom 500GB Generalist LoRA.
+* **Audio Cortex:** `faster-whisper` (base.en) + `edge-tts`.
+* **Optical Ingestion:** `DXCam` (Desktop) / `OpenCV` (Webcam).
+
+```mermaid
+flowchart LR
+    subgraph SENSORS [User Input]
+        MIC(🎙️ Mic)
+        CAM(📷 Camera)
+    end
+    
+    subgraph ENGINE [A.R.G.U.S. Core]
+        VAD[VAD / Echo Shield]
+        ROUTER{Mode Router}
+        MEM[(Ring Buffers)]
+        LLM[Qwen2-VL]
+    end
+    
+    subgraph OUTPUT [System Output]
+        TTS(🔊 Speaker)
+        UI(💻 Dashboard)
+    end
+
+    MIC --> VAD --> ROUTER
+    CAM --> ROUTER
+    ROUTER <--> MEM
+    ROUTER --> LLM
+    LLM --> TTS
+    LLM --> UI
+    
+    style ENGINE fill:#0a0a0a,stroke:#333,stroke-width:1px,color:#fff
+    style ROUTER fill:#1f1f1f,stroke:#fff
+```
+
+## ▓ FOUR-STATE PERCEPTION ROUTING
+
+A.R.G.U.S. dynamically reallocates its attention, memory structures, and inference settings based on the active operational state.
+
+* `[MODE 01] SCREEN COPILOT` // Engages high-FPS desktop capture. Acts as a real-time pair-programmer and UI analyst. Speaks in brief, casual bursts.
+* `[MODE 02] LIVE COMPANION` // Egocentric webcam mode. Highly conversational, utilizing natural human speech fillers for fluid interaction.
+* `[MODE 03] ASSISTIVE VISION` // Strips away conversational latency. Prioritizes aggressive physical hazard detection and dense OCR (reading medicine bottles). Overrides system to issue direct auditory warnings.
+* `[MODE 04] SMART LECTURE` // Silent observer mode. Captures whiteboard snapshots every 60s and compiles continuous background transcripts. Merges audio/visual memory on-demand for post-class evaluation and tutoring.
+
+## ▓ THE ECHO SHIELD & FULL DUPLEX
+
+Standard AI voice agents suffer from acoustic feedback loops (hearing themselves speak). A.R.G.U.S. solves this with a proprietary **Software Echo Shield**.
+
+* **Active Barge-in:** The mic is always hot. You can interrupt the AI at any millisecond; it immediately halts TTS and flushes the generation queue.
+* **AEC Logic:** Using fuzzy matching (`difflib`) and substring validation, incoming microphone transcripts are continuously cross-referenced against a `deque` of the AI's recent outputs. Self-feedback is silently dropped. True human interruptions pass through.
+
+## ▓ ZERO-RAM TRAINING PIPELINE 
+
+The custom vision adapter was trained on **500GB of LLaVA-OneVision** entirely on a consumer GPU. The `train500.py` script is a masterclass in hardware optimization.
+
+```python
+# Streaming Parquet chunks without touching System RAM
+load_dataset("parquet", data_dir=subset_dir, split="train", streaming=True)
+```
+
+* **Phased Checkpointing:** The dataset is partitioned into 100GB (10,000 step) phases. The script tracks progress via `resume_from_checkpoint`, allowing massive-scale training in interruptible batches.
+* **Dimension Protection:** Bypasses Hugging Face batch-looping bugs by enforcing `batch_size=1` and overriding the Data Collator to format `features[0]` natively, protecting the 2D tensor shapes.
+* **VRAM Safeguards:** Aggressive `torch.cuda.empty_cache()` sweeps and explicit variable deletion post-inference prevent VRAM fragmentation.
+
+## ▓ INITIALIZATION SEQUENCE
+
+**Prerequisites:** NVIDIA GPU ($\ge$ 8GB VRAM), 16GB System RAM, Python 3.10+.
+
+```bash
+# 01. Clone the repository
+git clone [https://github.com/YourOrg/ARGUS.git](https://github.com/YourOrg/ARGUS.git)
+cd ARGUS
+
+# 02. Build the environment
+python -m venv .venv
+source .venv/bin/activate  # Windows: .venv\Scripts\activate
+
+# 03. Install dependencies (Requires transformers >= 4.45.0)
+pip install -r requirements.txt
+
+# 04. Ignite the engine
+python main.py
+```
+
+*Access the WebSocket Telemetry Dashboard at `http://localhost:8000`.*
+
+---
+<div align="center">
+  <p><b>[ TELEMETRY ACTIVE ]</b> | VRAM Tracker • Core Temp • Latency Ms</p>
+  <sub>MIT Licensed. Built for the edge by Anik and Aryan.</sub>
+</div>
