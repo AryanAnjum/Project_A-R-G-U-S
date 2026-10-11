@@ -20,224 +20,283 @@ warnings.filterwarnings("ignore")
 # ==========================================
 # 1. CONFIGURATION & CLASSIFIER
 # ==========================================
-TARGET_SAMPLES = 20000  # Change to 20000 for the grand publication run
-ADAPTER_PATH = "qwen2-vl-argus-200gb-checkpoints/final_adapter"
-OUTPUT_CSV = "argus_vs_moondream_diverse_log.csv"
+MODEL_TARGETS = {
+    "ARGUS": 50000,
+    "Moondream2": 50000,
+    "Phi3.5": 20000
+}
 
-print("=" * 90)
-print("     A.R.G.U.S. vs MOONDREAM2: DIVERSE MULTIMODAL BENCHMARK (VQAv2)     ")
-print("=" * 90)
+ARGUS_ADAPTER_PATH = "argus_phased_adapters/part_5_adapter"
+DATASET_NAME = "lmms-lab-encoder/VQAv2"
+OUTPUT_DIR = "vlm_benchmark_results"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-def classify_question(q_text):
+print("=" * 160)
+print("      A.R.G.U.S. GRAND 3-WAY VLM BENCHMARK EXECUTION ENGINE      ")
+print("=" * 160)
+
+def classify_question(q_text: str) -> str:
     q = q_text.lower().strip()
     if q.startswith("what color"): return "Color / Attribute"
     elif q.startswith("how many") or q.startswith("how much") or "number of" in q: return "Counting / Quantity"
     elif q.startswith("where") or "location" in q or "standing on" in q: return "Spatial / Location"
     elif any(q.startswith(w) for w in ["is ", "are ", "do ", "does ", "can ", "has ", "was ", "were "]): return "Binary (Yes/No)"
-    elif "doing" in q or "action" in q or "sport" in q or "playing" in q: return "Action / Activity"
+    elif any(w in q for w in ["doing", "action", "sport", "playing"]): return "Action / Activity"
     else: return "General Reasoning"
 
-# This lightweight list will hold all our data in RAM without storing heavy images
-eval_data = []
+def clean_answer(pred_text: str) -> str:
+    return str(pred_text).replace('"', '').replace('.', '').replace(',', '').strip().lower()
+
+def compute_correctness(pred: str, valid_answers: list) -> int:
+    return 1 if (pred in valid_answers or any(pred == ans for ans in valid_answers)) else 0
+
 
 # ==========================================
-# 2. PHASE 1: A.R.G.U.S. EVALUATION
+# 2. ISOLATED MODEL INTERFACE WRAPPERS
 # ==========================================
-print("\n[PHASE 1] Booting A.R.G.U.S. Pipeline (4-bit NF4)...")
-torch.cuda.empty_cache()
-torch.cuda.reset_peak_memory_stats()
+class ArgusRunner:
+    def __init__(self):
+        print("\n[INIT] Booting A.R.G.U.S. (Qwen2-VL 2B NF4 + Adapter)...")
+        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        base = Qwen2VLForConditionalGeneration.from_pretrained(
+            "Qwen/Qwen2-VL-2B-Instruct", quantization_config=bnb, device_map="cuda"
+        )
+        self.model = PeftModel.from_pretrained(base, ARGUS_ADAPTER_PATH).eval()
+        self.processor = AutoProcessor.from_pretrained(ARGUS_ADAPTER_PATH)
 
-bnb_config = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
-base_model = Qwen2VLForConditionalGeneration.from_pretrained("Qwen/Qwen2-VL-2B-Instruct", quantization_config=bnb_config, device_map="cuda")
-model_argus = PeftModel.from_pretrained(base_model, ADAPTER_PATH)
-processor = AutoProcessor.from_pretrained(ADAPTER_PATH)
-model_argus.eval()
-
-print("[SYSTEM] Streaming VQAv2 Dataset for A.R.G.U.S...")
-dataset_stream_1 = load_dataset("lmms-lab-encoder/VQAv2", split="validation", streaming=True)
-
-start_time_argus = time.time()
-
-for index, item in enumerate(dataset_stream_1):
-    if index >= TARGET_SAMPLES: break
-
-    try:
-        pil_image = item["image"].convert("RGB")
-        question = item["question"]
-        q_type = classify_question(question)
-        
-        valid_human_answers = [str(ans["answer"]).lower().strip() for ans in item["answers"]]
-        best_truth = max(set(valid_human_answers), key=valid_human_answers.count)
-
-        system_instruction = "Answer the question directly, concisely, and factually using 1 to 3 words."
-        messages = [{"role": "user", "content": [{"type": "image", "image": pil_image}, {"type": "text", "text": f"{system_instruction}\n\nQuestion: {question}"}]}]
-
-        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    def predict(self, pil_image, question: str) -> str:
+        prompt = "Answer the question directly and factually using 1 to 3 words."
+        messages = [{"role": "user", "content": [{"type": "image", "image": pil_image}, {"type": "text", "text": f"{prompt}\n\nQuestion: {question}"}]}]
+        text = self.processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         img_in, vid_in = process_vision_info(messages)
-        inputs = processor(text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt").to("cuda")
-
-        t0 = time.time()
+        inputs = self.processor(text=[text], images=img_in, videos=vid_in, padding=True, return_tensors="pt").to("cuda")
         with torch.no_grad():
-            gen_ids = model_argus.generate(**inputs, max_new_tokens=8, do_sample=False)
-        latency_ms = (time.time() - t0) * 1000
-
+            gen_ids = self.model.generate(**inputs, max_new_tokens=8, do_sample=False)
         gen_trimmed = [out[len(inp):] for inp, out in zip(inputs.input_ids, gen_ids)]
-        argus_pred = processor.batch_decode(gen_trimmed, skip_special_tokens=True)[0].replace('"', '').replace('.', '').strip().lower()
-        is_correct = 1 if (argus_pred in valid_human_answers or any(argus_pred == ans for ans in valid_human_answers)) else 0
+        return self.processor.batch_decode(gen_trimmed, skip_special_tokens=True)[0]
 
-        # Save to RAM
-        eval_data.append({
-            "ID": index + 1, "Category": q_type, "Question": question, "Truth": best_truth, "Valid_Answers": valid_human_answers,
-            "ARGUS_Pred": argus_pred, "ARGUS_Correct": is_correct, "ARGUS_Latency": latency_ms
-        })
 
-        status = "✓" if is_correct else "✗"
-        print(f"[A.R.G.U.S.] [{index+1:04d}/{TARGET_SAMPLES}] | [{q_type:<19}] | Q: {question[:30]:<30} | Truth: {best_truth[:10]:<10} | Pred: {argus_pred[:10]:<10} | {status} | ({latency_ms:.1f} ms)")
+class MoondreamRunner:
+    def __init__(self):
+        print("\n[INIT] Booting Moondream2 (16-bit)...")
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "vikhyatk/moondream2", revision="2025-01-09", trust_remote_code=True,
+            device_map="cuda", torch_dtype=torch.float16
+        ).eval()
 
-    except Exception as e:
-        print(f"[WARNING] Skipping sample {index + 1}: {e}")
-    finally:
-        del inputs, gen_ids, gen_trimmed, img_in, vid_in, pil_image
-        torch.cuda.empty_cache()
+    def predict(self, pil_image, question: str) -> str:
+        prompt = f"{question} Answer concisely using 1 to 3 words."
+        with torch.no_grad():
+            return self.model.query(pil_image, prompt)["answer"]
 
-argus_fps = TARGET_SAMPLES / (time.time() - start_time_argus)
-argus_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
-print("\n[SYSTEM] Tearing down A.R.G.U.S. pipeline to free GPU memory...")
-del model_argus, base_model, processor
-gc.collect()
-torch.cuda.empty_cache()
+class Phi35Runner:
+    def __init__(self):
+        print("\n[INIT] Booting Phi-3.5-Vision-Instruct (4-bit)...")
+        bnb = BitsAndBytesConfig(load_in_4bit=True, bnb_4bit_compute_dtype=torch.bfloat16)
+        self.model = AutoModelForCausalLM.from_pretrained(
+            "microsoft/Phi-3.5-vision-instruct", 
+            trust_remote_code=True, 
+            quantization_config=bnb, 
+            device_map="cuda", 
+            torch_dtype=torch.bfloat16, 
+            _attn_implementation="eager"
+        ).eval()
+        self.processor = AutoProcessor.from_pretrained("microsoft/Phi-3.5-vision-instruct", trust_remote_code=True)
+
+    def predict(self, pil_image, question: str) -> str:
+        prompt = f"<|user|>\n<|image_1|>\nAnswer the question directly and factually using 1 to 3 words.\n\nQuestion: {question}<|end|>\n<|assistant|>\n"
+        inputs = self.processor(text=prompt, images=pil_image, return_tensors="pt").to("cuda")
+        inputs = {k: v.to(torch.bfloat16) if v.is_floating_point() else v for k, v in inputs.items()}
+        
+        with torch.no_grad():
+            gen_ids = self.model.generate(**inputs, max_new_tokens=8, do_sample=False, use_cache=False)
+            
+        gen_trimmed = gen_ids[0][inputs['input_ids'].shape[1]:]
+        return self.processor.decode(gen_trimmed, skip_special_tokens=True).strip()
+
 
 # ==========================================
-# 3. PHASE 2: MOONDREAM2 EVALUATION
+# 3. BENCHMARK EXECUTION ENGINE (PER-MODEL)
 # ==========================================
-print("\n[PHASE 2] Booting Moondream2 Pipeline (16-bit)...")
-torch.cuda.reset_peak_memory_stats()
+MODEL_REGISTRY = {
+    "ARGUS": ArgusRunner,
+    "Moondream2": MoondreamRunner,
+    "Phi3.5": Phi35Runner
+}
 
-# We use the latest 2025 revision which utilizes your newly installed pyvips library
-model_md = AutoModelForCausalLM.from_pretrained(
-    "vikhyatk/moondream2", revision="2025-01-09", trust_remote_code=True, device_map="cuda", torch_dtype=torch.float16
-)
-model_md.eval()
+def evaluate_model(model_name: str, runner_cls):
+    csv_file = os.path.join(OUTPUT_DIR, f"{model_name.lower()}_benchmark.csv")
+    completed_ids = set()
+    target_samples = MODEL_TARGETS.get(model_name, 50000)
 
-print("[SYSTEM] Re-Streaming VQAv2 Dataset for Moondream2...")
-dataset_stream_2 = load_dataset("lmms-lab-encoder/VQAv2", split="validation", streaming=True)
+    if os.path.exists(csv_file):
+        df_existing = pd.read_csv(csv_file)
+        completed_ids = set(df_existing["ID"].tolist())
+        print(f"[{model_name}] Resuming from checkpoint: {len(completed_ids):,} / {target_samples:,} already completed.")
 
-start_time_md = time.time()
+    if len(completed_ids) >= target_samples:
+        print(f"[{model_name}] Completed all {target_samples:,} samples. Skipping.")
+        return
 
-for index, item in enumerate(dataset_stream_2):
-    if index >= len(eval_data): break
+    runner = runner_cls()
+    dataset_stream = load_dataset(DATASET_NAME, split="validation", streaming=True)
+
+    batch_records = []
 
     try:
-        pil_image = item["image"].convert("RGB")
-        target_record = eval_data[index] # Fetch the exact same record from Phase 1
-        prompt = target_record["Question"] + " Answer concisely using only a few words."
+        for idx, item in enumerate(dataset_stream):
+            if idx >= target_samples:
+                break
+            if idx + 1 in completed_ids:
+                continue
 
-        t0 = time.time()
-        with torch.no_grad():
-            md_pred = model_md.query(pil_image, prompt)["answer"].replace('"', '').replace('.', '').strip().lower()
-        latency_ms = (time.time() - t0) * 1000
+            try:
+                pil_image = item["image"].convert("RGB")
+                question = item["question"]
+                valid_answers = [clean_answer(ans["answer"]) for ans in item["answers"]]
+                best_truth = max(set(valid_answers), key=valid_answers.count)
+                category = classify_question(question)
 
-        is_correct = 1 if (md_pred in target_record["Valid_Answers"] or any(md_pred == ans for ans in target_record["Valid_Answers"])) else 0
+                t0 = time.time()
+                raw_pred = runner.predict(pil_image, question)
+                latency_ms = (time.time() - t0) * 1000
 
-        # Update RAM record
-        target_record["MD_Pred"] = md_pred
-        target_record["MD_Correct"] = is_correct
-        target_record["MD_Latency"] = latency_ms
+                clean_pred = clean_answer(raw_pred)
+                is_correct = compute_correctness(clean_pred, valid_answers)
 
-        status = "✓" if is_correct else "✗"
-        print(f"[MOONDREAM] [{index+1:04d}/{TARGET_SAMPLES}] | [{target_record['Category']:<19}] | Q: {target_record['Question'][:30]:<30} | Truth: {target_record['Truth'][:10]:<10} | Pred: {md_pred[:10]:<10} | {status} | ({latency_ms:.1f} ms)")
+                record = {
+                    "ID": idx + 1, "Category": category, "Question": question,
+                    "Truth": best_truth, "Pred": clean_pred,
+                    "Correct": is_correct, "Latency_ms": round(latency_ms, 2)
+                }
+                batch_records.append(record)
 
-    except Exception as e:
-        print(f"[WARNING] Skipping Moondream sample {index + 1}: {e}")
+                status = "✓" if is_correct else "✗"
+                print(f"[{model_name}] [{idx+1:05d}/{target_samples}] | [{category:<19}] | Pred: {clean_pred[:12]:<12} | Truth: {best_truth[:12]:<12} | {status} ({latency_ms:.1f} ms)")
+
+                if len(batch_records) >= 100:
+                    pd.DataFrame(batch_records).to_csv(csv_file, mode='a', header=not os.path.exists(csv_file), index=False)
+                    batch_records.clear()
+
+            except Exception as e:
+                print(f"[WARNING] Skipping sample {idx + 1}: {e}")
+                continue
+
+        if batch_records:
+            pd.DataFrame(batch_records).to_csv(csv_file, mode='a', header=not os.path.exists(csv_file), index=False)
+            batch_records.clear()
+
     finally:
-        del pil_image
+        del runner
+        gc.collect()
         torch.cuda.empty_cache()
+        print(f"[{model_name}] Evaluation complete. Hardware memory reclaimed.")
 
-md_fps = TARGET_SAMPLES / (time.time() - start_time_md)
-md_vram = torch.cuda.max_memory_allocated() / (1024 ** 3)
 
-del model_md
-gc.collect()
-torch.cuda.empty_cache()
+for name, runner_cls in MODEL_REGISTRY.items():
+    evaluate_model(name, runner_cls)
 
-# ==========================================
-# 4. REPORT GENERATION & DATA EXPORT
-# ==========================================
-print("\n" + "=" * 90)
-print("                 DIVERSE CATEGORY COMPARISON REPORT                 ")
-print("=" * 90)
-
-df_all = pd.DataFrame(eval_data)
-# Clean up the output CSV by dropping the heavy valid_answers array
-df_csv = df_all.drop(columns=["Valid_Answers"])
-df_csv.to_csv(OUTPUT_CSV, index=False)
-
-categories = df_all["Category"].unique()
-summary_data = []
-
-for cat in categories:
-    cat_df = df_all[df_all["Category"] == cat]
-    total = len(cat_df)
-    
-    argus_acc = (cat_df["ARGUS_Correct"].sum() / total) * 100
-    md_acc = (cat_df["MD_Correct"].sum() / total) * 100
-    
-    argus_lat = cat_df["ARGUS_Latency"].mean()
-    md_lat = cat_df["MD_Latency"].mean()
-    
-    summary_data.append({
-        "Category": cat, "Count": total, 
-        "ARGUS Acc (%)": round(argus_acc, 1), "MD Acc (%)": round(md_acc, 1),
-        "ARGUS Lat (ms)": round(argus_lat, 1), "MD Lat (ms)": round(md_lat, 1)
-    })
-
-# Add Overall Stats
-summary_data.append({
-    "Category": "OVERALL BENCHMARK", "Count": len(df_all),
-    "ARGUS Acc (%)": round((df_all["ARGUS_Correct"].sum() / len(df_all)) * 100, 1),
-    "MD Acc (%)": round((df_all["MD_Correct"].sum() / len(df_all)) * 100, 1),
-    "ARGUS Lat (ms)": round(df_all["ARGUS_Latency"].mean(), 1),
-    "MD Lat (ms)": round(df_all["MD_Latency"].mean(), 1)
-})
-
-df_summary = pd.DataFrame(summary_data)
-print(df_summary.to_string(index=False))
-print("=" * 90)
-df_summary.to_csv("argus_vs_moondream_diverse_summary.csv", index=False)
 
 # ==========================================
-# 5. VISUALIZATION EXPORT
+# 4. AGGREGATE STATS & PRECISE REPORT
 # ==========================================
-print("\n[SYSTEM] Generating comparative bar charts...")
+print("\n" + "=" * 160)
+print(" " * 55 + "DIVERSE CATEGORY COMPARISON REPORT")
+print("=" * 160)
+
+model_results = {}
+for name in MODEL_REGISTRY.keys():
+    csv_path = os.path.join(OUTPUT_DIR, f"{name.lower()}_benchmark.csv")
+    if os.path.exists(csv_path):
+        target = MODEL_TARGETS.get(name, 50000)
+        df_loaded = pd.read_csv(csv_path)
+        # Cap data at target to ensure pure parity
+        model_results[name] = df_loaded.head(target)
+
+if not model_results:
+    print("[ERROR] No results found to aggregate.")
+    exit()
+
+first_model_name = list(model_results.keys())[0]
+categories = model_results[first_model_name]["Category"].unique()
+
+summary_rows = []
+
+for cat in list(categories) + ["OVERALL BENCHMARK"]:
+    row = {"Category": cat}
+
+    for name, df in model_results.items():
+        cat_df = df if cat == "OVERALL BENCHMARK" else df[df["Category"] == cat]
+        model_cat_total = len(cat_df)
+
+        # Calculates accuracy based on each model's own individual count
+        acc = (cat_df["Correct"].sum() / model_cat_total) * 100 if model_cat_total > 0 else 0.0
+        lat = cat_df["Latency_ms"].mean() if model_cat_total > 0 else 0.0
+
+        row[f"{name} Acc (%)"] = acc
+        row[f"{name} Lat (ms)"] = lat
+
+    summary_rows.append(row)
+
+df_final_summary = pd.DataFrame(summary_rows)
+
+formatters = {}
+for col in df_final_summary.columns:
+    if "Acc (%)" in col or "Lat (ms)" in col:
+        formatters[col] = lambda x: f"{x:>12.1f}"
+    elif col == "Category":
+        formatters[col] = lambda x: f"{x:>22}"
+
+print(df_final_summary.to_string(index=False, formatters=formatters, justify='right'))
+print("=" * 160)
+
+SUMMARY_CSV = os.path.join(OUTPUT_DIR, "all_models_diverse_summary.csv")
+df_final_summary.to_csv(SUMMARY_CSV, index=False)
+
+
+# ==========================================
+# 5. HIGH-RESOLUTION PUBLICATION CHART
+# ==========================================
+print("\n[SYSTEM] Exporting 3-way comparative visualization...")
 sns.set_theme(style="whitegrid")
 
-plot_df = df_summary[df_summary["Category"] != "OVERALL BENCHMARK"]
+plot_df = df_final_summary[df_final_summary["Category"] != "OVERALL BENCHMARK"]
 labels = plot_df["Category"].tolist()
-argus_scores = plot_df["ARGUS Acc (%)"].tolist()
-md_scores = plot_df["MD Acc (%)"].tolist()
+num_categories = len(labels)
+num_models = len(MODEL_REGISTRY)
 
-x = np.arange(len(labels))
-width = 0.35
+x = np.arange(num_categories)
+total_cluster_width = 0.8
+bar_width = total_cluster_width / num_models
+# Adjusted to 3 colors to match the 3 models
+colors = ['#2b5c8f', '#ff7f0e', '#2ca02c']
 
-fig, ax = plt.subplots(figsize=(12, 6))
-rects1 = ax.bar(x - width/2, argus_scores, width, label='A.R.G.U.S. (Ours)', color='#2b5c8f')
-rects2 = ax.bar(x + width/2, md_scores, width, label='Moondream2', color='#d95f02')
+fig, ax = plt.subplots(figsize=(16, 7))
+all_bar_containers = []
 
-ax.set_ylabel('Accuracy (%)', fontweight="bold")
-ax.set_title('Head-to-Head Multimodal Reasoning Accuracy by Diverse Category', fontweight="bold", fontsize=14)
+for idx, (name, color) in enumerate(zip(MODEL_REGISTRY.keys(), colors)):
+    col = f"{name} Acc (%)"
+    if col in plot_df.columns:
+        vals = plot_df[col].tolist()
+        offset = (idx - (num_models - 1) / 2) * bar_width
+        rects = ax.bar(x + offset, vals, bar_width, label=name if name != "ARGUS" else "A.R.G.U.S. (Ours)", color=color, edgecolor="black", linewidth=0.5)
+        all_bar_containers.append(rects)
+
+ax.set_ylabel('Accuracy (%)', fontweight="bold", fontsize=12)
+ax.set_title('Comprehensive VQAv2 Benchmark: A.R.G.U.S. vs Leading Edge VLMs', fontweight="bold", fontsize=15)
 ax.set_xticks(x)
-ax.set_xticklabels(labels, rotation=15, ha="right")
-ax.legend()
+ax.set_xticklabels(labels, rotation=15, ha="right", fontsize=11)
+ax.set_ylim(0, 105)
+ax.legend(loc='upper right', frameon=True)
 
-# Attach exact numbers to the top of the bars
-for rect in rects1 + rects2:
-    height = rect.get_height()
-    ax.annotate(f'{height}%',
-                xy=(rect.get_x() + rect.get_width() / 2, height),
-                xytext=(0, 3), textcoords="offset points",
-                ha='center', va='bottom', fontsize=9)
+for container in all_bar_containers:
+    for rect in container:
+        height = rect.get_height()
+        if height > 0:
+            ax.annotate(f"{height:.0f}%", xy=(rect.get_x() + rect.get_width() / 2, height), xytext=(0, 3), textcoords="offset points", ha="center", va="bottom", fontsize=8, rotation=90)
 
 plt.tight_layout()
-plt.savefig("argus_vs_moondream_diverse_chart.png", dpi=300)
-print("[SYSTEM] Diverse category comparison graph saved as 'argus_vs_moondream_diverse_chart.png'")
+chart_path = os.path.join(OUTPUT_DIR, "all_vlms_diverse_comparison_chart.png")
+plt.savefig(chart_path, dpi=300)
+print(f"[SYSTEM] High-resolution chart saved to: {chart_path}")
