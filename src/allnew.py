@@ -123,21 +123,42 @@ print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-GENERAL_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-200gb-checkpoints", "final_adapter"))
+BASE_MODEL_ID = os.getenv("ARGUS_BASE_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
 
-print("[SYSTEM] Loading Base Qwen2-VL 2B Backbone (Frozen)...")
+# Phased LoRA fine-tune (PEFT format: adapter_config.json + adapter_model.safetensors).
+# Defaults to the last phase; override with ARGUS_ADAPTER_PATH to point at another
+# phase (e.g. part_4_adapter) or a training checkpoint folder.
+GENERAL_ADAPTER_PATH = os.path.abspath(os.getenv(
+    "ARGUS_ADAPTER_PATH",
+    os.path.join(BASE_DIR, "..", "argus_phased_adapters", "part_5_adapter"),
+))
+# Folding the LoRA weights into the backbone removes the per-layer adapter
+# overhead at inference time without using extra VRAM.
+MERGE_ADAPTER = os.getenv("ARGUS_MERGE_ADAPTER", "1") == "1"
+
+print(f"[SYSTEM] Loading Base Qwen2-VL 2B Backbone ({BASE_MODEL_ID})...")
 base_model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2-VL-2B-Instruct", 
-    torch_dtype=torch.bfloat16, 
-    device_map="cuda"
+    BASE_MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map=device,
+    low_cpu_mem_usage=True,
 )
 
-print("[SYSTEM] Injecting Adapter 1: General Intelligence & Tutor Logic...")
+if not os.path.isfile(os.path.join(GENERAL_ADAPTER_PATH, "adapter_config.json")):
+    raise FileNotFoundError(
+        f"No adapter_config.json in {GENERAL_ADAPTER_PATH}. "
+        "Set ARGUS_ADAPTER_PATH to your argus_phased_adapters/part_X_adapter folder."
+    )
+
+print(f"[SYSTEM] Injecting A.R.G.U.S. fine-tuned adapter from {GENERAL_ADAPTER_PATH}...")
 spatial_model = PeftModel.from_pretrained(
-    base_model, 
-    GENERAL_ADAPTER_PATH, 
+    base_model,
+    GENERAL_ADAPTER_PATH,
     adapter_name="argus_general"
 )
+if MERGE_ADAPTER:
+    spatial_model = spatial_model.merge_and_unload()
+    print("[SYSTEM] Adapter merged into backbone.")
 spatial_model.eval()
 
 try:
@@ -145,7 +166,7 @@ try:
     print("[SYSTEM] Custom A.R.G.U.S. processor loaded successfully.")
 except Exception:
     print("[WARNING] Loading default base processor fallback...")
-    spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
+    spatial_processor = AutoProcessor.from_pretrained(BASE_MODEL_ID)
 
 WHISPER_MODEL_NAME = os.getenv("ARGUS_WHISPER_MODEL", "small.en")
 _default_whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
