@@ -7,6 +7,7 @@ import queue
 import tempfile
 import threading
 import time
+import traceback
 import string
 import re
 from PIL import Image
@@ -122,21 +123,42 @@ print("\n[SYSTEM] Booting A.R.G.U.S. Multimodal Engine...")
 device = "cuda" if torch.cuda.is_available() else "cpu"
 
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-GENERAL_ADAPTER_PATH = os.path.abspath(os.path.join(BASE_DIR, "..", "qwen2-vl-argus-200gb-checkpoints", "final_adapter"))
+BASE_MODEL_ID = os.getenv("ARGUS_BASE_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
 
-print("[SYSTEM] Loading Base Qwen2-VL 2B Backbone (Frozen)...")
+# Phased LoRA fine-tune (PEFT format: adapter_config.json + adapter_model.safetensors).
+# Defaults to the last phase; override with ARGUS_ADAPTER_PATH to point at another
+# phase (e.g. part_4_adapter) or a training checkpoint folder.
+GENERAL_ADAPTER_PATH = os.path.abspath(os.getenv(
+    "ARGUS_ADAPTER_PATH",
+    os.path.join(BASE_DIR, "..", "argus_phased_adapters", "part_5_adapter"),
+))
+# Folding the LoRA weights into the backbone removes the per-layer adapter
+# overhead at inference time without using extra VRAM.
+MERGE_ADAPTER = os.getenv("ARGUS_MERGE_ADAPTER", "1") == "1"
+
+print(f"[SYSTEM] Loading Base Qwen2-VL 2B Backbone ({BASE_MODEL_ID})...")
 base_model = Qwen2VLForConditionalGeneration.from_pretrained(
-    "Qwen/Qwen2-VL-2B-Instruct", 
-    torch_dtype=torch.bfloat16, 
-    device_map="cuda"
+    BASE_MODEL_ID,
+    torch_dtype=torch.bfloat16,
+    device_map=device,
+    low_cpu_mem_usage=True,
 )
 
-print("[SYSTEM] Injecting Adapter 1: General Intelligence & Tutor Logic...")
+if not os.path.isfile(os.path.join(GENERAL_ADAPTER_PATH, "adapter_config.json")):
+    raise FileNotFoundError(
+        f"No adapter_config.json in {GENERAL_ADAPTER_PATH}. "
+        "Set ARGUS_ADAPTER_PATH to your argus_phased_adapters/part_X_adapter folder."
+    )
+
+print(f"[SYSTEM] Injecting A.R.G.U.S. fine-tuned adapter from {GENERAL_ADAPTER_PATH}...")
 spatial_model = PeftModel.from_pretrained(
-    base_model, 
-    GENERAL_ADAPTER_PATH, 
+    base_model,
+    GENERAL_ADAPTER_PATH,
     adapter_name="argus_general"
 )
+if MERGE_ADAPTER:
+    spatial_model = spatial_model.merge_and_unload()
+    print("[SYSTEM] Adapter merged into backbone.")
 spatial_model.eval()
 
 try:
@@ -144,7 +166,7 @@ try:
     print("[SYSTEM] Custom A.R.G.U.S. processor loaded successfully.")
 except Exception:
     print("[WARNING] Loading default base processor fallback...")
-    spatial_processor = AutoProcessor.from_pretrained("Qwen/Qwen2-VL-2B-Instruct")
+    spatial_processor = AutoProcessor.from_pretrained(BASE_MODEL_ID)
 
 WHISPER_MODEL_NAME = os.getenv("ARGUS_WHISPER_MODEL", "small.en")
 _default_whisper_device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -238,6 +260,9 @@ def play_hazard_alert():
 
 def speak_text(text_to_say, speech_rate="+12%"):
     global tts_interrupt_requested, last_tts_end
+
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
 
     async def _speak():
         communicate = edge_tts.Communicate(
@@ -648,9 +673,14 @@ def tts_worker():
             text_to_say = queued[0] if isinstance(queued, tuple) else queued
             tts_interrupt_requested = False
             rate = "+15%" if ws_manager.current_mode == "assistive" else "+8%"
+            print(f"[TTS] Speaking {len(text_to_say)} chars...")
             speak_text(text_to_say, speech_rate=rate)
         except queue.Empty:
             pass
+        except Exception as exc:
+            # Keep the worker alive: one failed reply must not mute every later one.
+            print(f"[TTS ERROR] {type(exc).__name__}: {exc}")
+            traceback.print_exc()
 
 def audio_worker():
     global system_is_running, assistant_state, class_transcript, tts_interrupt_requested
