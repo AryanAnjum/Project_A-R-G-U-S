@@ -1,0 +1,9 @@
+# Install PyTorch first, for RTX 50-series:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
+transformers>=4.44
+peft>=0.12
+sentencepiece
+sacrebleu>=2.4
+numpy
+opencv-python
+mediapipe>=0.10.20
