@@ -7,6 +7,7 @@ import queue
 import tempfile
 import threading
 import time
+import traceback
 import string
 import re
 from PIL import Image
@@ -238,6 +239,9 @@ def play_hazard_alert():
 
 def speak_text(text_to_say, speech_rate="+12%"):
     global tts_interrupt_requested, last_tts_end
+
+    if not pygame.mixer.get_init():
+        pygame.mixer.init()
 
     async def _speak():
         communicate = edge_tts.Communicate(
@@ -648,9 +652,14 @@ def tts_worker():
             text_to_say = queued[0] if isinstance(queued, tuple) else queued
             tts_interrupt_requested = False
             rate = "+15%" if ws_manager.current_mode == "assistive" else "+8%"
+            print(f"[TTS] Speaking {len(text_to_say)} chars...")
             speak_text(text_to_say, speech_rate=rate)
         except queue.Empty:
             pass
+        except Exception as exc:
+            # Keep the worker alive: one failed reply must not mute every later one.
+            print(f"[TTS ERROR] {type(exc).__name__}: {exc}")
+            traceback.print_exc()
 
 def audio_worker():
     global system_is_running, assistant_state, class_transcript, tts_interrupt_requested
