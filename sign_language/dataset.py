@@ -40,14 +40,29 @@ def augment(seq, rng):
     return seq
 
 
+def resample(feats, length):
+    """Linearly resample (N, D) features along time to `length` steps."""
+    if len(feats) == length:
+        return feats
+    pos = np.linspace(0, len(feats) - 1, length)
+    lo = np.floor(pos).astype(int)
+    hi = np.minimum(lo + 1, len(feats) - 1)
+    w = (pos - lo)[:, None].astype(np.float32)
+    return feats[lo] * (1 - w) + feats[hi] * w
+
+
 class KeypointDataset(Dataset):
-    def __init__(self, manifest, kp_root, split, max_frames=400, train=False, seed=0):
+    """Keypoint sequences, plus I3D clip features when rgb_root is given."""
+
+    def __init__(self, manifest, kp_root, split, max_frames=400, train=False, seed=0, rgb_root=None):
         self.rows = [r for r in read_manifest(manifest) if r["split"] == split]
         self.kp_root = kp_root
+        self.rgb_root = rgb_root
         self.max_frames = max_frames
         self.train = train
         self.rng = np.random.default_rng(seed)
-        missing = [r for r in self.rows if not os.path.exists(os.path.join(kp_root, r["keypoints"]))]
+        missing = [r for r in self.rows if not os.path.exists(os.path.join(kp_root, r["keypoints"]))
+                   or rgb_root and not os.path.exists(os.path.join(rgb_root, r["keypoints"]))]
         if missing:
             print(f"[DATA] {split}: skipping {len(missing)} rows with no keypoint file "
                   f"(first: {missing[0]['keypoints']})")
@@ -66,7 +81,14 @@ class KeypointDataset(Dataset):
         if len(seq) > self.max_frames:
             idx = np.round(np.linspace(0, len(seq) - 1, self.max_frames)).astype(int)
             seq = seq[idx]
-        return {"id": row["id"], "features": torch.from_numpy(to_features(seq)), "text": row["text"]}
+        item = {"id": row["id"], "features": torch.from_numpy(to_features(seq)), "text": row["text"]}
+        if self.rgb_root:
+            from sign_language.model import PoseEncoder
+            # one I3D clip per 4 frames, stretched to the pose encoder's output length
+            rgb = np.load(os.path.join(self.rgb_root, row["keypoints"])).astype(np.float32)
+            n = int(PoseEncoder.out_lengths(torch.tensor(len(seq))))
+            item["rgb"] = torch.from_numpy(resample(rgb, n))
+        return item
 
 
 def collate(batch):
@@ -76,8 +98,15 @@ def collate(batch):
     feats = torch.zeros(len(batch), t_max, v, c)
     for i, b in enumerate(batch):
         feats[i, :lengths[i]] = b["features"]
-    return {"ids": [b["id"] for b in batch], "features": feats, "lengths": lengths,
-            "texts": [b["text"] for b in batch]}
+    out = {"ids": [b["id"] for b in batch], "features": feats, "lengths": lengths,
+           "texts": [b["text"] for b in batch]}
+    if "rgb" in batch[0]:
+        n = max(b["rgb"].shape[0] for b in batch)
+        rgb = torch.zeros(len(batch), n, batch[0]["rgb"].shape[1])
+        for i, b in enumerate(batch):
+            rgb[i, :len(b["rgb"])] = b["rgb"]
+        out["rgb"] = rgb
+    return out
 
 
 def worker_init(worker_id):

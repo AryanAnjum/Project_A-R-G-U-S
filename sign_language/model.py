@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from transformers import MBart50TokenizerFast, MBartConfig, MBartForConditionalGeneration
+from transformers.modeling_outputs import BaseModelOutput
+from transformers.models.mbart.modeling_mbart import shift_tokens_right
 
 from sign_language.keypoints import PART_EDGES, PARTS
 
@@ -37,28 +39,47 @@ def adjacency(edges, n):
     return d[:, None] * a * d[None, :]
 
 
+class ChannelNorm(nn.Module):
+    """LayerNorm over channels at each (frame, point).
+
+    BatchNorm mixed zero-padded frames into its running statistics, so the
+    encoder behaved differently in training and evaluation. This norm has no
+    batch statistics and ignores padding.
+    """
+
+    def __init__(self, c):
+        super().__init__()
+        self.ln = nn.LayerNorm(c)
+
+    def forward(self, x):  # (B, C, T, V)
+        return self.ln(x.permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
+
+
 class STGCNBlock(nn.Module):
     def __init__(self, cin, cout, A, stride=1, dropout=0.1):
         super().__init__()
         self.register_buffer("A", A)
         self.B = nn.Parameter(torch.zeros_like(A))  # learned extra connections
         self.gcn = nn.Conv2d(cin, cout, 1)
-        self.bn = nn.BatchNorm2d(cout)
+        self.norm = ChannelNorm(cout)
         self.tcn = nn.Sequential(
             nn.ReLU(inplace=True),
             nn.Conv2d(cout, cout, (9, 1), (stride, 1), (4, 0)),
-            nn.BatchNorm2d(cout),
+            ChannelNorm(cout),
             nn.Dropout(dropout),
         )
         if cin == cout and stride == 1:
             self.res = nn.Identity()
         else:
-            self.res = nn.Sequential(nn.Conv2d(cin, cout, 1, (stride, 1)), nn.BatchNorm2d(cout))
+            self.res = nn.Sequential(nn.Conv2d(cin, cout, 1, (stride, 1)), ChannelNorm(cout))
+        self.stride = stride
 
-    def forward(self, x):  # x: (B, C, T, V)
+    def forward(self, x, mask):  # x: (B, C, T, V), mask: (B, T)
         y = torch.einsum("bctv,vw->bctw", self.gcn(x), self.A + self.B)
-        y = self.tcn(self.bn(y))
-        return F.relu(y + self.res(x))
+        y = self.tcn(self.norm(y))
+        mask = mask[:, ::self.stride]
+        # zero the padded frames so the next temporal conv cannot read them
+        return F.relu(y + self.res(x)) * mask[:, None, :, None], mask
 
 
 class PartEncoder(nn.Module):
@@ -67,19 +88,21 @@ class PartEncoder(nn.Module):
     def __init__(self, edges, n_points, in_ch=9, dropout=0.1):
         super().__init__()
         A = adjacency(edges, n_points)
-        self.data_bn = nn.BatchNorm1d(in_ch * n_points)
+        self.in_norm = nn.LayerNorm(in_ch * n_points)
         blocks, cin = [], in_ch
         for cout, stride in self.LAYERS:
             blocks.append(STGCNBlock(cin, cout, A, stride, dropout))
             cin = cout
-        self.blocks = nn.Sequential(*blocks)
+        self.blocks = nn.ModuleList(blocks)
         self.out_dim = cin
 
-    def forward(self, x):  # x: (B, T, V, C) -> (B, T/4, D)
+    def forward(self, x, mask):  # x: (B, T, V, C), mask: (B, T) -> (B, T/4, D)
         b, t, v, c = x.shape
-        x = self.data_bn(x.permute(0, 2, 3, 1).reshape(b, v * c, t))
-        x = x.reshape(b, v, c, t).permute(0, 2, 3, 1)
-        return self.blocks(x).mean(-1).transpose(1, 2)
+        x = self.in_norm(x.reshape(b, t, v * c)) * mask[..., None]
+        x = x.reshape(b, t, v, c).permute(0, 3, 1, 2)
+        for block in self.blocks:
+            x, mask = block(x, mask)
+        return x.mean(-1).transpose(1, 2)
 
 
 class PositionalEncoding(nn.Module):
@@ -98,17 +121,22 @@ class PositionalEncoding(nn.Module):
 class PoseEncoder(nn.Module):
     TIME_STRIDE = 4
 
-    def __init__(self, d_model=512, layers=2, heads=8, dropout=0.1):
+    def __init__(self, d_model=512, layers=2, heads=8, dropout=0.1, rgb_dim=0):
         super().__init__()
         n = {k: s.stop - s.start for k, s in PARTS.items()}
         self.body = PartEncoder(PART_EDGES["body"], n["body"], dropout=dropout)
         self.hand = PartEncoder(PART_EDGES["rhand"], n["rhand"], dropout=dropout)
         self.face = PartEncoder(PART_EDGES["face"], n["face"], dropout=dropout)
         width = self.body.out_dim + 2 * self.hand.out_dim + self.face.out_dim
+        # optional I3D clip features, concatenated with the pose features per time step
+        self.rgb = nn.Sequential(nn.LayerNorm(rgb_dim), nn.Dropout(dropout)) if rgb_dim else None
+        width += rgb_dim
         self.fuse = nn.Sequential(nn.Linear(width, d_model), nn.LayerNorm(d_model), nn.Dropout(dropout))
         self.pos = PositionalEncoding(d_model)
         layer = nn.TransformerEncoderLayer(d_model, heads, 4 * d_model, dropout, batch_first=True, norm_first=True)
-        self.transformer = nn.TransformerEncoder(layer, layers)
+        # final norm: with norm_first the residual stream is otherwise never normalised
+        self.transformer = nn.TransformerEncoder(layer, layers, norm=nn.LayerNorm(d_model),
+                                                 enable_nested_tensor=False)
         self.d_model = d_model
 
     @classmethod
@@ -117,16 +145,20 @@ class PoseEncoder(nn.Module):
             lengths = (lengths - 1) // stride + 1
         return lengths
 
-    def forward(self, x, lengths):  # x: (B, T, V, 9)
+    def forward(self, x, lengths, rgb=None):  # x: (B, T, V, 9), rgb: (B, T/4, rgb_dim)
+        lengths = lengths.to(x.device)
+        frame_mask = (torch.arange(x.shape[1], device=x.device)[None] < lengths[:, None]).to(x.dtype)
         lhand = x[:, :, PARTS["lhand"]].clone()
         lhand[..., 0::3] = -lhand[..., 0::3]  # mirror x so both hands share one encoder
         feats = torch.cat([
-            self.body(x[:, :, PARTS["body"]]),
-            self.hand(lhand),
-            self.hand(x[:, :, PARTS["rhand"]]),
-            self.face(x[:, :, PARTS["face"]]),
+            self.body(x[:, :, PARTS["body"]], frame_mask),
+            self.hand(lhand, frame_mask),
+            self.hand(x[:, :, PARTS["rhand"]], frame_mask),
+            self.face(x[:, :, PARTS["face"]], frame_mask),
         ], -1)
-        out_len = self.out_lengths(lengths).to(x.device)
+        if self.rgb is not None:
+            feats = torch.cat([feats, self.rgb(rgb.to(feats.dtype))], -1)
+        out_len = self.out_lengths(lengths)
         mask = torch.arange(feats.shape[1], device=x.device)[None] < out_len[:, None]
         h = self.transformer(self.pos(self.fuse(feats)), src_key_padding_mask=~mask)
         return h, mask
@@ -218,29 +250,57 @@ def build_text_model(kind, vocab, finetune="lora", lora_r=16):
     model.config.decoder_start_token_id = EOS
     model.generation_config.forced_bos_token_id = vocab.lang_id
     model.generation_config.decoder_start_token_id = EOS
+    model.generation_config.max_length = None  # translate() sets max_new_tokens
     return model
 
 
 class SignTranslator(nn.Module):
-    def __init__(self, text_model, d_pose=512, pose_layers=2, dropout=0.1):
-        super().__init__()
-        self.pose = PoseEncoder(d_pose, pose_layers, dropout=dropout)
-        self.text = text_model
-        self.proj = nn.Linear(d_pose, text_model.config.d_model)
+    """Pose encoder plus mBART.
 
-    def encode(self, features, lengths):
-        h, mask = self.pose(features, lengths)
+    bridge="decoder" (default) hands the pose features straight to the mBART
+    decoder's cross-attention and skips mBART's own text encoder. Feeding pose
+    features through the frozen text encoder ("encoder", the GFSLT-VLP layout)
+    left the decoder free to ignore the signing: on PHOENIX it produced the same
+    stock sentence for most inputs.
+    """
+
+    def __init__(self, text_model, d_pose=512, pose_layers=2, dropout=0.1, bridge="decoder", rgb_dim=0):
+        super().__init__()
+        self.pose = PoseEncoder(d_pose, pose_layers, dropout=dropout, rgb_dim=rgb_dim)
+        self.text = text_model
+        self.bridge = bridge
+        d_text = text_model.config.d_model
+        self.proj = nn.Sequential(nn.Linear(d_pose, d_text), nn.LayerNorm(d_text))
+        if bridge == "decoder":
+            text_model.model.encoder.layers = nn.ModuleList()  # unused; frees its memory
+
+    def encode(self, features, lengths, rgb=None):
+        h, mask = self.pose(features, lengths, rgb)
         return self.proj(h), mask.long()
 
-    def forward(self, features, lengths, labels):
-        embeds, mask = self.encode(features, lengths)
-        return self.text(inputs_embeds=embeds, attention_mask=mask, labels=labels).logits
+    def _text_inputs(self, embeds, mask):
+        if self.bridge == "decoder":
+            return {"encoder_outputs": BaseModelOutput(last_hidden_state=embeds), "attention_mask": mask}
+        return {"inputs_embeds": embeds, "attention_mask": mask}
+
+    def forward(self, features, lengths, labels, word_dropout=0.0, rgb=None):
+        embeds, mask = self.encode(features, lengths, rgb)
+        dec_in = shift_tokens_right(labels, PAD)
+        if self.training and word_dropout > 0:
+            # hide some previous words so the decoder has to look at the signing
+            drop = (torch.rand(dec_in.shape, device=dec_in.device) < word_dropout) & (dec_in > UNK)
+            dec_in = dec_in.masked_fill(drop, UNK)
+            dec_in[:, :2] = shift_tokens_right(labels, PAD)[:, :2]  # keep </s> and the language token
+        return self.text(**self._text_inputs(embeds, mask), decoder_input_ids=dec_in).logits
 
     @torch.no_grad()
-    def translate(self, features, lengths, num_beams=5, max_new_tokens=100, length_penalty=1.0):
-        embeds, mask = self.encode(features, lengths)
-        return self.text.generate(inputs_embeds=embeds, attention_mask=mask, num_beams=num_beams,
-                                  max_new_tokens=max_new_tokens, length_penalty=length_penalty)
+    def translate(self, features, lengths, num_beams=5, max_new_tokens=80, length_penalty=1.0,
+                  no_repeat_ngram_size=3, rgb=None):
+        # no_repeat_ngram_size stops the "heute heute heute ..." loops a weak model falls into
+        embeds, mask = self.encode(features, lengths, rgb)
+        return self.text.generate(**self._text_inputs(embeds, mask), num_beams=num_beams,
+                                  max_new_tokens=max_new_tokens, length_penalty=length_penalty,
+                                  no_repeat_ngram_size=no_repeat_ngram_size)
 
 
 def save_checkpoint(model, vocab, args, path):
@@ -268,8 +328,10 @@ def load_checkpoint(path, device="cpu"):
                 "q_proj", "k_proj", "v_proj", "out_proj", "fc1", "fc2"]), text)
         text.generation_config.forced_bos_token_id = vocab.lang_id
         text.generation_config.decoder_start_token_id = EOS
+        text.generation_config.max_length = None
     else:
         text = build_text_model("small", vocab)
-    model = SignTranslator(text, args["d_pose"], args["pose_layers"])
+    model = SignTranslator(text, args["d_pose"], args["pose_layers"], bridge=args.get("bridge", "encoder"),
+                           rgb_dim=args.get("rgb_dim", 0))
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval(), vocab, args

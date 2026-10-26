@@ -3,6 +3,7 @@
 transformers>=4.44
 peft>=0.12
 sentencepiece
+protobuf
 sacrebleu>=2.4
 numpy
 opencv-python

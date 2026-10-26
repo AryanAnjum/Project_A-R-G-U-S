@@ -16,7 +16,7 @@ from multiprocessing import Pool
 import cv2
 import numpy as np
 
-from sign_language.keypoints import NUM_POINTS, from_holistic
+from sign_language.keypoints import NUM_POINTS, PARTS, from_holistic
 
 VIDEO_EXT = {".mp4", ".mov", ".avi", ".mkv", ".webm"}
 IMAGE_EXT = {".png", ".jpg", ".jpeg"}
@@ -81,7 +81,7 @@ def _frames_from_dir(path):
 def _process(job):
     src, dst, is_dir, target_fps = job
     if os.path.exists(dst):
-        return dst, "skip"
+        return dst, "skip", None
     frames = _frames_from_dir(src) if is_dir else _frames_from_video(src, target_fps)
     import mediapipe as mp
     seq = []
@@ -91,12 +91,15 @@ def _process(job):
             results = landmarker.detect_for_video(image, int(i * 1000 / 25))
             seq.append(from_holistic(results))
     if not seq:
-        return dst, "empty"
+        return dst, "empty", None
     os.makedirs(os.path.dirname(dst), exist_ok=True)
     tmp = dst + ".tmp.npy"
-    np.save(tmp, np.stack(seq).astype(np.float16))
+    arr = np.stack(seq)
+    np.save(tmp, arr.astype(np.float16))
     os.replace(tmp, dst)
-    return dst, f"{len(seq)} frames"
+    seen = np.abs(arr).sum(-1) > 0
+    hands = seen[:, PARTS["lhand"]].any(-1) | seen[:, PARTS["rhand"]].any(-1)
+    return dst, "ok", (len(arr), int(hands.sum()))
 
 
 def find_jobs(src_root, out_root, frame_dirs, target_fps):
@@ -128,14 +131,18 @@ def main():
     model_path = os.path.abspath(ensure_model(args.model))
     jobs = find_jobs(args.src, args.out, args.frame_dirs, args.fps)
     print(f"[EXTRACT] {len(jobs)} samples, {args.workers} workers, {NUM_POINTS} points per frame")
-    done = 0
+    done, frames, hand_frames = 0, 0, 0
     with Pool(args.workers, initializer=_init_worker, initargs=(model_path,)) as pool:
-        for dst, status in pool.imap_unordered(_process, jobs, chunksize=4):
+        for dst, status, stats in pool.imap_unordered(_process, jobs, chunksize=4):
             done += 1
+            if stats:
+                frames += stats[0]
+                hand_frames += stats[1]
             if status == "empty":
                 print(f"[EXTRACT] no frames read: {dst}", file=sys.stderr)
             if done % 100 == 0 or done == len(jobs):
-                print(f"[EXTRACT] {done}/{len(jobs)}")
+                print(f"[EXTRACT] {done}/{len(jobs)} | at least one hand found in "
+                      f"{100 * hand_frames / max(1, frames):.1f}% of new frames")
 
 
 if __name__ == "__main__":

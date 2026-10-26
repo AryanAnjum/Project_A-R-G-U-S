@@ -53,6 +53,19 @@ python -m sign_language.manifests csv --csv D:/BornilDB/annotations.csv ^
 Use the same train/dev/test split as SignFormer-GCN, or the comparison is not fair.
 `how2sign` and `phoenix` subcommands read those datasets' own annotation files.
 
+## 2b. Optional: RGB features (I3D)
+
+SignFormer-GCN uses I3D features of 16-frame RGB clips. To add the same kind
+of input next to the keypoints, download the BSL-1K I3D checkpoint (trained on
+British Sign Language, no PHOENIX glosses) and extract features once:
+
+```
+curl.exe -L -o models\bsl1k.pth.tar https://www.robots.ox.ac.uk/~vgg/research/bsl1k/data/pretrained_models/bsl1k.pth.tar
+python -m sign_language.extract_i3d --src <phoenix>/features/fullFrame-210x260px --out D:/phoenix_i3d --frame-dirs
+```
+
+Then pass `--rgb-root D:/phoenix_i3d` to `train`. Without it, training is pose-only.
+
 ## 3. Train and evaluate
 
 ```
@@ -73,5 +86,7 @@ Useful switches:
 
 - `--decoder small`: a small text model trained from scratch, about SignFormer-GCN's size. Use as an ablation.
 - `--finetune full`: fine-tune all of mBART-50 instead of LoRA. Fits in 16 GB with `--batch 8 --grad-accum 2`.
+- `--bridge encoder`: pass pose features through mBART's text encoder (GFSLT-VLP layout) instead of straight to the decoder. On PHOENIX it ignored the signing; kept for comparison.
+- `dev_loss_shuffled` in the log is the dev loss with each sample's signing swapped for another's. If it is close to `dev_loss`, the model is not using the signing.
 - `--eval-batches 20`: score only part of dev during training, to save time.
 - `--bleu-tokenize`: sacreBLEU tokenizer. Keep the default `13a` unless the paper you compare with used another.
