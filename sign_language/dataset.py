@@ -54,10 +54,12 @@ def resample(feats, length):
 class KeypointDataset(Dataset):
     """Keypoint sequences, plus I3D clip features when rgb_root is given."""
 
-    def __init__(self, manifest, kp_root, split, max_frames=400, train=False, seed=0, rgb_root=None):
+    def __init__(self, manifest, kp_root, split, max_frames=400, train=False, seed=0, rgb_root=None,
+                 time_mask=0.0):
         self.rows = [r for r in read_manifest(manifest) if r["split"] == split]
         self.kp_root = kp_root
         self.rgb_root = rgb_root
+        self.time_mask = time_mask
         self.max_frames = max_frames
         self.train = train
         self.rng = np.random.default_rng(seed)
@@ -88,7 +90,26 @@ class KeypointDataset(Dataset):
             rgb = np.load(os.path.join(self.rgb_root, row["keypoints"])).astype(np.float32)
             n = int(PoseEncoder.out_lengths(torch.tensor(len(seq))))
             item["rgb"] = torch.from_numpy(resample(rgb, n))
+        if self.train and self.time_mask > 0:
+            self._mask_time(item)
         return item
+
+    def _mask_time(self, item):
+        """Blank two random spans, together about time_mask of the sample, in every input stream.
+
+        The model then has to fill gaps from context instead of memorising whole
+        training sequences; dev loss rose after about 30 epochs without it.
+        """
+        t = item["features"].shape[0]
+        for _ in range(2):
+            span = int(self.rng.integers(0, max(1, int(t * self.time_mask / 2)) + 1))
+            if span == 0:
+                continue
+            start = int(self.rng.integers(0, t - span + 1))
+            item["features"][start:start + span] = 0
+            if "rgb" in item:
+                n = item["rgb"].shape[0]
+                item["rgb"][start * n // t:-(-(start + span) * n // t)] = 0
 
 
 def collate(batch):

@@ -75,7 +75,8 @@ def autocast(device, enabled):
     return torch.autocast(device_type=device.type, dtype=torch.bfloat16, enabled=enabled and device.type == "cuda")
 
 
-def evaluate(model, vocab, loader, device, beams=5, amp=True, tokenize="13a", max_batches=None, no_repeat=3):
+def evaluate(model, vocab, loader, device, beams=5, amp=True, tokenize="13a", max_batches=None, no_repeat=3,
+             length_penalty=1.0):
     model.eval()
     hyps, refs, ids = [], [], []
     start, n = time.perf_counter(), 0
@@ -84,7 +85,8 @@ def evaluate(model, vocab, loader, device, beams=5, amp=True, tokenize="13a", ma
             break
         with autocast(device, amp):
             out = model.translate(batch["features"].to(device), batch["lengths"], num_beams=beams,
-                                  no_repeat_ngram_size=no_repeat, rgb=_rgb(batch, device))
+                                  no_repeat_ngram_size=no_repeat, length_penalty=length_penalty,
+                                  rgb=_rgb(batch, device))
         hyps += vocab.decode(out.tolist())
         refs += batch["texts"]
         ids += batch["ids"]
@@ -152,6 +154,8 @@ def main():
     ap.add_argument("--weight-decay", type=float, default=0.01)
     ap.add_argument("--warmup", type=float, default=0.1, help="fraction of steps")
     ap.add_argument("--label-smoothing", type=float, default=0.1)
+    ap.add_argument("--time-mask", type=float, default=0.0,
+                    help="fraction of each training sample blanked in two random spans (0 = off)")
     ap.add_argument("--max-frames", type=int, default=400)
     ap.add_argument("--max-text-len", type=int, default=128)
     ap.add_argument("--eval-every", type=int, default=2)
@@ -189,7 +193,8 @@ def main():
     print(f"[TRAIN] parameters: {n_train / 1e6:.1f}M trainable of {n_all / 1e6:.1f}M")
 
     def loader(split, train):
-        ds = KeypointDataset(args.manifest, args.kp_root, split, args.max_frames, train, args.seed, args.rgb_root)
+        ds = KeypointDataset(args.manifest, args.kp_root, split, args.max_frames, train, args.seed, args.rgb_root,
+                             args.time_mask)
         return DataLoader(ds, batch_size=args.batch, shuffle=train, collate_fn=collate, drop_last=train,
                           num_workers=args.workers, worker_init_fn=worker_init, pin_memory=device.type == "cuda",
                           persistent_workers=args.workers > 0)
