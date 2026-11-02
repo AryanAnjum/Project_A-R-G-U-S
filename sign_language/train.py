@@ -22,7 +22,7 @@ from torch.utils.data import DataLoader
 from sign_language.dataset import KeypointDataset, collate, worker_init
 from sign_language.manifests import read_manifest
 from sign_language.metrics import all_metrics
-from sign_language.model import (LANG_CODES, PrunedVocab, SignTranslator, build_text_model,
+from sign_language.model import (LANG_CODES, parse_parts, PrunedVocab, SignTranslator, build_text_model,
                                  load_checkpoint, load_tokenizer, save_checkpoint)
 
 
@@ -135,6 +135,8 @@ def main():
     ap.add_argument("--kp-root", required=True)
     ap.add_argument("--rgb-root", help="I3D features from extract_i3d.py; adds the RGB branch")
     ap.add_argument("--rgb-dim", type=int, default=1024, help="I3D feature size (used with --rgb-root)")
+    ap.add_argument("--parts", default="body,hands,face",
+                    help="keypoint groups to use, for ablations; empty (--parts \"\") means RGB only")
     ap.add_argument("--lang", default="bn", help="bn, en, de, zh or an mBART-50 code such as bn_IN")
     ap.add_argument("--decoder", choices=["mbart50", "small"], default="mbart50")
     ap.add_argument("--finetune", choices=["lora", "full"], default="lora", help="how mbart50 is trained")
@@ -187,7 +189,7 @@ def main():
     if not args.rgb_root:
         args.rgb_dim = 0
     model = SignTranslator(text_model, args.d_pose, args.pose_layers, args.dropout, args.bridge,
-                           args.rgb_dim).to(device)
+                           args.rgb_dim, parse_parts(args.parts)).to(device)
     n_train = sum(p.numel() for p in model.parameters() if p.requires_grad)
     n_all = sum(p.numel() for p in model.parameters())
     print(f"[TRAIN] parameters: {n_train / 1e6:.1f}M trainable of {n_all / 1e6:.1f}M")

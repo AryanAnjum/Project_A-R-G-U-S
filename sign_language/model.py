@@ -121,13 +121,25 @@ class PositionalEncoding(nn.Module):
 class PoseEncoder(nn.Module):
     TIME_STRIDE = 4
 
-    def __init__(self, d_model=512, layers=2, heads=8, dropout=0.1, rgb_dim=0):
+    ALL_PARTS = ("body", "hands", "face")
+
+    def __init__(self, d_model=512, layers=2, heads=8, dropout=0.1, rgb_dim=0, parts=ALL_PARTS):
         super().__init__()
+        # parts picks the keypoint groups used (an ablation); none at all means RGB only
         n = {k: s.stop - s.start for k, s in PARTS.items()}
-        self.body = PartEncoder(PART_EDGES["body"], n["body"], dropout=dropout)
-        self.hand = PartEncoder(PART_EDGES["rhand"], n["rhand"], dropout=dropout)
-        self.face = PartEncoder(PART_EDGES["face"], n["face"], dropout=dropout)
-        width = self.body.out_dim + 2 * self.hand.out_dim + self.face.out_dim
+        self.parts = tuple(parts)
+        width = 0
+        if "body" in parts:
+            self.body = PartEncoder(PART_EDGES["body"], n["body"], dropout=dropout)
+            width += self.body.out_dim
+        if "hands" in parts:
+            self.hand = PartEncoder(PART_EDGES["rhand"], n["rhand"], dropout=dropout)
+            width += 2 * self.hand.out_dim
+        if "face" in parts:
+            self.face = PartEncoder(PART_EDGES["face"], n["face"], dropout=dropout)
+            width += self.face.out_dim
+        if not width and not rgb_dim:
+            raise ValueError("the model needs at least one keypoint part or RGB features")
         # optional I3D clip features, concatenated with the pose features per time step
         self.rgb = nn.Sequential(nn.LayerNorm(rgb_dim), nn.Dropout(dropout)) if rgb_dim else None
         width += rgb_dim
@@ -148,16 +160,18 @@ class PoseEncoder(nn.Module):
     def forward(self, x, lengths, rgb=None):  # x: (B, T, V, 9), rgb: (B, T/4, rgb_dim)
         lengths = lengths.to(x.device)
         frame_mask = (torch.arange(x.shape[1], device=x.device)[None] < lengths[:, None]).to(x.dtype)
-        lhand = x[:, :, PARTS["lhand"]].clone()
-        lhand[..., 0::3] = -lhand[..., 0::3]  # mirror x so both hands share one encoder
-        feats = torch.cat([
-            self.body(x[:, :, PARTS["body"]], frame_mask),
-            self.hand(lhand, frame_mask),
-            self.hand(x[:, :, PARTS["rhand"]], frame_mask),
-            self.face(x[:, :, PARTS["face"]], frame_mask),
-        ], -1)
+        feats = []
+        if "body" in self.parts:
+            feats.append(self.body(x[:, :, PARTS["body"]], frame_mask))
+        if "hands" in self.parts:
+            lhand = x[:, :, PARTS["lhand"]].clone()
+            lhand[..., 0::3] = -lhand[..., 0::3]  # mirror x so both hands share one encoder
+            feats += [self.hand(lhand, frame_mask), self.hand(x[:, :, PARTS["rhand"]], frame_mask)]
+        if "face" in self.parts:
+            feats.append(self.face(x[:, :, PARTS["face"]], frame_mask))
         if self.rgb is not None:
-            feats = torch.cat([feats, self.rgb(rgb.to(feats.dtype))], -1)
+            feats.append(self.rgb(rgb.to(x.dtype if not feats else feats[0].dtype)))
+        feats = torch.cat(feats, -1)
         out_len = self.out_lengths(lengths)
         mask = torch.arange(feats.shape[1], device=x.device)[None] < out_len[:, None]
         h = self.transformer(self.pos(self.fuse(feats)), src_key_padding_mask=~mask)
@@ -264,9 +278,10 @@ class SignTranslator(nn.Module):
     stock sentence for most inputs.
     """
 
-    def __init__(self, text_model, d_pose=512, pose_layers=2, dropout=0.1, bridge="decoder", rgb_dim=0):
+    def __init__(self, text_model, d_pose=512, pose_layers=2, dropout=0.1, bridge="decoder", rgb_dim=0,
+                 parts=PoseEncoder.ALL_PARTS):
         super().__init__()
-        self.pose = PoseEncoder(d_pose, pose_layers, dropout=dropout, rgb_dim=rgb_dim)
+        self.pose = PoseEncoder(d_pose, pose_layers, dropout=dropout, rgb_dim=rgb_dim, parts=parts)
         self.text = text_model
         self.bridge = bridge
         d_text = text_model.config.d_model
@@ -303,6 +318,13 @@ class SignTranslator(nn.Module):
                                   no_repeat_ngram_size=no_repeat_ngram_size)
 
 
+def parse_parts(spec):
+    """'body,hands,face' -> tuple; empty string -> no keypoints; None -> all parts."""
+    if spec is None:
+        return PoseEncoder.ALL_PARTS
+    return tuple(p for p in spec.split(",") if p)
+
+
 def save_checkpoint(model, vocab, args, path):
     os.makedirs(path, exist_ok=True)
     state = {k: v for k, v in model.state_dict().items()}
@@ -332,6 +354,6 @@ def load_checkpoint(path, device="cpu"):
     else:
         text = build_text_model("small", vocab)
     model = SignTranslator(text, args["d_pose"], args["pose_layers"], bridge=args.get("bridge", "encoder"),
-                           rgb_dim=args.get("rgb_dim", 0))
+                           rgb_dim=args.get("rgb_dim", 0), parts=parse_parts(args.get("parts")))
     model.load_state_dict(ckpt["model"])
     return model.to(device).eval(), vocab, args
