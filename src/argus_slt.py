@@ -30,6 +30,7 @@ import numpy as np
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 if REPO_ROOT not in sys.path:
     sys.path.insert(0, REPO_ROOT)
+DATA_ROOT = os.path.abspath(os.getenv("ARGUS_HOME", REPO_ROOT))  # models and checkpoints
 
 from sign_language.keypoints import NUM_POINTS, PARTS, from_holistic, normalize, to_features  # noqa: E402
 
@@ -38,8 +39,8 @@ END_GAP_S = float(os.getenv("ARGUS_SLT_END_GAP", "1.0"))
 MIN_SIGN_S = float(os.getenv("ARGUS_SLT_MIN_SECONDS", "0.8"))
 MAX_SIGN_S = float(os.getenv("ARGUS_SLT_MAX_SECONDS", "15.0"))
 NUM_BEAMS = int(os.getenv("ARGUS_SLT_BEAMS", "5"))
-HOLISTIC_TASK = os.getenv("ARGUS_SLT_HOLISTIC", os.path.join(REPO_ROOT, "models", "holistic_landmarker.task"))
-I3D_CKPT = os.getenv("ARGUS_SLT_I3D", os.path.join(REPO_ROOT, "models", "bsl1k.pth.tar"))
+HOLISTIC_TASK = os.getenv("ARGUS_SLT_HOLISTIC", os.path.join(DATA_ROOT, "models", "holistic_landmarker.task"))
+I3D_CKPT = os.getenv("ARGUS_SLT_I3D", os.path.join(DATA_ROOT, "models", "bsl1k.pth.tar"))
 I3D_RESIZE, I3D_CROP = 256, 224
 
 
@@ -59,13 +60,13 @@ class Language:
 LANGUAGES = {
     "de": Language(
         "de", "German", "DGS",
-        os.getenv("ARGUS_SLT_DE_CKPT", os.path.join(REPO_ROOT, "runs", "ablation_small_decoder_s1", "best")),
+        os.getenv("ARGUS_SLT_DE_CKPT", os.path.join(DATA_ROOT, "runs", "ablation_small_decoder_s1", "best")),
         "de",
     ),
     # Bangla is still training. Put its checkpoint here (or set ARGUS_SLT_BN_CKPT) and it turns on.
     "bn": Language(
         "bn", "Bangla", "BdSL",
-        os.getenv("ARGUS_SLT_BN_CKPT", os.path.join(REPO_ROOT, "runs", "bansign_small", "best")),
+        os.getenv("ARGUS_SLT_BN_CKPT", os.path.join(DATA_ROOT, "runs", "bansign_small", "best")),
         "bn",
     ),
 }

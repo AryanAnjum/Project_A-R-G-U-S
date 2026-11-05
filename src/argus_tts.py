@@ -23,8 +23,9 @@ import urllib.request
 import wave
 
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
+DATA_ROOT = os.path.abspath(os.getenv("ARGUS_HOME", REPO_ROOT))
 ENGINE = os.getenv("ARGUS_TTS", "piper").lower()
-PIPER_DIR = os.getenv("ARGUS_PIPER_DIR", os.path.join(REPO_ROOT, "models", "piper"))
+PIPER_DIR = os.getenv("ARGUS_PIPER_DIR", os.path.join(DATA_ROOT, "models", "piper"))
 VOICE_BASE_URL = "https://huggingface.co/rhasspy/piper-voices/resolve/main"
 
 # language -> (piper voice name, edge-tts voice)

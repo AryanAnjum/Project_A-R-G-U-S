@@ -12,6 +12,9 @@ load. Closing the window shuts the backend down.
 
 If an A.R.G.U.S. server is already running on the port, the window simply attaches to it.
 
+The Windows installer (installer/build_installer.ps1) ships this file as the app's entry
+point, together with Python, PyTorch and every model, so it runs fully offline.
+
 Options
     --browser   open the dashboard in the default browser instead of a window
     --debug     enable the WebView developer tools (right click > Inspect)
@@ -31,6 +34,75 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 PORT = int(os.getenv("ARGUS_PORT", "8000"))
 URL = f"http://127.0.0.1:{PORT}/"
 WS_MAX_SIZE = 32 * 1024 * 1024
+
+
+def configure_installed_app():
+    """In the installed app (data folder next to app/), use the bundled models and stay offline.
+
+    Installed layout:  ARGUS/python, ARGUS/app/src (this file), ARGUS/data (models, logs).
+    A source checkout has no data/.argus_data marker, so nothing changes there.
+    """
+    data = os.path.abspath(os.path.join(BASE_DIR, "..", "..", "data"))
+    if not os.path.isfile(os.path.join(data, ".argus_data")):
+        return False
+    os.environ.setdefault("ARGUS_HOME", data)
+    try:
+        with open(os.path.join(data, ".argus_data"), encoding="utf-8") as f:
+            settings = json.load(f).get("settings", {})
+    except (OSError, ValueError):
+        settings = {}
+    for name, rel in settings.items():  # bundled Qwen2-VL, Whisper and mBART folders
+        os.environ.setdefault(name, os.path.join(data, rel))
+    os.environ.setdefault("HF_HOME", os.path.join(data, "hf_cache"))
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+    os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # pythonw (the Start-menu shortcut) has no console: keep the output in a log file instead.
+    if sys.stdout is None or sys.stderr is None:
+        logs = os.path.join(data, "logs")
+        os.makedirs(logs, exist_ok=True)
+        log = open(os.path.join(logs, "argus.log"), "w", encoding="utf-8", buffering=1)
+        sys.stdout = sys.stdout or log
+        sys.stderr = sys.stderr or log
+    return True
+
+
+def icon_path():
+    for path in (os.path.join(BASE_DIR, "..", "..", "argus.ico"), os.path.join(BASE_DIR, "..", "installer", "argus.ico")):
+        if os.path.isfile(path):
+            return os.path.abspath(path)
+    return None
+
+
+def set_window_icon(window):
+    """Windows: show the A.R.G.U.S. icon on the window and taskbar instead of Python's."""
+    ico = icon_path()
+    if not ico or sys.platform != "win32":
+        return
+    try:
+        from System import Action
+        from System.Drawing import Icon
+        form = window.native
+        form.Invoke(Action(lambda: setattr(form, "Icon", Icon(ico))))
+    except Exception as exc:
+        print(f"[WARNING] Could not set the window icon: {exc}")
+
+
+def check_gpu():
+    """Return None if a CUDA GPU is usable, else a message for the loading screen."""
+    try:
+        import torch
+    except Exception as exc:  # broken install
+        return f"PyTorch could not be loaded ({exc}). Try reinstalling A.R.G.U.S."
+    if not torch.cuda.is_available():
+        return ("A.R.G.U.S. needs an NVIDIA graphics card (8 GB or more) with a recent driver.\n"
+                "No usable CUDA GPU was found. If this PC has one, update the NVIDIA driver "
+                "(version 570 or newer) from nvidia.com and start A.R.G.U.S. again.")
+    vram = torch.cuda.get_device_properties(0).total_memory / 1024 ** 3
+    if vram < 7.5:
+        print(f"[WARNING] {torch.cuda.get_device_name(0)} has {vram:.1f} GB VRAM; 8 GB or more is recommended.")
+    return None
+
 
 SPLASH_HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><style>
@@ -154,6 +226,13 @@ def run_window(debug=False):
     if "--use-fake-ui-for-media-stream" not in extra:
         os.environ["WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS"] = (extra + " --use-fake-ui-for-media-stream").strip()
 
+    if sys.platform == "win32":
+        try:  # group the taskbar button under A.R.G.U.S., not under pythonw.exe
+            import ctypes
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("ARGUS.Desktop")
+        except Exception:
+            pass
+
     import webview
 
     backend = Backend()
@@ -169,6 +248,8 @@ def run_window(debug=False):
         text_select=True,
     )
 
+    window.events.shown += lambda: set_window_icon(window)
+
     def boot():
         if attach:
             print(f"[SYSTEM] Attached to the A.R.G.U.S. server already running on port {PORT}.")
@@ -176,6 +257,11 @@ def run_window(debug=False):
         tee = SplashTee(sys.stdout, lambda line: window.evaluate_js(f"setStatus({json.dumps(line)})"))
         sys.stdout = tee
         try:
+            problem = check_gpu()
+            if problem:
+                tee.active = False
+                window.evaluate_js(f"showError({json.dumps(problem)})")
+                return
             backend.start()
             tee.active = False
             print(f"\n[SYSTEM] A.R.G.U.S. running at {URL} (desktop window)")
@@ -198,6 +284,8 @@ def main():
     parser.add_argument("--browser", action="store_true", help="open in the default browser instead of a window")
     parser.add_argument("--debug", action="store_true", help="enable WebView developer tools")
     args = parser.parse_args()
+    if configure_installed_app():
+        print(f"[SYSTEM] Installed app, using bundled models in {os.environ['ARGUS_HOME']}")
 
     if args.browser:
         run_browser()

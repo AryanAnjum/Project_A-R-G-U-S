@@ -97,6 +97,30 @@ be connected at the same time. Add `--browser` to use the default browser instea
 MediaPipe holistic model. After that everything runs offline. The Piper voices go to
 `models/piper/`, and you can copy the `.onnx` and `.onnx.json` files there by hand instead.
 
+### Share it as a Windows installer
+
+`installer/build_installer.ps1` turns your setup into an installer a friend can run on their
+own PC, with no Python, internet or setup on their side. It bundles a private Python,
+PyTorch (CUDA 12.8), the app and every model (your fine-tune, the sign language checkpoints,
+Qwen2-VL-2B, Whisper, the Piper voices and MediaPipe), so every mode works offline.
+
+Build it once on your Windows PC (needs internet, about 25 GB of free disk, 30 to 90 minutes):
+
+```powershell
+winget install JRSoftware.InnoSetup
+powershell -ExecutionPolicy Bypass -File installer\build_installer.ps1 -AdapterDir D:\path\to\part_5_adapter
+```
+
+It writes `installer\dist\ARGUS-Setup.exe` plus several `ARGUS-Setup-*.bin` files (about
+9 GB in total). Copy all of them into one folder on a USB drive or shared drive. Your friend
+runs `ARGUS-Setup.exe`, which installs to their user folder without admin rights, adds a
+Start menu and desktop icon, and installs the Visual C++ runtime and WebView2 if they are missing.
+
+Your friend's PC needs Windows 10 or 11, an NVIDIA GPU with 8 GB or more of VRAM and a recent
+driver (570 or newer), and about 15 GB of free disk. Their phone connects to
+`ws://<their PC's IP>:8000/ws`, and Windows asks once to allow A.R.G.U.S. through the firewall.
+Logs are written to `data\logs\argus.log` inside the install folder.
+
 ### Sign language mode
 
 1. Copy the trained German checkpoint folder (the `best/` folder with `model.pt` and

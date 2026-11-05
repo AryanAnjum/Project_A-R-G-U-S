@@ -76,6 +76,8 @@ except Exception:
 # ==========================================
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
+# Models, checkpoints and logs live here. The installed desktop app points this at its data folder.
+DATA_ROOT = os.path.abspath(os.getenv("ARGUS_HOME", REPO_ROOT))
 
 
 def env_float(name, default):
@@ -85,7 +87,7 @@ def env_float(name, default):
 BASE_MODEL_ID = os.getenv("ARGUS_BASE_MODEL", "Qwen/Qwen2-VL-2B-Instruct")
 # Phased LoRA fine-tune (PEFT format). Defaults to the last phase.
 ADAPTER_PATH = os.path.abspath(os.getenv(
-    "ARGUS_ADAPTER_PATH", os.path.join(REPO_ROOT, "argus_phased_adapters", "part_5_adapter")))
+    "ARGUS_ADAPTER_PATH", os.path.join(DATA_ROOT, "argus_phased_adapters", "part_5_adapter")))
 MERGE_ADAPTER = os.getenv("ARGUS_MERGE_ADAPTER", "1") == "1"
 
 # Longest image side sent to the model. OCR keeps the full 1920 px so small
@@ -111,7 +113,7 @@ BARGE_IN = os.getenv("ARGUS_BARGE_IN", "all").lower()
 SLT_ENGLISH = os.getenv("ARGUS_SLT_ENGLISH", "1") == "1"
 SLT_SPEAK = os.getenv("ARGUS_SLT_SPEAK", "en").lower()  # en | source | off
 
-LATENCY_LOG = os.getenv("ARGUS_LATENCY_LOG", os.path.join(REPO_ROOT, "logs", "latency.csv"))
+LATENCY_LOG = os.getenv("ARGUS_LATENCY_LOG", os.path.join(DATA_ROOT, "logs", "latency.csv"))
 
 MODES = ("screen", "live", "assistive", "slt")
 MODE_ALIASES = {"assist": "assistive", "sign": "slt", "lecture": "slt"}
