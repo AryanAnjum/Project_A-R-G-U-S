@@ -33,7 +33,9 @@ import tempfile
 import threading
 import time
 import traceback
+from difflib import SequenceMatcher
 import uuid
+from collections import deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -98,6 +100,8 @@ WHISPER_DEVICE = os.getenv("ARGUS_WHISPER_DEVICE", "cuda" if torch.cuda.is_avail
 WHISPER_COMPUTE_TYPE = os.getenv("ARGUS_WHISPER_COMPUTE_TYPE", "float16" if WHISPER_DEVICE == "cuda" else "int8")
 # Seconds of silence that end a spoken sentence. Lower answers sooner but may cut you off mid-pause.
 PAUSE_THRESHOLD = env_float("ARGUS_PAUSE_THRESHOLD", 0.45)
+# Seconds to ignore the mic after ARGUS stops talking, so room echo isn't heard as a question.
+ECHO_GUARD_S = env_float("ARGUS_ECHO_GUARD", 0.8)
 
 # Sign language captions: also translate into English with Qwen, and which text to speak.
 SLT_ENGLISH = os.getenv("ARGUS_SLT_ENGLISH", "1") == "1"
@@ -427,6 +431,8 @@ pc_generating = threading.Event()  # set while a PC reply is being generated
 pending_pc_speech = 0
 pending_pc_lock = threading.Lock()
 last_tts_end = 0.0
+last_tts_start = 0.0
+recent_speech = deque(maxlen=30)  # (time, normalized text) of what ARGUS said, for the echo filter
 
 
 def pc_busy():
@@ -506,6 +512,7 @@ def pc_synth_worker():
 
 
 def pc_play_worker():
+    global last_tts_start
     while system_is_running:
         item, audio, mime = pc_play_queue.get()
         if item.epoch != tts_epoch:
@@ -519,6 +526,8 @@ def pc_play_worker():
                 pygame.mixer.init()
             pygame.mixer.music.load(tmp.name)
             set_status("speaking")
+            last_tts_start = time.time()
+            recent_speech.append((last_tts_start, normalize_command_text(item.text)))
             pygame.mixer.music.play()
             if item.seq == 0 and item.req_id:
                 latency.mark(item.req_id, "first_audio_ms")
@@ -619,6 +628,26 @@ def detect_wake_call(text):
     return False, ""
 
 
+def is_own_echo(heard, window_s=30.0):
+    """True if the mic most likely picked up ARGUS's own voice from the speakers."""
+    clean = normalize_command_text(heard)
+    words = clean.split()
+    if not words:
+        return False
+    now = time.time()
+    recent = [text for t, text in list(recent_speech) if now - t <= window_s and text]
+    if not recent:
+        return False
+    joined = " ".join(recent)
+    if any(SequenceMatcher(None, clean, r).ratio() >= 0.6 for r in recent):
+        return True
+    if len(clean) >= 12 and SequenceMatcher(None, clean, joined).find_longest_match(
+            0, len(clean), 0, len(joined)).size >= 0.6 * len(clean):
+        return True
+    spoken = set(joined.split())
+    return len(words) >= 3 and sum(w in spoken for w in words) / len(words) >= 0.75
+
+
 def sanitize_transcription_for_ui(text):
     return re.sub(ARGUS_PHONETIC_VARIANTS, "Argus", text, flags=re.IGNORECASE)
 
@@ -677,7 +706,18 @@ GROUNDING_RULES = ("The image attached to this message is the only visual eviden
 
 HAZARD_PATTERN = re.compile(r"\b(danger|dangerous|hazard|caution|careful|watch out|warning|stairs ahead|"
                             r"step down|step up|obstacle|traffic|oncoming)\b", re.IGNORECASE)
-DIALOGUE_CUT = re.compile(r"\b(?:User|Human)\s*:", re.IGNORECASE)
+# The model sometimes keeps going and writes both sides of a conversation: cut at the first
+# speaker label after the start of the reply.
+DIALOGUE_CUT = re.compile(r"(?:^|\n|\s)(?:User|Human|Assistant|You|Me|ARGUS|A\.R\.G\.U\.S\.?)\s*:", re.IGNORECASE)
+LEADING_LABEL = re.compile(r"^\s*(?:Assistant|ARGUS|A\.R\.G\.U\.S\.?)\s*:\s*", re.IGNORECASE)
+
+
+def dialogue_cut(text):
+    """Index where an invented dialogue starts in text, or None."""
+    lead = LEADING_LABEL.match(text)
+    start = lead.end() if lead else 0
+    m = DIALOGUE_CUT.search(text, start)
+    return m.start() if m else None
 # A sentence is ready to speak once it ends in . ! ? (or the Bangla danda) followed by a space.
 # Sentences shorter than 12 characters ("Hmm...") are merged with the next one.
 SENTENCE_END = re.compile(r"(.{12,}?[.!?\u0964][\"')\]]*)(\s+)", re.S)
@@ -733,8 +773,10 @@ class CancelCriteria(StoppingCriteria):
 
 
 def clean_reply(text):
-    text = DIALOGUE_CUT.split(text, maxsplit=1)[0]
-    text = re.sub(r"^\s*Assistant\s*:\s*", "", text, flags=re.IGNORECASE)
+    cut = dialogue_cut(text)
+    if cut is not None:
+        text = text[:cut]
+    text = LEADING_LABEL.sub("", text)
     return text.strip().strip('"').strip()
 
 
@@ -817,7 +859,7 @@ def _process_prompt(req: PromptRequest):
                 latency.mark(req.id, "first_token_ms")
             n_chunks += 1
             full += chunk
-            if DIALOGUE_CUT.search(full):  # the model started writing a fake dialogue: stop there
+            if dialogue_cut(full) is not None:  # the model started writing a fake dialogue: stop there
                 cancel_generation.set()
                 pending += chunk
                 break
@@ -844,7 +886,7 @@ def _process_prompt(req: PromptRequest):
 
     if gen_error:
         print("[VLM ERROR]", "".join(traceback.format_exception(gen_error[0])))
-    interrupted = cancel_generation.is_set() and not DIALOGUE_CUT.search(full)
+    interrupted = cancel_generation.is_set() and dialogue_cut(full) is None
     if interrupted:
         latency.finish(req.id)
         return
@@ -1024,11 +1066,12 @@ def audio_worker():
                     pass
                 continue
 
-            if time.time() - last_tts_end < 0.5:  # don't hear the tail of our own voice
+            if time.time() - last_tts_end < ECHO_GUARD_S:  # don't hear the tail of our own voice
                 time.sleep(0.05)
                 continue
 
             idle = assistant_state == "idle"
+            listen_start = time.time()
             try:
                 with mic as source:
                     audio = recognizer.listen(source, timeout=2.0 if idle else 8.0,
@@ -1036,7 +1079,8 @@ def audio_worker():
             except sr.WaitTimeoutError:
                 continue
             speech_end = time.time() - PAUSE_THRESHOLD
-            if pc_busy():
+            # ARGUS started talking while this clip was being recorded: it is (partly) our own voice.
+            if pc_busy() or last_tts_start >= listen_start - 0.2 or last_tts_end >= listen_start:
                 continue
 
             stt_start = time.time()
@@ -1047,6 +1091,10 @@ def audio_worker():
             print(f"[VOICE] Heard {heard!r} ({stt_ms} ms, state={assistant_state})")
 
             if handle_stop_or_sleep(heard):
+                continue
+
+            if is_own_echo(heard):
+                print(f"[VOICE] Ignored (sounds like ARGUS's own reply): {heard!r}")
                 continue
 
             if assistant_state == "idle":
