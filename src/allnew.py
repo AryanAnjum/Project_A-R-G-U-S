@@ -582,8 +582,22 @@ def normalize_command_text(text):
     return " ".join(clean.split())
 
 
+# Hint that helps Whisper spell "Argus". On noise Whisper sometimes just repeats this hint,
+# which would look like a wake word followed by a question, so those transcripts are dropped.
+WHISPER_PROMPT = "Hey Argus."
+
+
+def is_prompt_echo(text):
+    clean = normalize_command_text(text)
+    words = clean.split()
+    return bool(words) and all(w in {"hey", "argus", "assistant", "a", "r", "g", "u", "s"} for w in words) \
+        and len(words) > 2
+
+
 WHISPER_HALLUCINATIONS = {"thank you", "thanks", "thanks for watching", "subscribe", "you",
-                          "okay", "ok", "amaraorg", "yeah", "you know"}
+                          "okay", "ok", "amaraorg", "yeah", "you know", "bye", "so", "um", "uh", "hmm",
+                          "thank you for watching", "please subscribe", "thank you very much",
+                          "subtitles by the amaraorg community", "argus assistant"}
 
 
 def is_hallucination(text):
@@ -1027,8 +1041,20 @@ def audio_worker():
         segments, _ = audio_model.transcribe(
             pcm.astype(np.float32) / 32768.0, beam_size=2, best_of=1, language="en", vad_filter=True,
             vad_parameters={"min_silence_duration_ms": 250}, condition_on_previous_text=False,
-            temperature=0.0, no_speech_threshold=0.6, initial_prompt="A.R.G.U.S. assistant, Hey Argus.")
-        return " ".join(s.text.strip() for s in segments).strip()
+            temperature=0.0, no_speech_threshold=0.6, initial_prompt=WHISPER_PROMPT)
+        kept = []
+        for seg in segments:
+            # Whisper invents text for noise or silence; those segments look unsure or "no speech".
+            if seg.no_speech_prob > 0.5 or seg.avg_logprob < -1.0 or seg.compression_ratio > 2.4:
+                print(f"[VOICE] Dropped unsure segment {seg.text.strip()!r} (no_speech={seg.no_speech_prob:.2f}, "
+                      f"logprob={seg.avg_logprob:.2f})")
+                continue
+            kept.append(seg.text.strip())
+        text = " ".join(kept).strip()
+        if is_prompt_echo(text):
+            print(f"[VOICE] Dropped {text!r}: Whisper repeated its own prompt (no one spoke)")
+            return ""
+        return text
 
     def handle_stop_or_sleep(heard):
         global assistant_state
