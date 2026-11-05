@@ -108,19 +108,18 @@ SPLASH_HTML = """<!DOCTYPE html>
 <html><head><meta charset="UTF-8"><style>
   html, body { height: 100%; margin: 0; }
   body { display: flex; align-items: center; justify-content: center;
-         background: #f5f5f2; color: #1d1d1b;
+         background: #161a1f; color: #d5dade;
          font-family: "Segoe UI", system-ui, -apple-system, sans-serif; }
-  @media (prefers-color-scheme: dark) { body { background: #161615; color: #ececea; } }
   .box { width: min(520px, 86vw); text-align: center; }
   h1 { font-size: 28px; letter-spacing: 0.35em; font-weight: 600; margin: 0 0 6px; }
   .sub { opacity: 0.6; font-size: 13px; margin-bottom: 28px; }
   .bar { height: 3px; border-radius: 3px; background: rgba(127,127,127,0.2); overflow: hidden; }
-  .bar i { display: block; height: 100%; width: 35%; background: currentColor;
+  .bar i { display: block; height: 100%; width: 35%; background: #86b8a5;
            animation: slide 1.3s ease-in-out infinite; }
   @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(290%); } }
   #status { margin-top: 18px; font-size: 13px; opacity: 0.75; min-height: 1.4em;
             white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .err #status { white-space: pre-wrap; text-align: left; opacity: 1; color: #c0392b;
+  .err #status { white-space: pre-wrap; text-align: left; opacity: 1; color: #e39d9d;
                  font-family: Consolas, monospace; font-size: 12px; }
   .err .bar { display: none; }
 </style></head><body><div class="box" id="box">
@@ -244,7 +243,7 @@ def run_window(debug=False):
         width=1440,
         height=900,
         min_size=(960, 640),
-        background_color="#f5f5f2",
+        background_color="#161a1f",
         text_select=True,
     )
 
