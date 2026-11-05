@@ -125,6 +125,8 @@ def warm_up(lang="en"):
     """Load the voice at startup so the first reply isn't slowed by loading it."""
     if ENGINE == "piper":
         try:
-            _load_piper(lang)
+            voice = _load_piper(lang)
+            if voice is not None:
+                _piper_wav(voice, "Ready.", "+0%")  # first synthesis also initialises ONNX Runtime
         except Exception as exc:
             print(f"[TTS] Piper voice not loaded ({type(exc).__name__}: {exc}). Replies will use edge-tts.")

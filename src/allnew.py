@@ -290,6 +290,42 @@ except Exception as exc:
 argus_tts.warm_up("en")
 
 
+def warm_up_models():
+    """Run each model once at startup. The very first CUDA generate pays one-time costs
+    (kernel loading, cuBLAS/cuDNN setup, vision encoder init) of 10-20 s on Windows, and
+    without this the user's first question absorbs them."""
+    if os.getenv("ARGUS_WARMUP", "1") != "1":
+        return
+    print("[SYSTEM] Warming up the models so the first reply is fast...")
+    start = time.time()
+    try:
+        img = Image.new("RGB", (MAX_IMAGE_PX, MAX_IMAGE_PX * 9 // 16), (40, 40, 40))
+        messages = [{"role": "user", "content": [
+            {"type": "image", "image": img}, {"type": "text", "text": "What is on the screen?"}]}]
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                           padding=True, return_tensors="pt").to(vlm.device)
+        with vlm_lock, torch.inference_mode():
+            vlm.generate(**inputs, max_new_tokens=4, do_sample=False)
+    except Exception as exc:
+        print(f"[WARNING] Model warm-up failed ({type(exc).__name__}: {exc}); the first reply may be slow.")
+    try:
+        segments, _ = audio_model.transcribe(np.zeros(16000, dtype=np.float32), language="en")
+        list(segments)
+    except Exception as exc:
+        print(f"[WARNING] Whisper warm-up failed ({type(exc).__name__}: {exc}).")
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        used = torch.cuda.memory_reserved() / 1024 ** 3
+        print(f"[SYSTEM] Warm-up done in {time.time() - start:.1f} s ({used:.1f} GB VRAM reserved by PyTorch).")
+    else:
+        print(f"[SYSTEM] Warm-up done in {time.time() - start:.1f} s.")
+
+
+warm_up_models()
+
+
 # ==========================================
 # 3. SHARED STATE
 # ==========================================
