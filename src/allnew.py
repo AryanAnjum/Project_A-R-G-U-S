@@ -101,7 +101,10 @@ WHISPER_COMPUTE_TYPE = os.getenv("ARGUS_WHISPER_COMPUTE_TYPE", "float16" if WHIS
 # Seconds of silence that end a spoken sentence. Lower answers sooner but may cut you off mid-pause.
 PAUSE_THRESHOLD = env_float("ARGUS_PAUSE_THRESHOLD", 0.45)
 # Seconds to ignore the mic after ARGUS stops talking, so room echo isn't heard as a question.
-ECHO_GUARD_S = env_float("ARGUS_ECHO_GUARD", 0.8)
+# 0 = listen again the moment ARGUS stops (best with earphones). With loudspeakers, 0.5-0.8 helps.
+ECHO_GUARD_S = env_float("ARGUS_ECHO_GUARD", 0.0)
+# While ARGUS talks: "all" = any new question interrupts it, "stop" = only stop / goodbye commands.
+BARGE_IN = os.getenv("ARGUS_BARGE_IN", "all").lower()
 
 # Sign language captions: also translate into English with Qwen, and which text to speak.
 SLT_ENGLISH = os.getenv("ARGUS_SLT_ENGLISH", "1") == "1"
@@ -607,7 +610,7 @@ def is_hallucination(text):
 
 ARGUS_PHONETIC_VARIANTS = r"argus|argas|argos|august|aragus|argis|arkus|ar\s+gus|our\s+guess|are\s+guess|artis"
 WAKE_PREFIXES = r"hey|hi|hello|ok|okay|yo"
-STOP_PHRASES = {"stop", "ok stop", "okay stop", "stop talking", "stop speaking", "be quiet", "quiet", "shut up",
+STOP_PHRASES = {"stop", "stop it", "stop stop", "no stop", "wait", "argus stop", "ok stop", "okay stop", "stop talking", "stop speaking", "be quiet", "quiet", "shut up",
                 "cancel", "hold on", "pause", "enough", "thats enough", "please stop", "okay thats enough",
                 "ok thats enough", "please be quiet"}
 SLEEP_PHRASES = {"bye", "goodbye", "good bye", "sleep", "go to sleep", "thats all", "im done", "im finished",
@@ -1080,41 +1083,33 @@ def audio_worker():
                 time.sleep(0.2)
                 continue
 
-            # While speaking, only listen for short "stop" / "goodbye" commands (barge-in).
-            if pc_busy():
-                try:
-                    with mic as source:
-                        audio = recognizer.listen(source, timeout=0.8, phrase_time_limit=3.5)
-                    heard = transcribe(audio)
-                    if heard:
-                        handle_stop_or_sleep(heard)
-                except sr.WaitTimeoutError:
-                    pass
+            if ECHO_GUARD_S > 0 and not pc_busy() and time.time() - last_tts_end < ECHO_GUARD_S:
+                time.sleep(0.02)  # optional pause for loudspeaker setups (0 by default)
                 continue
 
-            if time.time() - last_tts_end < ECHO_GUARD_S:  # don't hear the tail of our own voice
-                time.sleep(0.05)
-                continue
-
+            # The mic is always open, also while ARGUS is talking, so you can interrupt at any time.
             idle = assistant_state == "idle"
-            listen_start = time.time()
             try:
                 with mic as source:
-                    audio = recognizer.listen(source, timeout=2.0 if idle else 8.0,
-                                              phrase_time_limit=5.0 if idle else 12.0)
+                    audio = recognizer.listen(source, timeout=8.0 if not idle else 2.0,
+                                              phrase_time_limit=12.0 if not idle else 6.0)
             except sr.WaitTimeoutError:
                 continue
-            speech_end = time.time() - PAUSE_THRESHOLD
-            # ARGUS started talking while this clip was being recorded: it is (partly) our own voice.
-            if pc_busy() or last_tts_start >= listen_start - 0.2 or last_tts_end >= listen_start:
-                continue
+            now = time.time()
+            speech_end = now - PAUSE_THRESHOLD
+            # When did this phrase start? (the clip runs from the first sound to the end of the pause)
+            clip_s = len(audio.frame_data) / float(audio.sample_rate * audio.sample_width)
+            phrase_start = now - clip_s
+            # Was ARGUS talking at any point while this phrase was spoken?
+            overlapped = pc_busy() or last_tts_end >= phrase_start
 
             stt_start = time.time()
             heard = transcribe(audio)
             stt_ms = int((time.time() - stt_start) * 1000)
             if not heard:
                 continue
-            print(f"[VOICE] Heard {heard!r} ({stt_ms} ms, state={assistant_state})")
+            print(f"[VOICE] Heard {heard!r} ({stt_ms} ms, state={assistant_state}"
+                  f"{', while ARGUS was talking' if overlapped else ''})")
 
             if handle_stop_or_sleep(heard):
                 continue
@@ -1122,6 +1117,8 @@ def audio_worker():
             if is_own_echo(heard):
                 print(f"[VOICE] Ignored (sounds like ARGUS's own reply): {heard!r}")
                 continue
+            if overlapped and BARGE_IN != "all":
+                continue  # ARGUS_BARGE_IN=stop: only "stop" / "goodbye" interrupt
 
             if assistant_state == "idle":
                 is_wake, remainder = detect_wake_call(heard)
@@ -1139,6 +1136,12 @@ def audio_worker():
 
             if is_hallucination(heard):
                 continue
+
+            if overlapped and pc_busy():
+                # You spoke over ARGUS: stop the current answer and take the new question.
+                interrupt_tts()
+                clear_pending_prompts()
+                log_event("SYSTEM", "Interrupted. Answering your new question.")
 
             play_capture_chime()
             ws_manager.broadcast_sync({"event": "speech_recognized", "text": sanitize_transcription_for_ui(heard)},

@@ -51,8 +51,9 @@ flowchart LR
 
 - **Streaming replies.** The model's answer is spoken one sentence at a time while the rest is
   still being generated, so you hear the start of the reply sooner.
-- **Barge-in.** While A.R.G.U.S. is answering, the mic only listens for *"okay stop"* and
-  *"goodbye"*. Either one stops the voice and the generation immediately.
+- **Always listening.** The mic stays open while A.R.G.U.S. talks. *"Okay stop"* stops the voice and
+  the generation at once, and a new question asked over it interrupts the old answer. It listens
+  again the moment it stops talking. An echo filter ignores its own voice if you use loudspeakers.
 - **Timing for every reply.** Each reply's stages (speech-to-text, first token, first sentence,
   voice synthesis, first audio, full reply) are shown on the dashboard and appended to
   `logs/latency.csv`, so latency figures come from real measurements.
@@ -114,6 +115,8 @@ shows up as ready in the language menu, with no code change.
 | `ARGUS_MAX_IMAGE_PX` | `1024` | Longest image side for normal questions |
 | `ARGUS_OCR_MAX_PX` | `1920` | Longest image side for OCR questions |
 | `ARGUS_PAUSE_THRESHOLD` | `0.45` | Seconds of silence that end a spoken question |
+| `ARGUS_BARGE_IN` | `all` | While ARGUS talks: `all` = a new question interrupts it, `stop` = only "stop" / "goodbye" do |
+| `ARGUS_ECHO_GUARD` | `0` | Seconds to wait after ARGUS stops before listening. Keep 0 with earphones; try 0.5-0.8 with loudspeakers |
 | `ARGUS_TTS` | `piper` | `piper` (offline) or `edge` (online Microsoft voices) |
 | `ARGUS_WHISPER_MODEL` | `small.en` | faster-whisper model |
 | `ARGUS_SLT_DE_CKPT` / `ARGUS_SLT_BN_CKPT` | see above | Sign language checkpoints |
