@@ -57,10 +57,21 @@ def configure_installed_app():
     os.environ.setdefault("HF_HUB_OFFLINE", "1")
     os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
     os.environ.setdefault("HF_HUB_DISABLE_TELEMETRY", "1")
+    # Logs go next to the app when that folder is writable, otherwise (e.g. installed under
+    # Program Files) to %LOCALAPPDATA%\ARGUS\logs.
+    logs = os.path.join(data, "logs")
+    try:
+        os.makedirs(logs, exist_ok=True)
+        probe = os.path.join(logs, ".write_test")
+        with open(probe, "w"):
+            pass
+        os.remove(probe)
+    except OSError:
+        logs = os.path.join(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")), "ARGUS", "logs")
+        os.makedirs(logs, exist_ok=True)
+    os.environ.setdefault("ARGUS_LATENCY_LOG", os.path.join(logs, "latency.csv"))
     # pythonw (the Start-menu shortcut) has no console: keep the output in a log file instead.
     if sys.stdout is None or sys.stderr is None:
-        logs = os.path.join(data, "logs")
-        os.makedirs(logs, exist_ok=True)
         log = open(os.path.join(logs, "argus.log"), "w", encoding="utf-8", buffering=1)
         sys.stdout = sys.stdout or log
         sys.stderr = sys.stderr or log
