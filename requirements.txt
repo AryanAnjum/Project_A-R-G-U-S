@@ -27,6 +27,9 @@ fastapi
 uvicorn[standard]
 websockets
 
+# Desktop window (python argus_desktop.py); uses Edge WebView2 on Windows
+pywebview
+
 # Screen capture and GPU telemetry
 dxcam; sys_platform == "win32"
 mss

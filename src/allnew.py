@@ -4,7 +4,8 @@ Run from the src folder:
 
     python allnew.py
 
-then open http://localhost:8000 for the dashboard. The Android app connects to
+then open http://localhost:8000 for the dashboard, or run `python argus_desktop.py` to
+get the same dashboard in a native desktop window. The Android app connects to
 ws://<this PC>:8000/ws.
 
 Modes

@@ -84,10 +84,14 @@ Put the fine-tune at `argus_phased_adapters/part_5_adapter` (or set `ARGUS_ADAPT
 
 ```bash
 cd src
-python allnew.py
+python argus_desktop.py
 ```
 
-Open `http://localhost:8000`. In the Android app, enter `ws://<this PC's IP>:8000/ws` as the server address.
+This opens A.R.G.U.S. as a desktop app in its own window (or double-click `ARGUS.bat`). A
+loading screen shows each step while the models load, and closing the window stops the
+backend. It is the same backend the phone uses, so the desktop app and the Android app can
+be connected at the same time. Add `--browser` to use the default browser instead, or run
+`python allnew.py` and open `http://localhost:8000` as before. In the Android app, enter `ws://<this PC's IP>:8000/ws` as the server address.
 
 **First run needs internet once.** It downloads Qwen2-VL, Whisper, the Piper voices and the
 MediaPipe holistic model. After that everything runs offline. The Piper voices go to
