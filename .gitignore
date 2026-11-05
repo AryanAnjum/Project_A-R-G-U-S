@@ -248,3 +248,6 @@ Desktop.ini
 math_data/
 argus_phased_adapters/
 /LLaVA-OneVision-Data
+
+# Per-reply latency logs written by the server
+logs/
