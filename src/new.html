@@ -534,6 +534,24 @@ function applyMode(mode, notifyServer) {
 /* ---------- Webcam ---------- */
 const video = document.createElement("video");
 video.autoplay = true; video.muted = true; video.playsInline = true;
+// Keep the element in the page (invisible, not display:none). A detached video can stay paused on
+// its first, often black, frame in WebView2 (the desktop app), so every frame sent would be black.
+video.setAttribute("aria-hidden", "true");
+Object.assign(video.style, { position: "fixed", left: "0", top: "0", width: "2px", height: "2px",
+                             opacity: "0", pointerEvents: "none", zIndex: "-1" });
+document.body.appendChild(video);
+
+/** Average brightness (0-255) of a small copy of the current camera frame, or -1 if none yet. */
+function frameBrightness() {
+  if (video.readyState < 2 || !video.videoWidth) return -1;
+  const c = document.createElement("canvas"); c.width = 32; c.height = 18;
+  const ctx = c.getContext("2d");
+  ctx.drawImage(video, 0, 0, 32, 18);
+  const px = ctx.getImageData(0, 0, 32, 18).data;
+  let sum = 0;
+  for (let i = 0; i < px.length; i += 4) sum += px[i] + px[i + 1] + px[i + 2];
+  return sum / (px.length / 4) / 3;
+}
 const grabCanvas = document.createElement("canvas");
 
 async function startWebcam() {
@@ -543,9 +561,19 @@ async function startWebcam() {
       video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 30 } }, audio: false,
     });
     video.srcObject = stream;
+    try { await video.play(); } catch (e) { addLog("SYSTEM", `Webcam preview could not start: ${e.message || e.name}`); }
     state.cameraOn = true;
-    const s = stream.getVideoTracks()[0].getSettings();
-    addLog("SYSTEM", `Webcam on (${s.width || "?"}x${s.height || "?"}).`);
+    const track = stream.getVideoTracks()[0];
+    const s = track.getSettings();
+    addLog("SYSTEM", `Webcam on: ${track.label || "camera"} (${s.width || "?"}x${s.height || "?"}).`);
+    // Laptops often have a privacy shutter or camera key that gives a black picture instead of an error.
+    setTimeout(() => {
+      const b = frameBrightness();
+      if (state.cameraOn && b >= 0 && b < 6) {
+        addLog("SYSTEM", "The camera picture is black. Open the laptop's camera shutter or press its camera key " +
+                         "(often F8 or F10), and close other apps that use the camera.");
+      }
+    }, 2500);
   } catch (err) {
     addLog("SYSTEM", `Webcam unavailable: ${err.message || err.name}`);
   }
