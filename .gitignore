@@ -244,7 +244,10 @@ Desktop.ini
 
 # Local Environment Variables (API Keys)
 .env
-Ban-Sign-Sent-9K-V1/
+
 math_data/
 argus_phased_adapters/
 /LLaVA-OneVision-Data
+
+# Per-reply latency logs written by the server
+logs/

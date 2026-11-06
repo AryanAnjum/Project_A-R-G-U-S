@@ -1,73 +1,41 @@
-faster-whisper
-av
-ctranslate2
-huggingface-hub
-onnxruntime
-tokenizers
-tqdm
-pyaudio
-webrtcvad
-numpy
+# A.R.G.U.S. server (src/allnew.py)
+# Install PyTorch first, built for your CUDA version. RTX 50-series needs CUDA 12.8:
+#   pip install torch --index-url https://download.pytorch.org/whl/cu128
 
-# ==========================================
-# A.R.G.U.S. Core Dependencies
-# ==========================================
-
-# 1. Vision & Machine Learning (X3D Engine)
-torch>=1.13.0
-torchvision
-torchaudio
-pytorchvideo
-av>=10.0.0
-opencv-python>=4.7.0
-
-# 2. Audio & VAD (Hearing Engine)
-numpy
-PyAudio
-webrtcvad
-faster-whisper
-
-# 3. Meta/FAIR Core Dependencies (Required by PyTorchVideo)
-fvcore
-iopath
-packaging
-
-opencv-python
-pandas
-faster-whisper 
-SpeechRecognition 
-pyaudio
-SpeechRecognition
-faster-whisper 
-pyaudio
-tqdm
-pyttsx3
-
-transformers==4.56.1 
-einops 
+# Vision-language model
+transformers==4.56.1
 accelerate
+peft
+qwen-vl-utils
+einops
+pillow
+numpy
+opencv-python
+
+# Speech in
+faster-whisper
+SpeechRecognition
+pyaudio
+
+# Speech out (piper = offline voice, edge-tts = online fallback)
+piper-tts
 edge-tts
 pygame
-qwen-vl-utils
 
-scikit-learn 
-pandas
-datasets
-peft 
-accelerate
-uvicorn 
-websockets
+# Server
 fastapi
-dxcam 
-opencv-python
-scikit-learn 
-seaborn 
-matplotlib 
-peft
-pyvips-binary 
-pyvips
-bitsandbytes 
-accelerate
-pip install nvidia-ml-py
-python -m pip install mss
-pip install coqui-tts
+uvicorn[standard]
+websockets
+
+# Desktop window (python argus_desktop.py); uses Edge WebView2 on Windows
+pywebview
+
+# Screen capture and GPU telemetry
+dxcam; sys_platform == "win32"
+mss
+nvidia-ml-py
+
+# Sign language mode (see sign_language/README.md)
+mediapipe>=0.10.20
+sentencepiece
+protobuf
