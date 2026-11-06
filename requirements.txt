@@ -39,3 +39,7 @@ nvidia-ml-py
 mediapipe>=0.10.20
 sentencepiece
 protobuf
+
+
+# for pc software
+winget install JRSoftware.InnoSetup 
