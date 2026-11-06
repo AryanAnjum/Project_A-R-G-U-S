@@ -24,7 +24,7 @@ Developed and measured on an RTX 5060 Ti (16 GB) under Windows.
 | **Screen** | This PC's screen (DXCam, MSS fallback) | Casual copilot for whatever is on screen |
 | **Live** | Dashboard webcam or phone camera | Conversational companion |
 | **Assistive** | Camera | Short, safety-first descriptions for a visually impaired user, hazard beep, Bangladeshi Taka reader |
-| **Sign** | Camera | Translates continuous sign language into text and speech. German Sign Language (DGS) works now; Bangla (BdSL) switches on when its model is added |
+| **Sign** | Camera | Translates continuous sign language into text and speech. German Sign Language (DGS) and Bangla Sign Language (BdSL) |
 
 **OCR on demand.** Everyday questions use a 1024 px image so they answer quickly. When you
 turn on the **OCR** button, or ask something like *"read this"*, *"what does it say"*,
@@ -123,17 +123,30 @@ Logs are written to `data\logs\argus.log` inside the install folder.
 
 ### Sign language mode
 
-1. Copy the trained German checkpoint folder (the `best/` folder with `model.pt` and
-   `vocab.json`) to `runs/ablation_small_decoder_s1/best`, or point `ARGUS_SLT_DE_CKPT` at it.
-2. That model also uses RGB features, so put the BSL-1K I3D checkpoint at `models/bsl1k.pth.tar`
-   (download link in `sign_language/README.md`, step 2b). A pose-only checkpoint doesn't need it.
-3. Choose **Sign**, sign in front of the camera, then lower your hands. The sentence is
-   translated after about a second without hands, or straight away with **Translate now**.
+Two sign languages are supported: **German (DGS)** and **Bangla (BdSL)**. Pick one in the
+language menu of Sign mode.
 
-The German model was trained on PHOENIX-2014T, which is TV weather forecasts, so it translates
-weather-style German signing best. **Bangla:** when the BdSL model finishes training, copy its
-`best/` folder to `runs/bansign_small/best` (or set `ARGUS_SLT_BN_CKPT`) and restart. It then
-shows up as ready in the language menu, with no code change.
+1. Keep the trained `best/` folders (each holds `model.pt` and `vocab.json`) under `runs/`.
+   ARGUS uses the first one it finds for each language, preferring the pose-only models
+   because they are the fastest live and work from the phone's keypoints too:
+
+   | Language | Checkpoints tried, in order | Override |
+   | --- | --- | --- |
+   | German | `runs/ablation_pose_only/best`, `runs/ablation_small_decoder_s1/best` | `ARGUS_SLT_DE_CKPT` |
+   | Bangla | `runs/bansign_signer_pose_s0/best`, `runs/bansign_signer_s0/best`, `runs/bansign_sentence_pose_s0/best`, `runs/bansign_sentence_s0/best` | `ARGUS_SLT_BN_CKPT` |
+
+2. The RGB + pose models (`ablation_small_decoder_*`, `bansign_signer_s0`, `bansign_sentence_s0`)
+   also need the BSL-1K I3D checkpoint at `models/bsl1k.pth.tar` (download link in
+   `sign_language/README.md`, step 2b). The pose-only models don't.
+3. Choose **Sign**, pick the language, sign in front of the camera, then lower your hands. The
+   sentence is translated after about a second without hands, or straight away with **Translate now**.
+   The caption shows the German or Bangla sentence with an English translation underneath, and
+   the English is spoken (set `ARGUS_SLT_SPEAK=source` to speak the original language instead).
+
+The German model was trained on PHOENIX-2014T (TV weather forecasts), so it translates
+weather-style German signing best. The Bangla model was trained on Ban-Sign-Sent-9K and scores
+52.1 BLEU-4 on signers it never saw in training (see `runs/bansign_results.md`). Bangla speech
+uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 
 ### Settings (environment variables)
 

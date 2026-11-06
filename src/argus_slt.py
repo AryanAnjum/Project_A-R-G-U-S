@@ -44,6 +44,29 @@ I3D_CKPT = os.getenv("ARGUS_SLT_I3D", os.path.join(DATA_ROOT, "models", "bsl1k.p
 I3D_RESIZE, I3D_CROP = 256, 224
 
 
+# Checkpoints tried for each language, best for live use first. All are folders written by
+# sign_language.train (model.pt + vocab.json). Pose-only models need no RGB/I3D features, so they
+# run on the phone's keypoints too and leave the GPU to Qwen. ARGUS_SLT_<CODE>_CKPT overrides.
+CHECKPOINTS = {
+    # German (PHOENIX-2014T): pose-only mBART, then the RGB+pose small decoder (needs bsl1k.pth.tar).
+    "de": ["ablation_pose_only", "ablation_small_decoder_s1"],
+    # Bangla (Ban-Sign-Sent-9K): pose-only trained on the unseen-signer split (52.1 BLEU-4 on new
+    # signers), then RGB+pose and the unseen-sentence models.
+    "bn": ["bansign_signer_pose_s0", "bansign_signer_s0", "bansign_sentence_pose_s0", "bansign_sentence_s0"],
+}
+
+
+def pick_checkpoint(code):
+    override = os.getenv(f"ARGUS_SLT_{code.upper()}_CKPT")
+    if override:
+        return override
+    candidates = [os.path.join(DATA_ROOT, "runs", name, "best") for name in CHECKPOINTS[code]]
+    for path in candidates:
+        if os.path.isfile(os.path.join(path, "model.pt")):
+            return path
+    return candidates[0]  # not ready; shown as such in the UI
+
+
 @dataclass
 class Language:
     code: str           # mBART language key used in training ("de", "bn")
@@ -58,17 +81,8 @@ class Language:
 
 
 LANGUAGES = {
-    "de": Language(
-        "de", "German", "DGS",
-        os.getenv("ARGUS_SLT_DE_CKPT", os.path.join(DATA_ROOT, "runs", "ablation_small_decoder_s1", "best")),
-        "de",
-    ),
-    # Bangla is still training. Put its checkpoint here (or set ARGUS_SLT_BN_CKPT) and it turns on.
-    "bn": Language(
-        "bn", "Bangla", "BdSL",
-        os.getenv("ARGUS_SLT_BN_CKPT", os.path.join(DATA_ROOT, "runs", "bansign_small", "best")),
-        "bn",
-    ),
+    "de": Language("de", "German", "DGS", pick_checkpoint("de"), "de"),
+    "bn": Language("bn", "Bangla", "BdSL", pick_checkpoint("bn"), "bn"),
 }
 
 

@@ -12,7 +12,7 @@ Modes
     screen     answers about what is on this PC's screen (DXCam / MSS capture)
     live       answers about the camera (dashboard webcam or phone)
     assistive  short, safety-first descriptions for a visually impaired user
-    slt        sign language translation from the camera (German now, Bangla later)
+    slt        sign language translation from the camera (German DGS and Bangla BdSL)
 
 OCR: a question that asks to read something ("read this", "what does this say",
 "how much money is this") or that arrives with the OCR button on is answered
@@ -427,6 +427,58 @@ class LatencyTracker:
 latency = LatencyTracker(LATENCY_LOG)
 
 
+class SentenceTimings:
+    """Timing of every spoken sentence of a reply (the latency row above only has the first one).
+
+    Sent to the dashboards as "sentence_timing" and appended to logs/sentences.csv. Times are ms
+    from the end of the user's question, like the latency row:
+      ready_ms  the sentence was generated and queued for the voice
+      synth_ms  time the voice took to synthesize it
+      audio_ms  it started playing (phone: audio sent to the phone)
+      play_ms   how long it played (empty for the phone)
+      gap_ms    silence between the end of the previous sentence and the start of this one
+    """
+    FIELDS = ["time", "req_id", "origin", "seq", "ready_ms", "synth_ms", "audio_ms", "play_ms", "gap_ms",
+              "interrupted", "chars", "text"]
+
+    def __init__(self, path):
+        self.path = path
+        self.last_end = {}   # req_id -> when its previous sentence stopped playing
+        self.lock = threading.Lock()
+
+    def record(self, item, started, ended, interrupted=False):
+        if not item.req_id:
+            return  # sign language captions and system messages
+        with self.lock:
+            prev_end = self.last_end.get(item.req_id)
+            if ended is not None:
+                self.last_end[item.req_id] = ended
+                if len(self.last_end) > 50:
+                    self.last_end.pop(next(iter(self.last_end)))
+        row = {
+            "time": time.strftime("%Y-%m-%d %H:%M:%S"), "req_id": item.req_id, "origin": item.origin,
+            "seq": item.seq, "ready_ms": int((item.queued - item.t0) * 1000), "synth_ms": item.synth_ms,
+            "audio_ms": int((started - item.t0) * 1000),
+            "play_ms": int((ended - started) * 1000) if ended is not None else None,
+            "gap_ms": int((started - prev_end) * 1000) if prev_end is not None else None,
+            "interrupted": int(bool(interrupted)), "chars": len(item.text), "text": item.text[:120],
+        }
+        ws_manager.broadcast_sync({"event": "sentence_timing", "id": item.req_id, **row}, dashboards_only=True)
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            new = not os.path.exists(self.path)
+            with open(self.path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=self.FIELDS)
+                if new:
+                    writer.writeheader()
+                writer.writerow(row)
+        except OSError as exc:
+            print(f"[LATENCY] Could not write {self.path}: {exc}")
+
+
+sentence_timings = SentenceTimings(os.path.join(os.path.dirname(LATENCY_LOG), "sentences.csv"))
+
+
 # ==========================================
 # 5. AUDIO OUTPUT (BEEPS & TTS WITH BARGE-IN)
 # ==========================================
@@ -461,6 +513,9 @@ class SpeechItem:
     requester: object = None
     seq: int = 0
     epoch: int = 0
+    t0: float = 0.0        # when the user's question ended (latency clock of the reply)
+    queued: float = 0.0    # when this sentence was ready to speak
+    synth_ms: int = None
 
 
 # Interrupting bumps the epoch; audio from an older epoch is thrown away.
@@ -496,7 +551,9 @@ def speak(text, req=None, lang="en", rate="+8%", seq=0, origin=None, requester=N
     """Queue one sentence. PC replies play on this PC; phone replies are sent to the phone."""
     origin = origin or (req.origin if req else "pc")
     requester = requester if requester is not None else (req.requester if req else None)
-    item = SpeechItem(text, lang, rate, req.id if req else None, origin, requester, seq, tts_epoch)
+    now = time.time()
+    item = SpeechItem(text, lang, rate, req.id if req else None, origin, requester, seq, tts_epoch,
+                      t0=req.t0 if req else now, queued=now)
     global pending_pc_speech
     if origin == "phone" and requester is not None:
         phone_tts_queue.put(item)
@@ -542,8 +599,9 @@ def pc_synth_worker():
         try:
             start = time.time()
             audio, mime = argus_tts.synthesize(item.text, item.lang, item.rate)
+            item.synth_ms = int((time.time() - start) * 1000)
             if item.seq == 0 and item.req_id:
-                latency.mark(item.req_id, "tts_synth_ms", value=int((time.time() - start) * 1000))
+                latency.mark(item.req_id, "tts_synth_ms", value=item.synth_ms)
             if item.epoch == tts_epoch:
                 pc_play_queue.put((item, audio, mime))
         except Exception as exc:
@@ -574,11 +632,14 @@ def pc_play_worker():
             if item.seq == 0 and item.req_id:
                 latency.mark(item.req_id, "first_audio_ms")
                 latency.done(item.req_id, "audio")
+            stopped = False
             while pygame.mixer.music.get_busy():
                 if item.epoch != tts_epoch:
                     pygame.mixer.music.stop()
+                    stopped = True
                     break
                 time.sleep(0.02)
+            sentence_timings.record(item, last_tts_start, time.time(), interrupted=stopped)
         except Exception as exc:
             print(f"[TTS PLAYBACK ERROR] {type(exc).__name__}: {exc}")
         finally:
@@ -602,6 +663,8 @@ def phone_tts_worker():
         try:
             start = time.time()
             audio, mime = argus_tts.synthesize(item.text, item.lang, item.rate)
+            item.synth_ms = int((time.time() - start) * 1000)
+            sentence_timings.record(item, time.time(), None)
             ws_manager.send_to_sync(item.requester, {
                 "event": "tts_audio", "mime_type": mime, "request_id": item.req_id, "seq": item.seq,
                 "audio_base64": base64.b64encode(audio).decode("ascii")})
@@ -708,12 +771,14 @@ def sanitize_transcription_for_ui(text):
     return re.sub(ARGUS_PHONETIC_VARIANTS, "Argus", text, flags=re.IGNORECASE)
 
 
-# Questions that need the model to read text: answered from the full-resolution image.
+# Questions that explicitly ask the model to read text: answered from the full-resolution image.
+# Kept narrow on purpose. Words like "text", "number", "price" or "label" also appear in normal
+# questions, and every OCR question costs a 1920 px image (slower, more VRAM). Everything else
+# uses the normal 1024 px image. Text arrives lower-cased with punctuation removed ("what's" -> "whats").
 OCR_PATTERN = re.compile(
-    r"\b(read|reading|what does (it|this|that) say|what('s| is) written|written|text|label|sign says|"
-    r"how much (money|is this)|money|cash|taka|banknote|bank note|note is this|bill|price|"
-    r"medicine|expiry|expiration|dose|dosage|ingredients|equation|formula|number)\b")
-CURRENCY_PATTERN = re.compile(r"\b(money|cash|taka|banknote|bank note|note is this|how much money|bill)\b")
+    r"\b(read|reading|what (does|do) (it|this|that|they) say|whats written|what is written|"
+    r"what (does|do) (it|this|that) read|how much (money|is this)|which (note|bill)|taka)\b")
+CURRENCY_PATTERN = re.compile(r"\b(money|cash|taka|banknote|bank note|note is this|how much money|which note)\b")
 
 
 def detect_ocr_intent(text):
@@ -867,14 +932,16 @@ def _process_prompt(req: PromptRequest):
         return
 
     currency = req.mode == "assistive" and is_currency_question(req.text)
-    ocr = req.ocr or currency or detect_ocr_intent(req.text)
+    asked_to_read = detect_ocr_intent(req.text)
+    ocr = req.ocr or currency or asked_to_read
+    why = "OCR button" if req.ocr else ("money question" if currency else ("asked to read" if asked_to_read else ""))
     prompt_key = "currency" if currency else ("ocr" if ocr else ("live" if req.mode == "slt" else req.mode))
     max_px = OCR_MAX_PX if ocr else MAX_IMAGE_PX
 
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     pil_image.thumbnail((max_px, max_px), Image.LANCZOS)
     task = req.text or ("Read the text in front of me." if ocr else "What is in front of me?")
-    log_event("ROUTER", f"{req.mode} | {'OCR ' if ocr else ''}{pil_image.width}x{pil_image.height} from {source}")
+    log_event("ROUTER", f"{req.mode} | {f'OCR ({why}) ' if ocr else ''}{pil_image.width}x{pil_image.height} from {source}")
 
     messages = [{"role": "user", "content": [
         {"type": "image", "image": pil_image},
@@ -1186,7 +1253,7 @@ def audio_worker():
             ws_manager.broadcast_sync({"event": "speech_recognized", "text": sanitize_transcription_for_ui(heard)},
                                       dashboards_only=True)
             mode = ws_manager.pc_mode if ws_manager.pc_mode != "slt" else "live"
-            prompt_queue.put(PromptRequest(heard, "pc", None, mode, ocr=detect_ocr_intent(heard),
+            prompt_queue.put(PromptRequest(heard, "pc", None, mode, ocr=False,
                                            t0=speech_end, stt_ms=stt_ms))
         except Exception as e:
             print(f"[AUDIO WORKER ERROR] {type(e).__name__}: {e}")
@@ -1350,7 +1417,7 @@ async def handle_message(client, data):
             mode = "live"
         origin = "phone" if client.kind == "phone" else "pc"
         image = decode_image(data.get("image_data", ""))
-        ocr = bool(data.get("ocr")) or detect_ocr_intent(text)
+        ocr = bool(data.get("ocr"))  # a "read this" question is detected again in _process_prompt
         print(f"[PROMPT] {origin} ({mode}{', OCR' if ocr else ''}): {text}")
         interrupt_tts()
         clear_pending_prompts()

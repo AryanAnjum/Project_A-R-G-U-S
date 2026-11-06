@@ -39,7 +39,9 @@ HF_REPOS = [
     ("ARGUS_SLT_MBART", "facebook/mbart-large-50", ["*.json", "*.model", "*.txt"]),
 ]
 
-SLT_CHECKPOINTS = ["ablation_small_decoder_s1", "bansign_small"]  # German now, Bangla when trained
+# Sign language checkpoints copied when present (same order as src/argus_slt.py CHECKPOINTS).
+SLT_CHECKPOINTS = ["ablation_pose_only", "ablation_small_decoder_s1",
+                   "bansign_signer_pose_s0", "bansign_signer_s0", "bansign_sentence_pose_s0", "bansign_sentence_s0"]
 
 
 def step(msg):

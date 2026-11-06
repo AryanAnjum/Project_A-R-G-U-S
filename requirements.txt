@@ -40,6 +40,5 @@ mediapipe>=0.10.20
 sentencepiece
 protobuf
 
-
-# for pc software
-winget install JRSoftware.InnoSetup 
+# PC installer build tool (not a pip package, install it once with winget):
+#   winget install JRSoftware.InnoSetup
