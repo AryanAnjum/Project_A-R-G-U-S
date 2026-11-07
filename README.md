@@ -160,6 +160,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 | `ARGUS_TTS_RATE` / `ARGUS_ASSIST_TTS_RATE` | `+0%` | Voice speed, e.g. `-10%` slower, `+10%` faster |
 | `ARGUS_GUIDE_INTERVAL` | `2.5` | Seconds between walking-guidance updates |
 | `ARGUS_GUIDE_REPEAT` | `8.0` | While nothing changes, repeat the left / ahead / right description at most this often (warnings always speak at once) |
+| `ARGUS_CONTEXT_TURNS` | `4` | How many recent question/answer pairs follow-up questions can refer to |
 | `ARGUS_MOTION_GAP` | `1.5` | Walking help compares the camera now with this many seconds ago to spot things approaching (0 = off) |
 | `ARGUS_BARGE_IN` | `all` | While ARGUS talks: `all` = a new question interrupts it, `stop` = only "stop" / "goodbye" do |
 | `ARGUS_ECHO_GUARD` | `0` | Seconds to wait after ARGUS stops before listening. Keep 0 with earphones; try 0.5-0.8 with loudspeakers |
@@ -176,8 +177,11 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 - *"Hey Argus"*, optionally followed by a question, wakes it up.
 - *"Read this"*, *"what does it say"* and *"how much money is this"* answer from the full-resolution image.
 - *"Guide me"* (or *"help me walk"*) turns on walking guidance in Assistive mode: every few seconds it says
-  what is on your left, ahead and on your right, warns at once with a beep when something is coming toward
-  you, and at a road says *"No car coming, you can cross now"* or *"Wait"*. It stays quiet while nothing changes. *"Stop guiding"* or
+  what is on your left, ahead and on your right. It says *"Stop"* only for serious hazards (vehicles,
+  animals, furniture, poles, stairs, holes), never for people, and always says what the hazard is, where, and
+  how to avoid it (*"move a little to your left"*, *"wait for it to pass"*). It stays quiet while nothing changes.
+- It remembers the last few exchanges, so you can follow up: *"what colour is the car?"*, *"what kind of dog
+  is it?"*, *"how many are there?"*. The memory clears after 3 minutes or when you switch mode. *"Stop guiding"* or
   *"I have arrived"* ends it.
 - In Assistive mode, questions about a medicine (*"what is this medicine"*, *"when does it expire"*)
   read the label from the full-resolution image and never guess a name or dose.
