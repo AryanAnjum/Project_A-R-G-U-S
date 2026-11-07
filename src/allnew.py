@@ -98,12 +98,19 @@ OCR_MAX_PX = int(os.getenv("ARGUS_OCR_MAX_PX", "1920"))
 # doesn't delay the first words, it only lets a full answer finish instead of being cut short.
 MAX_NEW_TOKENS = int(os.getenv("ARGUS_MAX_NEW_TOKENS", "384"))
 OCR_MAX_NEW_TOKENS = int(os.getenv("ARGUS_OCR_MAX_NEW_TOKENS", "448"))
-GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "96"))
+GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "150"))
 # Voice speed, edge-tts style ("+0%" = normal, "-10%" = slower, "+10%" = faster).
 TTS_RATE = os.getenv("ARGUS_TTS_RATE", "+0%")
 ASSIST_TTS_RATE = os.getenv("ARGUS_ASSIST_TTS_RATE", TTS_RATE)
 # Walking guidance: seconds between automatic updates while "guide me" is on.
 GUIDE_INTERVAL_S = env_float("ARGUS_GUIDE_INTERVAL", 2.5)
+# While nothing changes, repeat the left / ahead / right description at most this often (warnings are never held back).
+GUIDE_REPEAT_S = env_float("ARGUS_GUIDE_REPEAT", 8.0)
+# Walking questions and guidance compare the newest camera frame with one from about this many seconds
+# earlier, so the model can tell what is coming closer. 0 turns the comparison off.
+MOTION_GAP_S = env_float("ARGUS_MOTION_GAP", 1.5)
+# Image size for each of those two frames (two images cost about twice the time of one).
+GUIDE_IMAGE_PX = int(os.getenv("ARGUS_GUIDE_IMAGE_PX", "768"))
 FRAME_MAX_AGE_S = env_float("ARGUS_FRAME_MAX_AGE", 3.0)
 
 WHISPER_MODEL_NAME = os.getenv("ARGUS_WHISPER_MODEL", "small.en")
@@ -343,6 +350,7 @@ warm_up_models()
 # Latest camera frame per source ("pc" = dashboard webcam, "phone" = Android app).
 camera_frames = {}
 camera_frames_lock = threading.Lock()
+camera_history = {}  # origin -> deque of (frame, time) for the last few seconds, for motion comparison
 
 assistant_state = "idle"   # PC microphone: "idle" waits for "Hey Argus", "active" takes commands
 mic_enabled = True
@@ -808,6 +816,9 @@ NAV_PATTERN = re.compile(
     r"\b(walk|walking|path|way|road|street|footpath|sidewalk|cross|crossing|ahead|in front|forward|"
     r"safe|stairs|staircase|step|steps|door|doorway|exit|entrance|obstacle|obstacles|where am i|"
     r"where is|where are|which way|turn|navigate|lift|elevator|corridor|hallway|room|move|go)\b")
+CROSSING_PATTERN = re.compile(
+    r"\b(cross|crossing|road|roads|street|traffic|zebra|signal|traffic light|car|cars|vehicle|vehicles|bus|"
+    r"truck|rickshaw|cng|motorbike|motorcycle|bike|lane)\b")
 GUIDE_START_PATTERN = re.compile(
     r"^(?:(?:hey|ok|okay)\s+)?(?:argus\s+)?(?:please\s+)?(?:start\s+)?(?:guide me|guiding|guidance|"
     r"guide mode|help me walk|walk with me|navigate|navigation|start walking|i want to walk|"
@@ -819,10 +830,12 @@ GUIDE_STOP_PATTERN = re.compile(
 
 
 def assist_task(text):
-    """Which assistive prompt fits a question: medicine, nav or general."""
+    """Which assistive prompt fits a question: medicine, crossing, nav or general."""
     clean = normalize_command_text(text)
     if MEDICINE_PATTERN.search(clean):
         return "medicine"
+    if CROSSING_PATTERN.search(clean):
+        return "crossing"
     if not clean or NAV_PATTERN.search(clean):
         return "nav"
     return "general"
@@ -869,6 +882,28 @@ BLIND_USER = ("The user is blind and is relying on you as their eyes, so they ca
               "(one step is about 70 cm) or arm's length. Never guess: if something is unclear, say so and tell "
               "them how to move the camera to get a better view. Speak calmly and clearly. Never use markdown. ")
 
+# Walking help answers in a fixed spoken layout so the user always knows where to listen:
+# warning first (only if needed), then left, ahead, right, then one instruction.
+SCENE_LAYOUT = ("Answer in this spoken layout, as short phrases: if anything is coming toward them, blocking "
+                "their path or dangerous, START with 'Stop.' or 'Wait.' and say what it is and where. Then "
+                "'On your left, ...', 'Ahead, ...' with what is in their path and how many steps it is clear, "
+                "'On your right, ...', and end with one instruction such as 'Keep walking straight.', 'Slow "
+                "down.', 'Stop.' or 'Turn slightly left.' Name real things: people, cars, rickshaws, bikes, "
+                "poles, steps, kerbs, holes, doors, walls, shops, parked vehicles. Say 'nothing' for a side "
+                "that is empty. Example: 'On your left, a parked rickshaw about two steps away. Ahead, the "
+                "footpath is clear for about eight steps. On your right, a shop entrance. Keep walking "
+                "straight.' Example with danger: 'Stop. A motorbike is coming toward you from the front "
+                "right. On your left, a wall. Wait until it passes.' ")
+MOTION_RULE = ("When two pictures are given, the first was taken {gap} seconds before the second, which is now. "
+               "Compare them: a person or vehicle that is bigger or closer in the second picture is approaching "
+               "and must be warned about; one that got smaller is moving away. Describe the scene in the second "
+               "picture. ")
+CROSSING_RULE = ("If they are at or on a road: look both ways, to the left and the right. Only say 'No car "
+                 "coming, you can cross now.' when no vehicle is moving toward them from either side and none "
+                 "is close. If any vehicle is approaching or the view is blocked or unclear, say 'Wait.' and "
+                 "why, for example 'Wait. A bus is coming from your right.' Mention a zebra crossing or a "
+                 "traffic light and its colour if visible. When unsure, always say wait, never cross. ")
+
 SYSTEM_PROMPTS = {
     "screen": ("You are A.R.G.U.S., a friendly copilot looking at the user's screen, talking casually like a "
                "friend on a call. " + LENGTH_RULE + " " + SPOKEN_STYLE + " " + NO_DIALOGUE),
@@ -876,14 +911,13 @@ SYSTEM_PROMPTS = {
              "like on a video call. " + LENGTH_RULE + " " + SPOKEN_STYLE + " " + NO_DIALOGUE),
     # Assistive mode, chosen per question by assist_task().
     "nav": ("You are A.R.G.U.S., a sighted guide for a blind person who is walking, looking through the camera "
-            "they hold or wear at chest height. " + BLIND_USER +
-            "First, warn about anything in or near their walking path: steps, stairs, kerbs, holes, uneven "
-            "ground, wet floor, poles, walls, furniture, open doors, low branches, bicycles, vehicles or people, "
-            "with direction and distance. Then say whether it is safe to keep walking and give one clear "
-            "instruction, for example 'Stop. There are two steps down right in front of you.' or 'The path is "
-            "clear for about ten steps, keep going straight. There is a door slightly to your right.' "
-            "If they ask where something is, guide them to it step by step. Use two to four short sentences. "
-            + NO_DIALOGUE),
+            "they hold or wear at chest height. " + BLIND_USER + SCENE_LAYOUT + MOTION_RULE + CROSSING_RULE +
+            "If they ask where something is, guide them to it step by step. " + NO_DIALOGUE),
+    "crossing": ("You are A.R.G.U.S., helping a blind person cross a road safely, looking through the camera "
+                 "they hold at chest height. " + BLIND_USER + CROSSING_RULE + MOTION_RULE +
+                 "Start with the decision, 'Wait.' or 'No car coming, you can cross now.', then say what is "
+                 "on the left, ahead and on the right of the road, and any vehicle and which way it is going. "
+                 "Use two to four short sentences. " + NO_DIALOGUE),
     "medicine": ("You are A.R.G.U.S., reading a medicine package, strip, bottle or label for a blind person. "
                  + BLIND_USER +
                  "Read, exactly as printed: the medicine name, the strength (for example 500 mg), and if visible "
@@ -898,11 +932,9 @@ SYSTEM_PROMPTS = {
                 "Mention any hazard first. Then answer their question about what is around them: the main "
                 "objects and people and where they are, and read out any sign or label that matters. "
                 "Use two to four sentences, more only if they ask for detail. " + NO_DIALOGUE),
-    "guide": ("You are A.R.G.U.S., guiding a blind person who is walking right now. " + BLIND_USER +
-              "This is an automatic update, not a question. In one short sentence, at most two, say what "
-              "matters for their next few steps: a hazard with direction and distance, a turn, a door or a "
-              "change in the path, and whether to keep going, slow down or stop. If nothing in the path has "
-              "changed and it is clear, reply only with 'Clear ahead.' " + NO_DIALOGUE),
+    "guide": ("You are A.R.G.U.S., guiding a blind person who is walking right now, through the camera they "
+              "hold at chest height. " + BLIND_USER + "This is an automatic update, not a question. "
+              + SCENE_LAYOUT + MOTION_RULE + CROSSING_RULE + NO_DIALOGUE),
     "ocr": ("You are A.R.G.U.S. reading text for the user. Read the requested text, numbers or label exactly as "
             "printed in the image, then answer the question in plain spoken sentences. If part of the text is "
             "too blurry or cut off, say which part you cannot read instead of guessing. Never use "
@@ -917,8 +949,15 @@ GROUNDING_RULES = ("The image attached to this message is the only visual eviden
                    "images or answers. Answer using only details actually visible in this image; if the image "
                    "is unclear or the requested content cannot be read, say so plainly.")
 
+GROUNDING_RULES_TWO = ("The two images attached to this message are the only visual evidence: an earlier one and "
+                       "the current one. Do not rely on earlier messages. Answer using only what is actually "
+                       "visible; if the view is unclear, say so plainly.")
+
 HAZARD_PATTERN = re.compile(r"\b(danger|dangerous|hazard|caution|careful|watch out|warning|stairs ahead|"
-                            r"step down|step up|obstacle|traffic|oncoming)\b", re.IGNORECASE)
+                            r"step down|step up|obstacle|traffic|oncoming|approaching|coming toward|coming towards)\b", re.IGNORECASE)
+# A guidance update that must be spoken at once, never held back as a repeat.
+URGENT_PATTERN = re.compile(r"^\s*(stop|wait)\b|\b(approaching|coming toward|coming towards|watch out|careful)\b",
+                            re.IGNORECASE)
 # The model sometimes keeps going and writes both sides of a conversation: cut at the first
 # speaker label after the start of the reply.
 DIALOGUE_CUT = re.compile(r"(?:^|\n|\s)(?:User|Human|Assistant|You|Me|ARGUS|A\.R\.G\.U\.S\.?)\s*:", re.IGNORECASE)
@@ -950,8 +989,27 @@ def decode_image(data_url):
 
 
 def store_camera_frame(origin, frame):
+    now = time.time()
     with camera_frames_lock:
-        camera_frames[origin] = (frame, time.time())
+        camera_frames[origin] = (frame, now)
+        hist = camera_history.setdefault(origin, deque(maxlen=12))
+        hist.append((frame, now))
+        while hist and now - hist[0][1] > 4.0:
+            hist.popleft()
+
+
+def earlier_camera_frame(origin, gap_s):
+    """The stored frame closest to gap_s seconds before the newest one, and its age difference."""
+    with camera_frames_lock:
+        hist = list(camera_history.get(origin, ()))
+    if gap_s <= 0 or len(hist) < 2:
+        return None, 0.0
+    newest_t = hist[-1][1]
+    older = [(f, newest_t - t) for f, t in hist[:-1] if newest_t - t >= 0.5]
+    if not older:
+        return None, 0.0
+    frame, gap = min(older, key=lambda x: abs(x[1] - gap_s))
+    return frame.copy(), gap
 
 
 def latest_camera_frame(origin):
@@ -1045,16 +1103,32 @@ def _process_prompt(req: PromptRequest):
     max_px = OCR_MAX_PX if ocr else MAX_IMAGE_PX
     system_prompt = SYSTEM_PROMPTS[prompt_key].replace("{today}", time.strftime("%d %B %Y"))
 
+    # Walking help compares the newest frame with one from a moment ago to see what is approaching.
+    prev_frame, gap = (None, 0.0)
+    if prompt_key in ("guide", "nav", "crossing") and source in ("pc", "phone"):
+        prev_frame, gap = earlier_camera_frame(source, MOTION_GAP_S)
+    if prev_frame is not None:
+        max_px = min(max_px, GUIDE_IMAGE_PX)
+    system_prompt = system_prompt.replace("{gap}", f"{gap:.1f}")
+    if prev_frame is None:
+        system_prompt = system_prompt.replace(MOTION_RULE.replace("{gap}", f"{gap:.1f}"), "")
+
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     pil_image.thumbnail((max_px, max_px), Image.LANCZOS)
+    images = [pil_image]
+    if prev_frame is not None:
+        prev_image = Image.fromarray(cv2.cvtColor(prev_frame, cv2.COLOR_BGR2RGB))
+        prev_image.thumbnail((max_px, max_px), Image.LANCZOS)
+        images = [prev_image, pil_image]
     task = req.text or ("Read the text in front of me." if ocr else "What is in front of me?")
     if not req.guide:
         log_event("ROUTER", f"{req.mode}{f' ({prompt_key})' if assistive else ''} | "
                             f"{f'OCR ({why}) ' if ocr else ''}{pil_image.width}x{pil_image.height} from {source}")
 
+    grounding = GROUNDING_RULES if len(images) == 1 else GROUNDING_RULES_TWO
     messages = [{"role": "user", "content": [
-        {"type": "image", "image": pil_image},
-        {"type": "text", "text": f"{system_prompt}\n\n{GROUNDING_RULES}\n"
+        *({"type": "image", "image": im} for im in images),
+        {"type": "text", "text": f"{system_prompt}\n\n{grounding}\n"
                                  f"Current user request: {task}\nRespond only to this request."},
     ]}]
     if not req.guide:  # automatic guidance updates are not questions, so they are not timed
@@ -1200,27 +1274,24 @@ def stop_guide(message=None):
 
 
 def finish_guide_update(req, answer, rate):
-    """Speak a guidance update only when it says something new."""
+    """Speak a guidance update: warnings at once, the same calm description at most every GUIDE_REPEAT_S."""
     clean = normalize_command_text(answer)
     now = time.time()
+    urgent = bool(URGENT_PATTERN.search(answer))
     with guide_lock:
         guide["in_flight"] = False
         guide["last_done"] = now
         if not guide["on"]:
             return
-        is_clear = clean in ("clear ahead", "clear", "path is clear", "the path is clear") or clean.startswith("clear ahead")
-        if is_clear:
-            # Say "clear ahead" at most every 10 seconds so the user knows guidance is still running.
-            if now - guide["clear_said"] < 10.0:
-                return
-            guide["clear_said"] = now
-        elif SequenceMatcher(None, clean, guide["last_text"]).ratio() > 0.85:
-            return  # same warning as last time
+        similar = SequenceMatcher(None, clean, guide["last_text"]).ratio() > 0.7
+        if not urgent and similar and now - guide["clear_said"] < GUIDE_REPEAT_S:
+            return  # nothing new: stay quiet for a moment
         guide["last_text"] = clean
+        guide["clear_said"] = now  # time of the last spoken update
+    if urgent:
+        play_hazard_alert()  # beep first so the warning is noticed
     speak(answer, req, rate=rate, seq=0)
     log_event("GUIDE", answer)
-    if HAZARD_PATTERN.search(answer) or re.search(r"\bstop\b", answer, re.IGNORECASE):
-        play_hazard_alert()
 
 
 def guide_worker():

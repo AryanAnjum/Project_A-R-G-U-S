@@ -675,8 +675,10 @@ function frameLoop() {
   const now = performance.now();
   const sign = state.mode === "slt";
   const cfg = sign ? SIGN_FRAME : LIVE_FRAME;
+  // Assistive sends twice as often so the server can compare frames and notice what is approaching.
+  const everyMs = state.mode === "assistive" ? 500 : cfg.everyMs;
   const congested = state.socket && state.socket.bufferedAmount > 2_000_000;
-  if (state.mode !== "screen" && state.cameraOn && !congested && now - state.lastFrameSent >= cfg.everyMs) {
+  if (state.mode !== "screen" && state.cameraOn && !congested && now - state.lastFrameSent >= everyMs) {
     const data = grabFrame(cfg.maxPx, cfg.quality);
     if (data) {
       state.lastFrameSent = now;
