@@ -177,7 +177,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 - *"Hey Argus"*, optionally followed by a question, wakes it up.
 - *"Read this"*, *"what does it say"* and *"how much money is this"* answer from the full-resolution image.
 - *"Guide me"* (or *"help me walk"*) turns on walking guidance in Assistive mode: every few seconds it says
-  what is on your left, ahead and on your right. It says *"Stop"* only for serious hazards (vehicles,
+  what is on your left, ahead and on your right. It warns (*"Careful!"*) only for serious hazards (vehicles,
   animals, furniture, poles, stairs, holes), never for people, and always says what the hazard is, where, and
   how to avoid it (*"move a little to your left"*, *"wait for it to pass"*). It stays quiet while nothing changes.
 - It remembers the last few exchanges, so you can follow up: *"what colour is the car?"*, *"what kind of dog
@@ -185,7 +185,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
   *"I have arrived"* ends it.
 - In Assistive mode, questions about a medicine (*"what is this medicine"*, *"when does it expire"*)
   read the label from the full-resolution image and never guess a name or dose.
-- *"Okay stop"* interrupts (and ends guidance). *"Goodbye"* puts it back to sleep.
+- *"Okay stop"* silences the current sentence (guidance keeps running; *"stop guiding"* ends it). *"Goodbye"* puts it back to sleep.
 
 ## Repository layout
 

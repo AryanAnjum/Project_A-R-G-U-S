@@ -826,6 +826,13 @@ def is_own_echo(heard, window_s=30.0):
     return len(words) >= 3 and sum(w in spoken for w in words) / len(words) >= 0.75
 
 
+def argus_just_said_stop(window_s=4.0):
+    """True if ARGUS's own recent speech contained a stop-like word, so a heard "stop" may be its echo."""
+    now = time.time()
+    return any(now - t <= window_s and re.search(r"\b(stop|wait|hold on|careful)\b", text)
+               for t, text in list(recent_speech))
+
+
 def sanitize_transcription_for_ui(text):
     return re.sub(ARGUS_PHONETIC_VARIANTS, "Argus", text, flags=re.IGNORECASE)
 
@@ -943,7 +950,7 @@ SCENE_LAYOUT = ("Describe the scene in this spoken order: 'On your left, ...', '
                 "instruction. Name real things. Say 'nothing' for an empty side. If something serious is in "
                 "their way, such as " + SERIOUS_HAZARDS + ", explain what it is, where it is, how many steps "
                 "away, and exactly how to avoid it: 'move a little to your left', 'move a little to your right', "
-                "or 'stop and wait for it to pass'. Never say only 'Stop' without the reason. People are not "
+                "or 'stand still until it passes'. Start a warning with 'Careful!' and always give the reason; never answer with only 'Stop'. People are not "
                 "obstacles: other people will see them and make way, so mention people but never tell them to "
                 "stop for a person. ")
 MOTION_RULE = ("When two pictures are given, the first was taken {gap} seconds before the second, which is now. "
@@ -1002,7 +1009,8 @@ SYSTEM_PROMPTS = {
               "AHEAD: what is ahead of them\n"
               "RIGHT: what is on their right, or nothing\n"
               "CLEAR: how many steps ahead are clear to walk, as a number\n"
-              "ROAD: yes if they are at or on a road, otherwise no"),
+              "ROAD: yes if they are at or on a road, otherwise no\n"
+              "Write every line. Do not write the word stop."),
     "ocr": ("You are A.R.G.U.S. reading text for the user. Read the requested text, numbers or label exactly as "
             "printed in the image, then answer the question in plain spoken sentences. If part of the text is "
             "too blurry or cut off, say which part you cannot read instead of guessing. Never use "
@@ -1026,7 +1034,7 @@ GROUNDING_RULES_TWO = ("The two images attached to this message are the only vis
 HAZARD_PATTERN = re.compile(r"\b(danger|dangerous|hazard|caution|careful|watch out|warning|stairs ahead|"
                             r"step down|step up|obstacle|traffic|oncoming|approaching|coming toward|coming towards)\b", re.IGNORECASE)
 # A guidance update that must be spoken at once, never held back as a repeat.
-URGENT_PATTERN = re.compile(r"^\s*(stop|wait)\b", re.IGNORECASE)
+URGENT_PATTERN = re.compile(r"^\s*(stop|wait|careful)\b", re.IGNORECASE)
 # The model sometimes keeps going and writes both sides of a conversation: cut at the first
 # speaker label after the start of the reply.
 DIALOGUE_CUT = re.compile(r"(?:^|\n|\s)(?:User|Human|Assistant|You|Me|ARGUS|A\.R\.G\.U\.S\.?)\s*:", re.IGNORECASE)
@@ -1275,7 +1283,7 @@ def _process_prompt(req: PromptRequest):
         finish_guide_update(req, full, rate)
         return
     answer = clean_reply(full)
-    if normalize_command_text(answer) in ("stop", "wait", "stop stop", "stop wait"):
+    if is_bare_warning(answer):
         answer = ""  # a bare "stop" with no reason helps no one; ask again instead
         pending = ""
     answer = answer or "Sorry, I didn't get a clear answer. Please ask me again."
@@ -1293,6 +1301,8 @@ def _process_prompt(req: PromptRequest):
     send_reply(req, {"event": "argus_reply", "id": req.id, "text": answer, "mode": req.mode, "ocr": ocr})
     remember(req.origin, "user", req.text)
     remember(req.origin, "argus", answer)
+    with guide_lock:
+        guide["last_done"] = time.time()  # guidance resumes a moment after this answer
     log_event("Qwen2-VL", f"{'Phone reply' if req.origin == 'phone' else 'Reply'}: {answer}")
     latency.done(req.id, "text")
 
@@ -1423,7 +1433,7 @@ def compose_guidance(fields):
             what = (f"{_a(danger)} is coming toward you {where_txt}{dist}" if toward else
                     f"there is {_a(danger)} {where_txt}{dist}")
             if toward:
-                how = "Stop and wait for it to pass."
+                how = "Stand still until it passes."
             elif where == "left":
                 how = "Keep a little to your right to pass it."
             elif where == "right":
@@ -1435,8 +1445,8 @@ def compose_guidance(fields):
             elif empty(left):
                 how = "Move a little to your left to go around it."
             else:
-                how = "Stop. Turn slightly and I will check again."
-            prefix = "Stop. " if toward or where == "ahead" else "Careful. "
+                how = "Stand still, turn slightly, and I will check again."
+            prefix = "Careful! " if toward or where == "ahead" else "Careful. "
             return f"{prefix}{what[0].upper() + what[1:]}. {how}", True
         scene.insert(0, f"Careful, {_a(danger)} {where if where != 'ahead' else 'ahead'}, about {int(steps)} steps away.")
 
@@ -1451,17 +1461,27 @@ def compose_guidance(fields):
     return " ".join(scene), False
 
 
+def is_bare_warning(text):
+    """True for replies that are only 'Stop.' / 'Stop stop stop' / 'Wait.' with no reason."""
+    words = [w for w in normalize_command_text(text).split()
+             if w not in {"stop", "wait", "please", "now", "careful", "danger"}]
+    return len(words) < 3
+
+
 def finish_guide_update(req, raw, rate):
     """Speak a guidance update: warnings at once (with the reason), the same calm description at most every
     GUIDE_REPEAT_S. The server decides when to say stop, so the model can't just repeat 'Stop'."""
+    print("[GUIDE RAW] " + " | ".join(l.strip() for l in (raw or "").splitlines() if l.strip()))
     fields = parse_guidance(raw)
     if fields is not None:
         answer, urgent = compose_guidance(fields)
     else:  # the model ignored the form: use its words, but never a bare "stop"
         answer = clean_reply(raw)
         urgent = False
-        if normalize_command_text(answer) in ("stop", "wait", "stop stop", "") or len(answer.split()) < 3:
+        if is_bare_warning(answer):
             answer = ""
+        else:
+            answer = re.sub(r"^(?:\s*(?:stop|wait)[.!,]*\s*)+", "Careful! ", answer, flags=re.IGNORECASE)
     now = time.time()
     clean = normalize_command_text(answer)
     with guide_lock:
@@ -1638,7 +1658,7 @@ def audio_worker():
             return ""
         return text
 
-    def handle_stop_or_sleep(heard):
+    def handle_stop_or_sleep(heard, overlapped=False):
         global assistant_state
         if is_guide_stop(heard):
             interrupt_tts()
@@ -1654,7 +1674,11 @@ def audio_worker():
             log_event("SYSTEM", "Going to sleep. Say 'Hey Argus' to wake me.")
             return True
         if is_stop_command(heard):
-            stop_guide()
+            if overlapped and argus_just_said_stop():
+                print(f"[VOICE] Ignored {heard!r}: that was ARGUS's own warning, not you")
+                return True
+            # "Okay stop" silences the current sentence. Walking guidance keeps running
+            # (say "stop guiding" or press Guide to end it).
             interrupt_tts()
             clear_pending_prompts()
             assistant_state = "active"
@@ -1697,7 +1721,7 @@ def audio_worker():
             print(f"[VOICE] Heard {heard!r} ({stt_ms} ms, state={assistant_state}"
                   f"{', while ARGUS was talking' if overlapped else ''})")
 
-            if handle_stop_or_sleep(heard):
+            if handle_stop_or_sleep(heard, overlapped):
                 continue
 
             if is_own_echo(heard):
@@ -1900,7 +1924,7 @@ async def handle_message(client, data):
             client.slt.clear()
 
     elif event == "stop":
-        if data.get("guide", True):
+        if data.get("guide", False):  # {"event": "stop", "guide": true} also ends walking guidance
             stop_guide()
         interrupt_tts()
         clear_pending_prompts()
