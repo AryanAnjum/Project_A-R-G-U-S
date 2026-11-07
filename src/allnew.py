@@ -98,7 +98,7 @@ OCR_MAX_PX = int(os.getenv("ARGUS_OCR_MAX_PX", "1920"))
 # doesn't delay the first words, it only lets a full answer finish instead of being cut short.
 MAX_NEW_TOKENS = int(os.getenv("ARGUS_MAX_NEW_TOKENS", "384"))
 OCR_MAX_NEW_TOKENS = int(os.getenv("ARGUS_OCR_MAX_NEW_TOKENS", "448"))
-GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "150"))
+GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "70"))
 # Voice speed, edge-tts style ("+0%" = normal, "-10%" = slower, "+10%" = faster).
 TTS_RATE = os.getenv("ARGUS_TTS_RATE", "+0%")
 ASSIST_TTS_RATE = os.getenv("ARGUS_ASSIST_TTS_RATE", TTS_RATE)
@@ -108,7 +108,7 @@ GUIDE_INTERVAL_S = env_float("ARGUS_GUIDE_INTERVAL", 2.5)
 GUIDE_REPEAT_S = env_float("ARGUS_GUIDE_REPEAT", 8.0)
 # Walking questions and guidance compare the newest camera frame with one from about this many seconds
 # earlier, so the model can tell what is coming closer. 0 turns the comparison off.
-MOTION_GAP_S = env_float("ARGUS_MOTION_GAP", 1.5)
+MOTION_GAP_S = env_float("ARGUS_MOTION_GAP", 0.0)  # off: two pictures confuse the 2B model
 # Image size for each of those two frames (two images cost about twice the time of one).
 GUIDE_IMAGE_PX = int(os.getenv("ARGUS_GUIDE_IMAGE_PX", "768"))
 FRAME_MAX_AGE_S = env_float("ARGUS_FRAME_MAX_AGE", 3.0)
@@ -946,13 +946,11 @@ SERIOUS_HAZARDS = ("vehicles (car, bus, truck, rickshaw, CNG, motorbike, bicycle
                    "stairs, steps, kerbs, holes, drains, open doors, barriers, boxes or anything they could "
                    "trip over or walk into")
 SCENE_LAYOUT = ("Describe the scene in this spoken order: 'On your left, ...', 'Ahead, ...' with what is in their "
-                "path and about how many steps it is clear, then 'On your right, ...', and end with one "
-                "instruction. Name real things. Say 'nothing' for an empty side. If something serious is in "
-                "their way, such as " + SERIOUS_HAZARDS + ", explain what it is, where it is, how many steps "
-                "away, and exactly how to avoid it: 'move a little to your left', 'move a little to your right', "
-                "or 'stand still until it passes'. Start a warning with 'Careful!' and always give the reason; never answer with only 'Stop'. People are not "
-                "obstacles: other people will see them and make way, so mention people but never tell them to "
-                "stop for a person. ")
+                "path, then 'On your right, ...', and end with one instruction. Name the real things you see. "
+                "If something they could walk into is in their way, such as a vehicle, an animal, a chair, a pole "
+                "or steps, start with 'Careful!', say what it is and where, and how to get past it: 'move a "
+                "little to your left', 'move a little to your right', or 'stand still until it passes'. People "
+                "are not obstacles: other people will make way, so never warn about a person. ")
 MOTION_RULE = ("When two pictures are given, the first was taken {gap} seconds before the second, which is now. "
                "Compare them: a person or vehicle that is bigger or closer in the second picture is approaching "
                "and must be warned about; one that got smaller is moving away. Describe the scene in the second "
@@ -995,22 +993,12 @@ SYSTEM_PROMPTS = {
                 "earlier in the conversation ('the car', 'it', 'that dog'), find it in the current picture and "
                 "describe it; if it is no longer visible, say so. Mention a serious hazard first if there is "
                 "one. Use two to four sentences, more only if they ask for detail. " + NO_DIALOGUE),
-    "guide": ("You help a blind person who is walking, by looking through the camera they hold at chest height. "
-              "When two pictures are given, the first was taken {gap} seconds before the second, which is now; "
-              "describe the second and use the first only to tell what is moving. Fill in this form with short "
-              "plain words, one line each, and nothing else:\n"
-              "DANGER: the most serious thing within about five steps that they could walk into or that is "
-              "coming toward them: " + SERIOUS_HAZARDS + ". People are NOT a danger. Write none if there is "
-              "nothing.\n"
-              "WHERE: left, ahead or right\n"
-              "STEPS: about how many steps away, as a number\n"
-              "MOVING: toward, away, across or still\n"
-              "LEFT: what is on their left, or nothing\n"
-              "AHEAD: what is ahead of them\n"
-              "RIGHT: what is on their right, or nothing\n"
-              "CLEAR: how many steps ahead are clear to walk, as a number\n"
-              "ROAD: yes if they are at or on a road, otherwise no\n"
-              "Write every line. Do not write the word stop."),
+    # Kept very short on purpose: the 2B model copies long lists from the prompt and loops on long forms.
+    # The server reads the three parts and decides itself whether to warn (see compose_guidance).
+    "guide": ("This photo is from a camera on the chest of a blind person walking forward. Say what is on "
+              "the left side, what is straight ahead in the middle, and what is on the right side. Use a few "
+              "words for each part, and answer in exactly this pattern:\n"
+              "Left: ...\nAhead: ...\nRight: ..."),
     "ocr": ("You are A.R.G.U.S. reading text for the user. Read the requested text, numbers or label exactly as "
             "printed in the image, then answer the question in plain spoken sentences. If part of the text is "
             "too blurry or cut off, say which part you cannot read instead of guessing. Never use "
@@ -1223,7 +1211,9 @@ def _process_prompt(req: PromptRequest):
                            padding=True, return_tensors="pt").to(vlm.device)
         streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True,
                                         clean_up_tokenization_spaces=False)
-        gen_kwargs = dict(**inputs, streamer=streamer, do_sample=False, repetition_penalty=1.1,
+        gen_kwargs = dict(**inputs, streamer=streamer, do_sample=False,
+                          repetition_penalty=1.25 if req.guide else 1.1,
+                          **({"no_repeat_ngram_size": 3} if req.guide else {}),
                           max_new_tokens=(GUIDE_MAX_NEW_TOKENS if req.guide else
                                           OCR_MAX_NEW_TOKENS if ocr else MAX_NEW_TOKENS),
                           stopping_criteria=StoppingCriteriaList([CancelCriteria()]))
@@ -1359,63 +1349,74 @@ def stop_guide(message=None):
         speak(message, origin=origin, requester=requester, rate=ASSIST_TTS_RATE)
 
 
-GUIDE_FIELD = re.compile(r"^\s*[-*]?\s*(DANGER|WHERE|STEPS|MOVING|LEFT|AHEAD|RIGHT|CLEAR|ROAD)\s*[:=-]\s*(.*)$",
+GUIDE_FIELD = re.compile(r"^\s*[-*]?\s*(LEFT|AHEAD|MIDDLE|CENTER|CENTRE|FRONT|RIGHT)\s*(?:SIDE)?\s*[:=-]\s*(.*)$",
                          re.IGNORECASE | re.MULTILINE)
-PERSON_WORDS = re.compile(r"\b(person|people|man|men|woman|women|boy|girl|child|children|kid|kids|pedestrian|"
-                          r"pedestrians|someone|somebody|crowd|human|humans|lady|guy|student|students|he|she)\b",
-                          re.IGNORECASE)
-NONE_WORDS = {"", "none", "nothing", "no", "n a", "na", "clear", "no danger", "nothing serious", "empty", "nobody"}
-VEHICLE_WORDS = re.compile(r"\b(car|cars|bus|truck|lorry|rickshaw|cng|auto|motorbike|motorcycle|bike|bicycle|scooter|"
-                           r"van|vehicle|jeep|tempo)\b", re.IGNORECASE)
+# Things worth warning a blind walker about. People are left out on purpose: they see the user and make way.
+HAZARD_WORDS = re.compile(
+    r"\b(cars?|bus(?:es)?|trucks?|lorry|lorries|vans?|rickshaws?|cngs?|auto rickshaws?|motorbikes?|motorcycles?|"
+    r"bikes?|bicycles?|scooters?|vehicles?|jeeps?|dogs?|cats?|cows?|goats?|animals?|horses?|tables?|chairs?|"
+    r"benches?|stools?|shel(?:f|ves)|poles?|posts?|pillars?|columns?|trees?|tree trunk|walls?|stairs?|staircase|"
+    r"steps?|kerb|curb|holes?|drains?|pothole|doors?|barriers?|fences?|bollards?|boxes?|bins?|dustbins?|"
+    r"railings?|construction|ladder|bags?)\b", re.IGNORECASE)
+VEHICLE_WORDS = re.compile(r"\b(cars?|bus(?:es)?|trucks?|lorry|vans?|rickshaws?|cngs?|motorbikes?|motorcycles?|"
+                           r"bikes?|bicycles?|scooters?|vehicles?|jeeps?)\b", re.IGNORECASE)
+NEGATION = re.compile(r"\b(no|not|without|nothing|none|free of)\b[^,.;]*$", re.IGNORECASE)
+EMPTY_PART = re.compile(r"^\s*(nothing|none|empty|clear|open|no ?thing|n/?a|-)?\s*\.?\s*$|"
+                        r"\b(nothing|empty|clear|open space|free)\b", re.IGNORECASE)
 
 
-def _num(text):
-    m = re.search(r"\d+(?:\.\d+)?", text or "")
-    if m:
-        return float(m.group())
-    words = {"one": 1, "two": 2, "three": 3, "four": 4, "five": 5, "six": 6, "seven": 7, "eight": 8,
-             "nine": 9, "ten": 10, "a few": 3, "few": 3}
-    for w, n in words.items():
-        if re.search(rf"\b{w}\b", (text or "").lower()):
-            return float(n)
-    return None
+def _tidy(part):
+    """First clause of a part, without the model's loops ("no, toot hail, clear, no, ...")."""
+    part = re.split(r"[.\n]", (part or "").strip())[0].strip(" ,;:-")
+    words = part.split()
+    if len(words) > 14:
+        words = words[:14]
+    counts = {}
+    for w in words:
+        counts[w.lower()] = counts.get(w.lower(), 0) + 1
+    if words and max(counts.values()) >= 3:  # repeating itself: garbage
+        return ""
+    part = " ".join(words)
+    if part[:1].isupper() and not part[:2].isupper():
+        part = part[0].lower() + part[1:]
+    return part
 
 
-def _phrase(text):
-    text = (text or "").strip().strip(".").strip()
-    return text[0].lower() + text[1:] if text[:1].isupper() and not text[:2].isupper() else text
+def hazards_in(part):
+    """Hazard words in a part, skipping negated ones ("no cars", "without any poles")."""
+    found = []
+    for m in HAZARD_WORDS.finditer(part or ""):
+        if NEGATION.search(part[:m.start()]):
+            continue
+        found.append(m.group(1).lower())
+    return found
 
 
 def _a(thing):
-    thing = re.sub(r"^(?:a|an|the)\s+", "", thing.strip(), flags=re.IGNORECASE)
-    if re.search(r"s$", thing.split()[0] if thing else "") or re.match(r"^\d", thing):
+    if re.search(r"s$", thing) and not thing.endswith(("bus", "ss")):
         return thing
-    return ("an " if thing[:1].lower() in "aeiou" else "a ") + thing
+    return ("an " if thing[:1] in "aeiou" else "a ") + thing
 
 
 def parse_guidance(raw):
-    fields = {k.upper(): v.strip() for k, v in GUIDE_FIELD.findall(raw or "")}
-    return fields if {"LEFT", "AHEAD", "RIGHT"} & fields.keys() or "DANGER" in fields else None
+    fields = {}
+    for key, val in GUIDE_FIELD.findall(raw or ""):
+        key = key.upper()
+        key = "AHEAD" if key in ("MIDDLE", "CENTER", "CENTRE", "FRONT") else key
+        if key not in fields:
+            fields[key] = _tidy(val)
+    return fields if fields.get("AHEAD") or fields.get("LEFT") or fields.get("RIGHT") else None
 
 
 def compose_guidance(fields):
-    """Turn the model's form into what to say. Returns (text, urgent)."""
-    danger = _phrase(fields.get("DANGER", ""))
-    if normalize_command_text(danger) in NONE_WORDS or PERSON_WORDS.search(danger) and not VEHICLE_WORDS.search(danger):
-        danger = ""  # nothing, or only people: people make way for a blind walker
-    where = normalize_command_text(fields.get("WHERE", ""))
-    where = "left" if "left" in where else "right" if "right" in where else "ahead"
-    steps = _num(fields.get("STEPS"))
-    moving = normalize_command_text(fields.get("MOVING", ""))
-    toward = "toward" in moving or "closer" in moving or "approach" in moving
-    left = _phrase(fields.get("LEFT", ""))
-    ahead = _phrase(fields.get("AHEAD", ""))
-    right = _phrase(fields.get("RIGHT", ""))
-    clear = _num(fields.get("CLEAR"))
-    on_road = normalize_command_text(fields.get("ROAD", "")).startswith("yes")
+    """Turn the model's left / ahead / right into what to say. Returns (text, urgent).
 
-    def empty(side):
-        return normalize_command_text(side) in NONE_WORDS or bool(re.search(r"\b(clear|empty|open|nothing)\b", side or ""))
+    The server, not the model, decides when to warn: only for hazard words straight ahead, never people,
+    and every warning says what it is and which way to go around it."""
+    left, ahead, right = (fields.get(k, "") for k in ("LEFT", "AHEAD", "RIGHT"))
+    h_left, h_ahead, h_right = hazards_in(left), hazards_in(ahead), hazards_in(right)
+    road_left = bool(re.search(r"\b(road|street|traffic|lane)\b", left, re.IGNORECASE))
+    road_right = bool(re.search(r"\b(road|street|traffic|lane)\b", right, re.IGNORECASE))
 
     scene = []
     if left:
@@ -1425,39 +1426,31 @@ def compose_guidance(fields):
     if right:
         scene.append(f"On your right, {right}.")
 
-    if danger:
-        close = steps is None or steps <= 4
-        if toward or close:
-            where_txt = {"left": "on your left", "right": "on your right", "ahead": "right in front of you"}[where]
-            dist = f", about {int(steps)} step{'s' if steps != 1 else ''} away" if steps else ""
-            what = (f"{_a(danger)} is coming toward you {where_txt}{dist}" if toward else
-                    f"there is {_a(danger)} {where_txt}{dist}")
-            if toward:
-                how = "Stand still until it passes."
-            elif where == "left":
-                how = "Keep a little to your right to pass it."
-            elif where == "right":
-                how = "Keep a little to your left to pass it."
-            elif empty(left) and not empty(right):
+    if h_ahead:
+        thing = h_ahead[0]
+        if VEHICLE_WORDS.search(thing) and re.search(r"\b(moving|coming|driving|approach)", ahead, re.IGNORECASE):
+            how = "Stand still until it passes."
+        else:
+            left_ok = not h_left and not road_left
+            right_ok = not h_right and not road_right
+            if left_ok and (not right_ok or EMPTY_PART.search(left)):
                 how = "Move a little to your left to go around it."
-            elif empty(right) and not empty(left):
+            elif right_ok:
                 how = "Move a little to your right to go around it."
-            elif empty(left):
-                how = "Move a little to your left to go around it."
             else:
-                how = "Stand still, turn slightly, and I will check again."
-            prefix = "Careful! " if toward or where == "ahead" else "Careful. "
-            return f"{prefix}{what[0].upper() + what[1:]}. {how}", True
-        scene.insert(0, f"Careful, {_a(danger)} {where if where != 'ahead' else 'ahead'}, about {int(steps)} steps away.")
+                how = "Slow down and stand still, I will check again."
+        side = f" On your left, {left}." if left else ""
+        side += f" On your right, {right}." if right else ""
+        if how.startswith("Stand still until"):
+            what = _a(thing)
+            return f"Careful! {what[0].upper() + what[1:]} is coming toward you. {how}{side}", True
+        return f"Careful! There is {_a(thing)} ahead of you. {how}{side}", True
 
-    if on_road and not danger:
-        scene.append("You are at a road. Ask me if it is safe to cross before you step out.")
-    if danger:
-        scene.append("Keep walking slowly.")
-    elif clear is not None and clear >= 2:
-        scene.append(f"Clear for about {int(clear)} steps, keep walking straight.")
-    else:
-        scene.append("Keep walking slowly.")
+    if road_left or road_right:
+        scene.append(f"The road is on your {'left' if road_left else 'right'}, keep to the "
+                     f"{'right' if road_left else 'left'}.")
+    scene.append("The way ahead looks clear, keep walking." if EMPTY_PART.search(ahead or "") or not ahead
+                 else "Keep walking slowly.")
     return " ".join(scene), False
 
 
@@ -1475,13 +1468,8 @@ def finish_guide_update(req, raw, rate):
     fields = parse_guidance(raw)
     if fields is not None:
         answer, urgent = compose_guidance(fields)
-    else:  # the model ignored the form: use its words, but never a bare "stop"
-        answer = clean_reply(raw)
-        urgent = False
-        if is_bare_warning(answer):
-            answer = ""
-        else:
-            answer = re.sub(r"^(?:\s*(?:stop|wait)[.!,]*\s*)+", "Careful! ", answer, flags=re.IGNORECASE)
+    else:  # the model didn't answer in the pattern: say nothing rather than speak garbage
+        answer, urgent = "", False
     now = time.time()
     clean = normalize_command_text(answer)
     with guide_lock:

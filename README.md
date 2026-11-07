@@ -161,7 +161,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 | `ARGUS_GUIDE_INTERVAL` | `2.5` | Seconds between walking-guidance updates |
 | `ARGUS_GUIDE_REPEAT` | `8.0` | While nothing changes, repeat the left / ahead / right description at most this often (warnings always speak at once) |
 | `ARGUS_CONTEXT_TURNS` | `4` | How many recent question/answer pairs follow-up questions can refer to |
-| `ARGUS_MOTION_GAP` | `1.5` | Walking help compares the camera now with this many seconds ago to spot things approaching (0 = off) |
+| `ARGUS_MOTION_GAP` | `0` | Experimental: compare the camera now with this many seconds ago (e.g. 1.5) to spot things approaching. Off by default because the 2B model gets confused by two pictures |
 | `ARGUS_BARGE_IN` | `all` | While ARGUS talks: `all` = a new question interrupts it, `stop` = only "stop" / "goodbye" do |
 | `ARGUS_ECHO_GUARD` | `0` | Seconds to wait after ARGUS stops before listening. Keep 0 with earphones; try 0.5-0.8 with loudspeakers |
 | `ARGUS_TTS` | `piper` | `piper` (offline) or `edge` (online Microsoft voices) |
