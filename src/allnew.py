@@ -98,12 +98,19 @@ OCR_MAX_PX = int(os.getenv("ARGUS_OCR_MAX_PX", "1920"))
 # doesn't delay the first words, it only lets a full answer finish instead of being cut short.
 MAX_NEW_TOKENS = int(os.getenv("ARGUS_MAX_NEW_TOKENS", "384"))
 OCR_MAX_NEW_TOKENS = int(os.getenv("ARGUS_OCR_MAX_NEW_TOKENS", "448"))
-GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "96"))
+GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "70"))
 # Voice speed, edge-tts style ("+0%" = normal, "-10%" = slower, "+10%" = faster).
 TTS_RATE = os.getenv("ARGUS_TTS_RATE", "+0%")
 ASSIST_TTS_RATE = os.getenv("ARGUS_ASSIST_TTS_RATE", TTS_RATE)
 # Walking guidance: seconds between automatic updates while "guide me" is on.
 GUIDE_INTERVAL_S = env_float("ARGUS_GUIDE_INTERVAL", 2.5)
+# While nothing changes, repeat the left / ahead / right description at most this often (warnings are never held back).
+GUIDE_REPEAT_S = env_float("ARGUS_GUIDE_REPEAT", 8.0)
+# Walking questions and guidance compare the newest camera frame with one from about this many seconds
+# earlier, so the model can tell what is coming closer. 0 turns the comparison off.
+MOTION_GAP_S = env_float("ARGUS_MOTION_GAP", 0.0)  # off: two pictures confuse the 2B model
+# Image size for each of those two frames (two images cost about twice the time of one).
+GUIDE_IMAGE_PX = int(os.getenv("ARGUS_GUIDE_IMAGE_PX", "768"))
 FRAME_MAX_AGE_S = env_float("ARGUS_FRAME_MAX_AGE", 3.0)
 
 WHISPER_MODEL_NAME = os.getenv("ARGUS_WHISPER_MODEL", "small.en")
@@ -343,6 +350,7 @@ warm_up_models()
 # Latest camera frame per source ("pc" = dashboard webcam, "phone" = Android app).
 camera_frames = {}
 camera_frames_lock = threading.Lock()
+camera_history = {}  # origin -> deque of (frame, time) for the last few seconds, for motion comparison
 
 assistant_state = "idle"   # PC microphone: "idle" waits for "Hey Argus", "active" takes commands
 mic_enabled = True
@@ -368,6 +376,39 @@ class PromptRequest:
 
 prompt_queue = queue.Queue()
 cancel_generation = threading.Event()
+# Recent exchanges per origin ("pc" / "phone"), so follow-up questions like "what colour is it?" work.
+CONTEXT_TURNS = int(os.getenv("ARGUS_CONTEXT_TURNS", "4"))
+CONTEXT_MAX_AGE_S = env_float("ARGUS_CONTEXT_MAX_AGE", 180.0)
+conversation = {}
+conversation_lock = threading.Lock()
+
+
+def remember(origin, role, text):
+    if not text:
+        return
+    with conversation_lock:
+        conversation.setdefault(origin, deque(maxlen=2 * CONTEXT_TURNS + 2)).append((time.time(), role, text))
+
+
+def recent_context(origin):
+    now = time.time()
+    with conversation_lock:
+        items = [(r, t) for ts, r, t in conversation.get(origin, ()) if now - ts <= CONTEXT_MAX_AGE_S]
+    items = items[-2 * CONTEXT_TURNS:]
+    if not items:
+        return ""
+    lines = [f'- {"The user asked" if r == "user" else "You said"}: "{t}"' for r, t in items]
+    return CONTEXT_RULE + "\n" + "\n".join(lines) + "\n"
+
+
+def forget_conversation(origin=None):
+    with conversation_lock:
+        if origin is None:
+            conversation.clear()
+        else:
+            conversation.pop(origin, None)
+
+
 # Walking guidance state (see section 7b)
 guide_lock = threading.Lock()
 guide = {"on": False, "origin": "pc", "requester": None, "last_done": 0.0, "last_text": "", "clear_said": 0.0,
@@ -785,6 +826,13 @@ def is_own_echo(heard, window_s=30.0):
     return len(words) >= 3 and sum(w in spoken for w in words) / len(words) >= 0.75
 
 
+def argus_just_said_stop(window_s=4.0):
+    """True if ARGUS's own recent speech contained a stop-like word, so a heard "stop" may be its echo."""
+    now = time.time()
+    return any(now - t <= window_s and re.search(r"\b(stop|wait|hold on|careful)\b", text)
+               for t, text in list(recent_speech))
+
+
 def sanitize_transcription_for_ui(text):
     return re.sub(ARGUS_PHONETIC_VARIANTS, "Argus", text, flags=re.IGNORECASE)
 
@@ -808,6 +856,9 @@ NAV_PATTERN = re.compile(
     r"\b(walk|walking|path|way|road|street|footpath|sidewalk|cross|crossing|ahead|in front|forward|"
     r"safe|stairs|staircase|step|steps|door|doorway|exit|entrance|obstacle|obstacles|where am i|"
     r"where is|where are|which way|turn|navigate|lift|elevator|corridor|hallway|room|move|go)\b")
+CROSSING_PATTERN = re.compile(
+    r"\b(cross|crossing|road|roads|street|traffic|zebra|signal|traffic light|car|cars|vehicle|vehicles|bus|"
+    r"truck|rickshaw|cng|motorbike|motorcycle|bike|lane)\b")
 GUIDE_START_PATTERN = re.compile(
     r"^(?:(?:hey|ok|okay)\s+)?(?:argus\s+)?(?:please\s+)?(?:start\s+)?(?:guide me|guiding|guidance|"
     r"guide mode|help me walk|walk with me|navigate|navigation|start walking|i want to walk|"
@@ -818,11 +869,28 @@ GUIDE_STOP_PATTERN = re.compile(
     r"|^(?:i have arrived|i arrived|im here|i am here|we are here|were here)$")
 
 
+# Questions about what something looks like ("what colour is the car", "how many cats", "what breed")
+# are conversation, not navigation, even when they mention a car or a road.
+DESCRIBE_PATTERN = re.compile(
+    r"^(?:(?:and|so|okay|ok|hey argus|argus)\s+)?(?:what (?:colou?r|type|kind|model|brand|breed|make|size|shape)|"
+    r"which (?:colou?r|type|kind|model|brand|breed|one)|how (?:many|big|old|tall|far)|describe|tell me (?:more|about)|"
+    r"what (?:does|do) (?:it|they|he|she|that|this) look like|what (?:is|are) (?:it|they|that|those|he|she) "
+    r"(?:doing|wearing|holding)|is (?:it|that|this) an?\b|are (?:they|there) any\b|who is)")
+CROSSING_QUESTION = re.compile(
+    r"\b(cross|crossing|zebra|traffic light|signal)\b|\b(?:is|are) (?:a |any |there (?:a |any )?)?"
+    r"(?:car|cars|vehicle|vehicles|bus|truck|rickshaw|cng|motorbike|motorcycle|bike)s? coming\b|"
+    r"\bsafe to (?:go across|cross)\b")
+
+
 def assist_task(text):
-    """Which assistive prompt fits a question: medicine, nav or general."""
+    """Which assistive prompt fits a question: medicine, describe/general, crossing or nav."""
     clean = normalize_command_text(text)
     if MEDICINE_PATTERN.search(clean):
         return "medicine"
+    if DESCRIBE_PATTERN.search(clean):
+        return "general"
+    if CROSSING_QUESTION.search(clean):
+        return "crossing"
     if not clean or NAV_PATTERN.search(clean):
         return "nav"
     return "general"
@@ -869,6 +937,30 @@ BLIND_USER = ("The user is blind and is relying on you as their eyes, so they ca
               "(one step is about 70 cm) or arm's length. Never guess: if something is unclear, say so and tell "
               "them how to move the camera to get a better view. Speak calmly and clearly. Never use markdown. ")
 
+# Walking help answers in a fixed spoken layout so the user always knows where to listen:
+# warning first (only if needed), then left, ahead, right, then one instruction.
+# What counts as a reason to say "stop" to a blind walker. People are not on the list: they see the
+# user coming and step aside. The server, not the model, decides when to say stop (see compose_guidance).
+SERIOUS_HAZARDS = ("vehicles (car, bus, truck, rickshaw, CNG, motorbike, bicycle, van), animals (dog, cat, cow, "
+                   "goat, any animal), furniture (table, chair, bench, shelf), poles, pillars, walls, trees, "
+                   "stairs, steps, kerbs, holes, drains, open doors, barriers, boxes or anything they could "
+                   "trip over or walk into")
+SCENE_LAYOUT = ("Describe the scene in this spoken order: 'On your left, ...', 'Ahead, ...' with what is in their "
+                "path, then 'On your right, ...', and end with one instruction. Name the real things you see. "
+                "If something they could walk into is in their way, such as a vehicle, an animal, a chair, a pole "
+                "or steps, start with 'Careful!', say what it is and where, and how to get past it: 'move a "
+                "little to your left', 'move a little to your right', or 'stand still until it passes'. People "
+                "are not obstacles: other people will make way, so never warn about a person. ")
+MOTION_RULE = ("When two pictures are given, the first was taken {gap} seconds before the second, which is now. "
+               "Compare them: a person or vehicle that is bigger or closer in the second picture is approaching "
+               "and must be warned about; one that got smaller is moving away. Describe the scene in the second "
+               "picture. ")
+CROSSING_RULE = ("If they are at or on a road: look both ways, to the left and the right. Only say 'No car "
+                 "coming, you can cross now.' when no vehicle is moving toward them from either side and none "
+                 "is close. If any vehicle is approaching or the view is blocked or unclear, say 'Wait.' and "
+                 "why, for example 'Wait. A bus is coming from your right.' Mention a zebra crossing or a "
+                 "traffic light and its colour if visible. When unsure, always say wait, never cross. ")
+
 SYSTEM_PROMPTS = {
     "screen": ("You are A.R.G.U.S., a friendly copilot looking at the user's screen, talking casually like a "
                "friend on a call. " + LENGTH_RULE + " " + SPOKEN_STYLE + " " + NO_DIALOGUE),
@@ -876,14 +968,13 @@ SYSTEM_PROMPTS = {
              "like on a video call. " + LENGTH_RULE + " " + SPOKEN_STYLE + " " + NO_DIALOGUE),
     # Assistive mode, chosen per question by assist_task().
     "nav": ("You are A.R.G.U.S., a sighted guide for a blind person who is walking, looking through the camera "
-            "they hold or wear at chest height. " + BLIND_USER +
-            "First, warn about anything in or near their walking path: steps, stairs, kerbs, holes, uneven "
-            "ground, wet floor, poles, walls, furniture, open doors, low branches, bicycles, vehicles or people, "
-            "with direction and distance. Then say whether it is safe to keep walking and give one clear "
-            "instruction, for example 'Stop. There are two steps down right in front of you.' or 'The path is "
-            "clear for about ten steps, keep going straight. There is a door slightly to your right.' "
-            "If they ask where something is, guide them to it step by step. Use two to four short sentences. "
-            + NO_DIALOGUE),
+            "they hold or wear at chest height. " + BLIND_USER + SCENE_LAYOUT + MOTION_RULE + CROSSING_RULE +
+            "If they ask where something is, guide them to it step by step. " + NO_DIALOGUE),
+    "crossing": ("You are A.R.G.U.S., helping a blind person cross a road safely, looking through the camera "
+                 "they hold at chest height. " + BLIND_USER + CROSSING_RULE + MOTION_RULE +
+                 "Start with the decision, 'Wait.' or 'No car coming, you can cross now.', then say what is "
+                 "on the left, ahead and on the right of the road, and any vehicle and which way it is going. "
+                 "Use two to four short sentences. " + NO_DIALOGUE),
     "medicine": ("You are A.R.G.U.S., reading a medicine package, strip, bottle or label for a blind person. "
                  + BLIND_USER +
                  "Read, exactly as printed: the medicine name, the strength (for example 500 mg), and if visible "
@@ -894,15 +985,20 @@ SYSTEM_PROMPTS = {
                  "package, for example 'Turn the box over' or 'Hold it about 20 centimetres from the camera'. "
                  "Never guess a medicine name, strength or dose, and if they ask how much to take and it is not "
                  "printed, tell them to check with a pharmacist or doctor. " + NO_DIALOGUE),
-    "general": ("You are A.R.G.U.S., the eyes of a blind user. " + BLIND_USER +
-                "Mention any hazard first. Then answer their question about what is around them: the main "
-                "objects and people and where they are, and read out any sign or label that matters. "
-                "Use two to four sentences, more only if they ask for detail. " + NO_DIALOGUE),
-    "guide": ("You are A.R.G.U.S., guiding a blind person who is walking right now. " + BLIND_USER +
-              "This is an automatic update, not a question. In one short sentence, at most two, say what "
-              "matters for their next few steps: a hazard with direction and distance, a turn, a door or a "
-              "change in the path, and whether to keep going, slow down or stop. If nothing in the path has "
-              "changed and it is clear, reply only with 'Clear ahead.' " + NO_DIALOGUE),
+    "general": ("You are A.R.G.U.S., the eyes of a blind user, having a friendly conversation with them. "
+                + BLIND_USER +
+                "Answer exactly what they ask, with the specific details a sighted friend would give: colour, "
+                "type, make or model of a vehicle if you can tell, breed or kind of an animal, how many there "
+                "are, what people are wearing or doing, and where it is. If they ask about something mentioned "
+                "earlier in the conversation ('the car', 'it', 'that dog'), find it in the current picture and "
+                "describe it; if it is no longer visible, say so. Mention a serious hazard first if there is "
+                "one. Use two to four sentences, more only if they ask for detail. " + NO_DIALOGUE),
+    # Kept very short on purpose: the 2B model copies long lists from the prompt and loops on long forms.
+    # The server reads the three parts and decides itself whether to warn (see compose_guidance).
+    "guide": ("This photo is from a camera on the chest of a blind person walking forward. Say what is on "
+              "the left side, what is straight ahead in the middle, and what is on the right side. Use a few "
+              "words for each part, and answer in exactly this pattern:\n"
+              "Left: ...\nAhead: ...\nRight: ..."),
     "ocr": ("You are A.R.G.U.S. reading text for the user. Read the requested text, numbers or label exactly as "
             "printed in the image, then answer the question in plain spoken sentences. If part of the text is "
             "too blurry or cut off, say which part you cannot read instead of guessing. Never use "
@@ -914,11 +1010,19 @@ SYSTEM_PROMPTS = {
 }
 
 GROUNDING_RULES = ("The image attached to this message is the only visual evidence. Do not rely on earlier "
-                   "images or answers. Answer using only details actually visible in this image; if the image "
+                   "images. Answer using only details actually visible in this image; if the image "
                    "is unclear or the requested content cannot be read, say so plainly.")
+CONTEXT_RULE = ("Recent conversation, only so you know what the user is referring to (describe only what is "
+                "visible now):")
+
+GROUNDING_RULES_TWO = ("The two images attached to this message are the only visual evidence: an earlier one and "
+                       "the current one. Do not rely on earlier messages. Answer using only what is actually "
+                       "visible; if the view is unclear, say so plainly.")
 
 HAZARD_PATTERN = re.compile(r"\b(danger|dangerous|hazard|caution|careful|watch out|warning|stairs ahead|"
-                            r"step down|step up|obstacle|traffic|oncoming)\b", re.IGNORECASE)
+                            r"step down|step up|obstacle|traffic|oncoming|approaching|coming toward|coming towards)\b", re.IGNORECASE)
+# A guidance update that must be spoken at once, never held back as a repeat.
+URGENT_PATTERN = re.compile(r"^\s*(stop|wait|careful)\b", re.IGNORECASE)
 # The model sometimes keeps going and writes both sides of a conversation: cut at the first
 # speaker label after the start of the reply.
 DIALOGUE_CUT = re.compile(r"(?:^|\n|\s)(?:User|Human|Assistant|You|Me|ARGUS|A\.R\.G\.U\.S\.?)\s*:", re.IGNORECASE)
@@ -950,8 +1054,27 @@ def decode_image(data_url):
 
 
 def store_camera_frame(origin, frame):
+    now = time.time()
     with camera_frames_lock:
-        camera_frames[origin] = (frame, time.time())
+        camera_frames[origin] = (frame, now)
+        hist = camera_history.setdefault(origin, deque(maxlen=12))
+        hist.append((frame, now))
+        while hist and now - hist[0][1] > 4.0:
+            hist.popleft()
+
+
+def earlier_camera_frame(origin, gap_s):
+    """The stored frame closest to gap_s seconds before the newest one, and its age difference."""
+    with camera_frames_lock:
+        hist = list(camera_history.get(origin, ()))
+    if gap_s <= 0 or len(hist) < 2:
+        return None, 0.0
+    newest_t = hist[-1][1]
+    older = [(f, newest_t - t) for f, t in hist[:-1] if newest_t - t >= 0.5]
+    if not older:
+        return None, 0.0
+    frame, gap = min(older, key=lambda x: abs(x[1] - gap_s))
+    return frame.copy(), gap
 
 
 def latest_camera_frame(origin):
@@ -1045,17 +1168,34 @@ def _process_prompt(req: PromptRequest):
     max_px = OCR_MAX_PX if ocr else MAX_IMAGE_PX
     system_prompt = SYSTEM_PROMPTS[prompt_key].replace("{today}", time.strftime("%d %B %Y"))
 
+    # Walking help compares the newest frame with one from a moment ago to see what is approaching.
+    prev_frame, gap = (None, 0.0)
+    if prompt_key in ("guide", "nav", "crossing") and source in ("pc", "phone"):
+        prev_frame, gap = earlier_camera_frame(source, MOTION_GAP_S)
+    if prev_frame is not None:
+        max_px = min(max_px, GUIDE_IMAGE_PX)
+    system_prompt = system_prompt.replace("{gap}", f"{gap:.1f}")
+    if prev_frame is None:
+        system_prompt = system_prompt.replace(MOTION_RULE.replace("{gap}", f"{gap:.1f}"), "")
+
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     pil_image.thumbnail((max_px, max_px), Image.LANCZOS)
+    images = [pil_image]
+    if prev_frame is not None:
+        prev_image = Image.fromarray(cv2.cvtColor(prev_frame, cv2.COLOR_BGR2RGB))
+        prev_image.thumbnail((max_px, max_px), Image.LANCZOS)
+        images = [prev_image, pil_image]
     task = req.text or ("Read the text in front of me." if ocr else "What is in front of me?")
     if not req.guide:
         log_event("ROUTER", f"{req.mode}{f' ({prompt_key})' if assistive else ''} | "
                             f"{f'OCR ({why}) ' if ocr else ''}{pil_image.width}x{pil_image.height} from {source}")
 
+    grounding = GROUNDING_RULES if len(images) == 1 else GROUNDING_RULES_TWO
     messages = [{"role": "user", "content": [
-        {"type": "image", "image": pil_image},
-        {"type": "text", "text": f"{system_prompt}\n\n{GROUNDING_RULES}\n"
-                                 f"Current user request: {task}\nRespond only to this request."},
+        *({"type": "image", "image": im} for im in images),
+        {"type": "text", "text": (f"{system_prompt}\n\n{grounding}\n" if not req.guide else f"{system_prompt}\n") +
+                                 ("" if req.guide else recent_context(req.origin) +
+                                  f"Current user request: {task}\nRespond only to this request.")},
     ]}]
     if not req.guide:  # automatic guidance updates are not questions, so they are not timed
         latency.start(req, ocr=int(ocr), image_px=max(pil_image.size), queue_ms=queue_ms)
@@ -1071,7 +1211,9 @@ def _process_prompt(req: PromptRequest):
                            padding=True, return_tensors="pt").to(vlm.device)
         streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True,
                                         clean_up_tokenization_spaces=False)
-        gen_kwargs = dict(**inputs, streamer=streamer, do_sample=False, repetition_penalty=1.1,
+        gen_kwargs = dict(**inputs, streamer=streamer, do_sample=False,
+                          repetition_penalty=1.25 if req.guide else 1.1,
+                          **({"no_repeat_ngram_size": 3} if req.guide else {}),
                           max_new_tokens=(GUIDE_MAX_NEW_TOKENS if req.guide else
                                           OCR_MAX_NEW_TOKENS if ocr else MAX_NEW_TOKENS),
                           stopping_criteria=StoppingCriteriaList([CancelCriteria()]))
@@ -1127,11 +1269,15 @@ def _process_prompt(req: PromptRequest):
         latency.finish(req.id)
         return
 
-    answer = clean_reply(full) or "Sorry, I didn't get a clear answer. Please ask me again."
-    tail = clean_reply(pending)
     if req.guide:
-        finish_guide_update(req, answer, rate)
+        finish_guide_update(req, full, rate)
         return
+    answer = clean_reply(full)
+    if is_bare_warning(answer):
+        answer = ""  # a bare "stop" with no reason helps no one; ask again instead
+        pending = ""
+    answer = answer or "Sorry, I didn't get a clear answer. Please ask me again."
+    tail = clean_reply(pending)
     if tail:
         if seq == 0:
             latency.mark(req.id, "first_sentence_ms")
@@ -1143,6 +1289,10 @@ def _process_prompt(req: PromptRequest):
         play_hazard_alert()
 
     send_reply(req, {"event": "argus_reply", "id": req.id, "text": answer, "mode": req.mode, "ocr": ocr})
+    remember(req.origin, "user", req.text)
+    remember(req.origin, "argus", answer)
+    with guide_lock:
+        guide["last_done"] = time.time()  # guidance resumes a moment after this answer
     log_event("Qwen2-VL", f"{'Phone reply' if req.origin == 'phone' else 'Reply'}: {answer}")
     latency.done(req.id, "text")
 
@@ -1199,28 +1349,145 @@ def stop_guide(message=None):
         speak(message, origin=origin, requester=requester, rate=ASSIST_TTS_RATE)
 
 
-def finish_guide_update(req, answer, rate):
-    """Speak a guidance update only when it says something new."""
-    clean = normalize_command_text(answer)
+GUIDE_FIELD = re.compile(r"^\s*[-*]?\s*(LEFT|AHEAD|MIDDLE|CENTER|CENTRE|FRONT|RIGHT)\s*(?:SIDE)?\s*[:=-]\s*(.*)$",
+                         re.IGNORECASE | re.MULTILINE)
+# Things worth warning a blind walker about. People are left out on purpose: they see the user and make way.
+HAZARD_WORDS = re.compile(
+    r"\b(cars?|bus(?:es)?|trucks?|lorry|lorries|vans?|rickshaws?|cngs?|auto rickshaws?|motorbikes?|motorcycles?|"
+    r"bikes?|bicycles?|scooters?|vehicles?|jeeps?|dogs?|cats?|cows?|goats?|animals?|horses?|tables?|chairs?|"
+    r"benches?|stools?|shel(?:f|ves)|poles?|posts?|pillars?|columns?|trees?|tree trunk|walls?|stairs?|staircase|"
+    r"steps?|kerb|curb|holes?|drains?|pothole|doors?|barriers?|fences?|bollards?|boxes?|bins?|dustbins?|"
+    r"railings?|construction|ladder|bags?)\b", re.IGNORECASE)
+VEHICLE_WORDS = re.compile(r"\b(cars?|bus(?:es)?|trucks?|lorry|vans?|rickshaws?|cngs?|motorbikes?|motorcycles?|"
+                           r"bikes?|bicycles?|scooters?|vehicles?|jeeps?)\b", re.IGNORECASE)
+NEGATION = re.compile(r"\b(no|not|without|nothing|none|free of)\b[^,.;]*$", re.IGNORECASE)
+EMPTY_PART = re.compile(r"^\s*(nothing|none|empty|clear|open|no ?thing|n/?a|-)?\s*\.?\s*$|"
+                        r"\b(nothing|empty|clear|open space|free)\b", re.IGNORECASE)
+
+
+def _tidy(part):
+    """First clause of a part, without the model's loops ("no, toot hail, clear, no, ...")."""
+    part = re.split(r"[.\n]", (part or "").strip())[0].strip(" ,;:-")
+    words = part.split()
+    if len(words) > 14:
+        words = words[:14]
+    counts = {}
+    for w in words:
+        counts[w.lower()] = counts.get(w.lower(), 0) + 1
+    if words and max(counts.values()) >= 3:  # repeating itself: garbage
+        return ""
+    part = " ".join(words)
+    if part[:1].isupper() and not part[:2].isupper():
+        part = part[0].lower() + part[1:]
+    return part
+
+
+def hazards_in(part):
+    """Hazard words in a part, skipping negated ones ("no cars", "without any poles")."""
+    found = []
+    for m in HAZARD_WORDS.finditer(part or ""):
+        if NEGATION.search(part[:m.start()]):
+            continue
+        found.append(m.group(1).lower())
+    return found
+
+
+def _a(thing):
+    if re.search(r"s$", thing) and not thing.endswith(("bus", "ss")):
+        return thing
+    return ("an " if thing[:1] in "aeiou" else "a ") + thing
+
+
+def parse_guidance(raw):
+    fields = {}
+    for key, val in GUIDE_FIELD.findall(raw or ""):
+        key = key.upper()
+        key = "AHEAD" if key in ("MIDDLE", "CENTER", "CENTRE", "FRONT") else key
+        if key not in fields:
+            fields[key] = _tidy(val)
+    return fields if fields.get("AHEAD") or fields.get("LEFT") or fields.get("RIGHT") else None
+
+
+def compose_guidance(fields):
+    """Turn the model's left / ahead / right into what to say. Returns (text, urgent).
+
+    The server, not the model, decides when to warn: only for hazard words straight ahead, never people,
+    and every warning says what it is and which way to go around it."""
+    left, ahead, right = (fields.get(k, "") for k in ("LEFT", "AHEAD", "RIGHT"))
+    h_left, h_ahead, h_right = hazards_in(left), hazards_in(ahead), hazards_in(right)
+    road_left = bool(re.search(r"\b(road|street|traffic|lane)\b", left, re.IGNORECASE))
+    road_right = bool(re.search(r"\b(road|street|traffic|lane)\b", right, re.IGNORECASE))
+
+    scene = []
+    if left:
+        scene.append(f"On your left, {left}.")
+    if ahead:
+        scene.append(f"Ahead, {ahead}.")
+    if right:
+        scene.append(f"On your right, {right}.")
+
+    if h_ahead:
+        thing = h_ahead[0]
+        if VEHICLE_WORDS.search(thing) and re.search(r"\b(moving|coming|driving|approach)", ahead, re.IGNORECASE):
+            how = "Stand still until it passes."
+        else:
+            left_ok = not h_left and not road_left
+            right_ok = not h_right and not road_right
+            if left_ok and (not right_ok or EMPTY_PART.search(left)):
+                how = "Move a little to your left to go around it."
+            elif right_ok:
+                how = "Move a little to your right to go around it."
+            else:
+                how = "Slow down and stand still, I will check again."
+        side = f" On your left, {left}." if left else ""
+        side += f" On your right, {right}." if right else ""
+        if how.startswith("Stand still until"):
+            what = _a(thing)
+            return f"Careful! {what[0].upper() + what[1:]} is coming toward you. {how}{side}", True
+        return f"Careful! There is {_a(thing)} ahead of you. {how}{side}", True
+
+    if road_left or road_right:
+        scene.append(f"The road is on your {'left' if road_left else 'right'}, keep to the "
+                     f"{'right' if road_left else 'left'}.")
+    scene.append("The way ahead looks clear, keep walking." if EMPTY_PART.search(ahead or "") or not ahead
+                 else "Keep walking slowly.")
+    return " ".join(scene), False
+
+
+def is_bare_warning(text):
+    """True for replies that are only 'Stop.' / 'Stop stop stop' / 'Wait.' with no reason."""
+    words = [w for w in normalize_command_text(text).split()
+             if w not in {"stop", "wait", "please", "now", "careful", "danger"}]
+    return len(words) < 3
+
+
+def finish_guide_update(req, raw, rate):
+    """Speak a guidance update: warnings at once (with the reason), the same calm description at most every
+    GUIDE_REPEAT_S. The server decides when to say stop, so the model can't just repeat 'Stop'."""
+    print("[GUIDE RAW] " + " | ".join(l.strip() for l in (raw or "").splitlines() if l.strip()))
+    fields = parse_guidance(raw)
+    if fields is not None:
+        answer, urgent = compose_guidance(fields)
+    else:  # the model didn't answer in the pattern: say nothing rather than speak garbage
+        answer, urgent = "", False
     now = time.time()
+    clean = normalize_command_text(answer)
     with guide_lock:
         guide["in_flight"] = False
         guide["last_done"] = now
-        if not guide["on"]:
+        if not guide["on"] or not answer:
             return
-        is_clear = clean in ("clear ahead", "clear", "path is clear", "the path is clear") or clean.startswith("clear ahead")
-        if is_clear:
-            # Say "clear ahead" at most every 10 seconds so the user knows guidance is still running.
-            if now - guide["clear_said"] < 10.0:
-                return
-            guide["clear_said"] = now
-        elif SequenceMatcher(None, clean, guide["last_text"]).ratio() > 0.85:
-            return  # same warning as last time
+        similar = SequenceMatcher(None, clean, guide["last_text"]).ratio() > (0.95 if urgent else 0.6)
+        hold = 5.0 if urgent else GUIDE_REPEAT_S  # repeat the same warning at most every 5 s
+        if similar and now - guide["clear_said"] < hold:
+            return
         guide["last_text"] = clean
+        guide["clear_said"] = now  # time of the last spoken update
+    if urgent:
+        play_hazard_alert()  # beep first so the warning is noticed
     speak(answer, req, rate=rate, seq=0)
+    remember(req.origin, "argus", answer)
     log_event("GUIDE", answer)
-    if HAZARD_PATTERN.search(answer) or re.search(r"\bstop\b", answer, re.IGNORECASE):
-        play_hazard_alert()
 
 
 def guide_worker():
@@ -1379,7 +1646,7 @@ def audio_worker():
             return ""
         return text
 
-    def handle_stop_or_sleep(heard):
+    def handle_stop_or_sleep(heard, overlapped=False):
         global assistant_state
         if is_guide_stop(heard):
             interrupt_tts()
@@ -1395,7 +1662,11 @@ def audio_worker():
             log_event("SYSTEM", "Going to sleep. Say 'Hey Argus' to wake me.")
             return True
         if is_stop_command(heard):
-            stop_guide()
+            if overlapped and argus_just_said_stop():
+                print(f"[VOICE] Ignored {heard!r}: that was ARGUS's own warning, not you")
+                return True
+            # "Okay stop" silences the current sentence. Walking guidance keeps running
+            # (say "stop guiding" or press Guide to end it).
             interrupt_tts()
             clear_pending_prompts()
             assistant_state = "active"
@@ -1438,7 +1709,7 @@ def audio_worker():
             print(f"[VOICE] Heard {heard!r} ({stt_ms} ms, state={assistant_state}"
                   f"{', while ARGUS was talking' if overlapped else ''})")
 
-            if handle_stop_or_sleep(heard):
+            if handle_stop_or_sleep(heard, overlapped):
                 continue
 
             if is_own_echo(heard):
@@ -1574,6 +1845,8 @@ async def handle_message(client, data):
             await ws.send_text(json.dumps({"event": "perception_log", "engine": "SYSTEM",
                                            "text": f"Unknown mode {data.get('mode')!r}."}))
             return
+        if client.mode != mode:
+            forget_conversation("phone" if client.kind == "phone" else "pc")
         client.mode = mode
         with guide_lock:
             guide_origin, guide_on = guide["origin"], guide["on"]
@@ -1639,7 +1912,7 @@ async def handle_message(client, data):
             client.slt.clear()
 
     elif event == "stop":
-        if data.get("guide", True):
+        if data.get("guide", False):  # {"event": "stop", "guide": true} also ends walking guidance
             stop_guide()
         interrupt_tts()
         clear_pending_prompts()
