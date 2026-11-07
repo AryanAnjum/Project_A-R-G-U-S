@@ -23,7 +23,7 @@ Developed and measured on an RTX 5060 Ti (16 GB) under Windows.
 | --- | --- | --- |
 | **Screen** | This PC's screen (DXCam, MSS fallback) | Casual copilot for whatever is on screen |
 | **Live** | Dashboard webcam or phone camera | Conversational companion |
-| **Assistive** | Camera | Short, safety-first descriptions for a visually impaired user, hazard beep, Bangladeshi Taka reader |
+| **Assistive** | Camera | Acts as the eyes of a blind user: walking guidance with directions and distances, a hands-free **Guide** mode, medicine label reader (name, strength, dose, expiry), hazard beep, Bangladeshi Taka reader |
 | **Sign** | Camera | Translates continuous sign language into text and speech. German Sign Language (DGS) and Bangla Sign Language (BdSL) |
 
 **OCR on demand.** Everyday questions use a 1024 px image so they answer quickly. When you
@@ -155,7 +155,10 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 | `ARGUS_ADAPTER_PATH` | `argus_phased_adapters/part_5_adapter` | LoRA fine-tune folder |
 | `ARGUS_MAX_IMAGE_PX` | `1024` | Longest image side for normal questions |
 | `ARGUS_OCR_MAX_PX` | `1920` | Longest image side for OCR questions |
-| `ARGUS_PAUSE_THRESHOLD` | `0.45` | Seconds of silence that end a spoken question |
+| `ARGUS_PAUSE_THRESHOLD` | `1.0` | Seconds of silence that end a spoken question. Lower answers sooner but can cut you off mid-sentence |
+| `ARGUS_MAX_NEW_TOKENS` | `384` | Longest reply (`ARGUS_OCR_MAX_NEW_TOKENS` = 448 for reading) |
+| `ARGUS_TTS_RATE` / `ARGUS_ASSIST_TTS_RATE` | `+0%` | Voice speed, e.g. `-10%` slower, `+10%` faster |
+| `ARGUS_GUIDE_INTERVAL` | `2.5` | Seconds between walking-guidance updates |
 | `ARGUS_BARGE_IN` | `all` | While ARGUS talks: `all` = a new question interrupts it, `stop` = only "stop" / "goodbye" do |
 | `ARGUS_ECHO_GUARD` | `0` | Seconds to wait after ARGUS stops before listening. Keep 0 with earphones; try 0.5-0.8 with loudspeakers |
 | `ARGUS_TTS` | `piper` | `piper` (offline) or `edge` (online Microsoft voices) |
@@ -170,7 +173,12 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 
 - *"Hey Argus"*, optionally followed by a question, wakes it up.
 - *"Read this"*, *"what does it say"* and *"how much money is this"* answer from the full-resolution image.
-- *"Okay stop"* interrupts. *"Goodbye"* puts it back to sleep.
+- *"Guide me"* (or *"help me walk"*) turns on walking guidance in Assistive mode: every few seconds it says
+  what matters for your next steps, and stays quiet while the path is clear. *"Stop guiding"* or
+  *"I have arrived"* ends it.
+- In Assistive mode, questions about a medicine (*"what is this medicine"*, *"when does it expire"*)
+  read the label from the full-resolution image and never guess a name or dose.
+- *"Okay stop"* interrupts (and ends guidance). *"Goodbye"* puts it back to sleep.
 
 ## Repository layout
 
