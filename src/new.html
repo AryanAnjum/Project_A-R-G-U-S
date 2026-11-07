@@ -209,6 +209,7 @@ main {
 .ocr-btn { display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 12px; font-weight: 600; }
 .ocr-btn:hover { background: var(--hover); color: var(--ink); }
 .ocr-btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+.ocr-btn[hidden] { display: none; }
 
 /* Chat */
 .chat { flex: 1; min-height: 0; overflow-y: auto; padding: 15px; display: flex; flex-direction: column; gap: 16px; }
@@ -344,6 +345,7 @@ main {
     <div class="console">
       <button type="button" class="icon-btn on" id="micBtn" title="PC microphone on (click to mute)" aria-pressed="true"><svg class="icon"><use href="#i-mic"/></svg></button>
       <input type="text" id="promptInput" placeholder="Ask A.R.G.U.S. about the screen or camera..." autocomplete="off">
+      <button type="button" class="ocr-btn" id="guideBtn" hidden title="Walking guidance: describes the path ahead every few seconds (or say &quot;guide me&quot;)" aria-pressed="false"><svg class="icon"><use href="#i-assist"/></svg><span>Guide</span></button>
       <button type="button" class="ocr-btn" id="ocrBtn" title="Read text at full 1920 px resolution" aria-pressed="false"><svg class="icon"><use href="#i-scan"/></svg><span>OCR</span></button>
       <button type="button" class="icon-btn" id="stopBtn" title="Stop talking"><svg class="icon"><use href="#i-stop"/></svg></button>
       <button type="button" class="icon-btn" id="sendBtn" title="Send"><svg class="icon"><use href="#i-send"/></svg></button>
@@ -436,6 +438,7 @@ const HANDLERS = {
   sentence_timing(d) { addSentenceTiming(d); },
   assistant_status(d) { setStatus(d.state); },
   mic_status(d) { setMicUi(d.enabled, d.available); },
+  guide_status(d) { setGuideUi(d.on); addLog("GUIDE", d.on ? "Walking guidance on" : "Walking guidance off"); },
   slt_languages(d) { fillLanguages(d.languages, d.language); },
   slt_status(d) { setSltState(d); },
   slt_caption(d) { showCaption(d); },
@@ -595,8 +598,11 @@ function applyMode(mode, notifyServer) {
   document.querySelectorAll(".mode-btn").forEach((b) => b.classList.toggle("active", b.dataset.mode === mode));
   updateFeedTag();
   $("sltPanel").classList.toggle("on", mode === "slt");
+  $("guideBtn").hidden = mode !== "assistive";
+  if (mode !== "assistive") setGuideUi(false);
   $("promptInput").placeholder = mode === "screen" ? "Ask A.R.G.U.S. about your screen..." :
-    mode === "slt" ? "Sign in front of the camera, or type a question..." : "Ask A.R.G.U.S. about the camera...";
+    mode === "slt" ? "Sign in front of the camera, or type a question..." :
+    mode === "assistive" ? "Ask what's ahead, or read a medicine label..." : "Ask A.R.G.U.S. about the camera...";
   if (mode === "screen") stopWebcam(); else startWebcam();
   if (notifyServer) send({ event: "set_mode", mode, language: state.sltLanguage });
 }
@@ -750,6 +756,12 @@ $("sendBtn").addEventListener("click", sendPrompt);
 $("promptInput").addEventListener("keydown", (e) => { if (e.key === "Enter") sendPrompt(); });
 $("stopBtn").addEventListener("click", () => send({ event: "stop" }));
 $("micBtn").addEventListener("click", () => send({ event: "set_mic", enabled: !state.micEnabled }));
+function setGuideUi(on) {
+  state.guide = !!on;
+  $("guideBtn").classList.toggle("on", state.guide);
+  $("guideBtn").setAttribute("aria-pressed", String(state.guide));
+}
+$("guideBtn").addEventListener("click", () => send({ event: "guide", on: !state.guide }));
 $("ocrBtn").addEventListener("click", () => {
   state.ocr = !state.ocr;
   $("ocrBtn").classList.toggle("on", state.ocr);

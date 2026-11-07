@@ -11,7 +11,7 @@ ws://<this PC>:8000/ws.
 Modes
     screen     answers about what is on this PC's screen (DXCam / MSS capture)
     live       answers about the camera (dashboard webcam or phone)
-    assistive  short, safety-first descriptions for a visually impaired user
+    assistive  the eyes of a blind user: walking guidance ("guide me"), medicine labels, hazards, Taka notes
     slt        sign language translation from the camera (German DGS and Bangla BdSL)
 
 OCR: a question that asks to read something ("read this", "what does this say",
@@ -94,15 +94,26 @@ MERGE_ADAPTER = os.getenv("ARGUS_MERGE_ADAPTER", "1") == "1"
 # text stays readable; everyday questions use a smaller image to answer faster.
 MAX_IMAGE_PX = int(os.getenv("ARGUS_MAX_IMAGE_PX", "1024"))
 OCR_MAX_PX = int(os.getenv("ARGUS_OCR_MAX_PX", "1920"))
-MAX_NEW_TOKENS = int(os.getenv("ARGUS_MAX_NEW_TOKENS", "160"))
-OCR_MAX_NEW_TOKENS = int(os.getenv("ARGUS_OCR_MAX_NEW_TOKENS", "256"))
+# Reply length budget. Answers are streamed and spoken sentence by sentence, so a bigger budget
+# doesn't delay the first words, it only lets a full answer finish instead of being cut short.
+MAX_NEW_TOKENS = int(os.getenv("ARGUS_MAX_NEW_TOKENS", "384"))
+OCR_MAX_NEW_TOKENS = int(os.getenv("ARGUS_OCR_MAX_NEW_TOKENS", "448"))
+GUIDE_MAX_NEW_TOKENS = int(os.getenv("ARGUS_GUIDE_MAX_NEW_TOKENS", "96"))
+# Voice speed, edge-tts style ("+0%" = normal, "-10%" = slower, "+10%" = faster).
+TTS_RATE = os.getenv("ARGUS_TTS_RATE", "+0%")
+ASSIST_TTS_RATE = os.getenv("ARGUS_ASSIST_TTS_RATE", TTS_RATE)
+# Walking guidance: seconds between automatic updates while "guide me" is on.
+GUIDE_INTERVAL_S = env_float("ARGUS_GUIDE_INTERVAL", 2.5)
 FRAME_MAX_AGE_S = env_float("ARGUS_FRAME_MAX_AGE", 3.0)
 
 WHISPER_MODEL_NAME = os.getenv("ARGUS_WHISPER_MODEL", "small.en")
 WHISPER_DEVICE = os.getenv("ARGUS_WHISPER_DEVICE", "cuda" if torch.cuda.is_available() else "cpu").lower()
 WHISPER_COMPUTE_TYPE = os.getenv("ARGUS_WHISPER_COMPUTE_TYPE", "float16" if WHISPER_DEVICE == "cuda" else "int8")
-# Seconds of silence that end a spoken sentence. Lower answers sooner but may cut you off mid-pause.
-PAUSE_THRESHOLD = env_float("ARGUS_PAUSE_THRESHOLD", 0.45)
+# Seconds of silence that end a spoken question. Lower answers sooner but cuts you off when you
+# pause to think mid-sentence; 1.0 lets you finish naturally. Try 0.6-0.8 if you speak in one go.
+PAUSE_THRESHOLD = env_float("ARGUS_PAUSE_THRESHOLD", 1.0)
+# Longest single question, in seconds.
+MAX_PHRASE_S = env_float("ARGUS_MAX_PHRASE", 30.0)
 # Seconds to ignore the mic after ARGUS stops talking, so room echo isn't heard as a question.
 # 0 = listen again the moment ARGUS stops (best with earphones). With loudspeakers, 0.5-0.8 helps.
 ECHO_GUARD_S = env_float("ARGUS_ECHO_GUARD", 0.0)
@@ -351,11 +362,16 @@ class PromptRequest:
     t0: float = field(default_factory=time.time)  # end of speech, or when a typed prompt arrived
     stt_ms: int = None
     stream_audio: bool = True  # speak sentence by sentence (older phone apps play one clip per reply)
+    guide: bool = False        # an automatic walking-guidance update, not a question
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
 
 
 prompt_queue = queue.Queue()
 cancel_generation = threading.Event()
+# Walking guidance state (see section 7b)
+guide_lock = threading.Lock()
+guide = {"on": False, "origin": "pc", "requester": None, "last_done": 0.0, "last_text": "", "clear_said": 0.0,
+         "in_flight": False}
 
 
 # ==========================================
@@ -507,7 +523,7 @@ def play_hazard_alert():
 class SpeechItem:
     text: str
     lang: str = "en"
-    rate: str = "+8%"
+    rate: str = TTS_RATE
     req_id: str = None
     origin: str = "pc"
     requester: object = None
@@ -547,7 +563,7 @@ def _pc_speech_done(count=1):
             set_status("listening" if assistant_state == "active" else "idle")
 
 
-def speak(text, req=None, lang="en", rate="+8%", seq=0, origin=None, requester=None):
+def speak(text, req=None, lang="en", rate=TTS_RATE, seq=0, origin=None, requester=None):
     """Queue one sentence. PC replies play on this PC; phone replies are sent to the phone."""
     origin = origin or (req.origin if req else "pc")
     requester = requester if requester is not None else (req.requester if req else None)
@@ -588,6 +604,8 @@ def interrupt_tts():
 
 def clear_pending_prompts():
     _drain(prompt_queue)
+    with guide_lock:
+        guide["in_flight"] = False  # a queued guidance update may have been dropped
 
 
 def pc_synth_worker():
@@ -781,6 +799,43 @@ OCR_PATTERN = re.compile(
 CURRENCY_PATTERN = re.compile(r"\b(money|cash|taka|banknote|bank note|note is this|how much money|which note)\b")
 
 
+# Assistive mode: what kind of help does a blind user want?
+MEDICINE_PATTERN = re.compile(
+    r"\b(medicine|medicines|medication|meds|pill|pills|tablet|tablets|capsule|capsules|syrup|dose|dosage|"
+    r"prescription|drug|drugs|expiry|expiration|expire|expired|ointment|cream|drops|inhaler|vitamin|"
+    r"strip|blister|mg|ml|paracetamol|napa|antibiotic|insulin|how many (should|do) i take|when (should|do) i take)\b")
+NAV_PATTERN = re.compile(
+    r"\b(walk|walking|path|way|road|street|footpath|sidewalk|cross|crossing|ahead|in front|forward|"
+    r"safe|stairs|staircase|step|steps|door|doorway|exit|entrance|obstacle|obstacles|where am i|"
+    r"where is|where are|which way|turn|navigate|lift|elevator|corridor|hallway|room|move|go)\b")
+GUIDE_START_PATTERN = re.compile(
+    r"^(?:(?:hey|ok|okay)\s+)?(?:argus\s+)?(?:please\s+)?(?:start\s+)?(?:guide me|guiding|guidance|"
+    r"guide mode|help me walk|walk with me|navigate|navigation|start walking|i want to walk|"
+    r"lets walk|let us walk)(?:\s+please)?$")
+GUIDE_STOP_PATTERN = re.compile(
+    r"^(?:(?:hey|ok|okay)\s+)?(?:argus\s+)?(?:please\s+)?(?:stop|end|cancel|turn off|exit)\s+"
+    r"(?:guiding|guide|guidance|navigation|navigating|walking mode|guide mode)(?:\s+me)?(?:\s+please)?$"
+    r"|^(?:i have arrived|i arrived|im here|i am here|we are here|were here)$")
+
+
+def assist_task(text):
+    """Which assistive prompt fits a question: medicine, nav or general."""
+    clean = normalize_command_text(text)
+    if MEDICINE_PATTERN.search(clean):
+        return "medicine"
+    if not clean or NAV_PATTERN.search(clean):
+        return "nav"
+    return "general"
+
+
+def is_guide_start(text):
+    return bool(GUIDE_START_PATTERN.match(normalize_command_text(text)))
+
+
+def is_guide_stop(text):
+    return bool(GUIDE_STOP_PATTERN.match(normalize_command_text(text)))
+
+
 def detect_ocr_intent(text):
     return bool(OCR_PATTERN.search(normalize_command_text(text)))
 
@@ -801,19 +856,56 @@ def normalize_mode(mode):
 NO_DIALOGUE = ("Only answer the user's actual request. Never write a 'User:' or 'Assistant:' dialogue, "
                "never ask or answer questions on the user's behalf, and do not continue the conversation.")
 
+SPOKEN_STYLE = ("Talk naturally, as if speaking out loud. Never use markdown, lists, bullet points, or "
+                "robotic phrases like 'Certainly', 'As an AI' or 'I can see'.")
+LENGTH_RULE = ("Give a complete, helpful answer in two to four sentences. If the user asks you to explain, "
+               "describe in detail or tell them more, give a fuller answer of up to eight sentences. "
+               "Always finish your last sentence.")
+
+# Shared rules for every assistive prompt: the user is blind, so the answer replaces their eyes.
+BLIND_USER = ("The user is blind and is relying on you as their eyes, so they cannot look at anything you mention. "
+              "Describe the real world, not 'the image' or 'the picture'. Give positions they can act on: left, "
+              "right, straight ahead, or clock directions (12 o'clock is straight ahead), and distances in steps "
+              "(one step is about 70 cm) or arm's length. Never guess: if something is unclear, say so and tell "
+              "them how to move the camera to get a better view. Speak calmly and clearly. Never use markdown. ")
+
 SYSTEM_PROMPTS = {
     "screen": ("You are A.R.G.U.S., a friendly copilot looking at the user's screen, talking casually like a "
-               "friend on a call. Answer in one or two short spoken sentences. Never use markdown, bullet "
-               "points, or phrases like 'Certainly', 'As an AI' or 'I can see'. " + NO_DIALOGUE),
+               "friend on a call. " + LENGTH_RULE + " " + SPOKEN_STYLE + " " + NO_DIALOGUE),
     "live": ("You are A.R.G.U.S., a friendly companion looking through the user's camera, talking casually "
-             "like on a video call. Answer in one or two short spoken sentences. Never use markdown, lists "
-             "or robotic AI phrases. " + NO_DIALOGUE),
-    "assistive": ("You are A.R.G.U.S. Assistive Voice for a visually impaired user. Describe the key objects, "
-                  "read exact labels, and call out any immediate physical hazard first. Be direct, calm and "
-                  "concise (one or two sentences). " + NO_DIALOGUE),
+             "like on a video call. " + LENGTH_RULE + " " + SPOKEN_STYLE + " " + NO_DIALOGUE),
+    # Assistive mode, chosen per question by assist_task().
+    "nav": ("You are A.R.G.U.S., a sighted guide for a blind person who is walking, looking through the camera "
+            "they hold or wear at chest height. " + BLIND_USER +
+            "First, warn about anything in or near their walking path: steps, stairs, kerbs, holes, uneven "
+            "ground, wet floor, poles, walls, furniture, open doors, low branches, bicycles, vehicles or people, "
+            "with direction and distance. Then say whether it is safe to keep walking and give one clear "
+            "instruction, for example 'Stop. There are two steps down right in front of you.' or 'The path is "
+            "clear for about ten steps, keep going straight. There is a door slightly to your right.' "
+            "If they ask where something is, guide them to it step by step. Use two to four short sentences. "
+            + NO_DIALOGUE),
+    "medicine": ("You are A.R.G.U.S., reading a medicine package, strip, bottle or label for a blind person. "
+                 + BLIND_USER +
+                 "Read, exactly as printed: the medicine name, the strength (for example 500 mg), and if visible "
+                 "the dose instructions, the expiry date and any warning. Today's date is {today}; if the expiry "
+                 "date is visible and has passed, say clearly that it is expired and should not be used. Read "
+                 "numbers digit by digit when they are small or important. If the name, strength or expiry is "
+                 "not visible or too blurry, say exactly which part is missing and how to turn or move the "
+                 "package, for example 'Turn the box over' or 'Hold it about 20 centimetres from the camera'. "
+                 "Never guess a medicine name, strength or dose, and if they ask how much to take and it is not "
+                 "printed, tell them to check with a pharmacist or doctor. " + NO_DIALOGUE),
+    "general": ("You are A.R.G.U.S., the eyes of a blind user. " + BLIND_USER +
+                "Mention any hazard first. Then answer their question about what is around them: the main "
+                "objects and people and where they are, and read out any sign or label that matters. "
+                "Use two to four sentences, more only if they ask for detail. " + NO_DIALOGUE),
+    "guide": ("You are A.R.G.U.S., guiding a blind person who is walking right now. " + BLIND_USER +
+              "This is an automatic update, not a question. In one short sentence, at most two, say what "
+              "matters for their next few steps: a hazard with direction and distance, a turn, a door or a "
+              "change in the path, and whether to keep going, slow down or stop. If nothing in the path has "
+              "changed and it is clear, reply only with 'Clear ahead.' " + NO_DIALOGUE),
     "ocr": ("You are A.R.G.U.S. reading text for the user. Read the requested text, numbers or label exactly as "
-            "printed in the image, then answer the question in one or two plain spoken sentences. If part of "
-            "the text is too blurry or cut off, say which part you cannot read instead of guessing. Never use "
+            "printed in the image, then answer the question in plain spoken sentences. If part of the text is "
+            "too blurry or cut off, say which part you cannot read instead of guessing. Never use "
             "markdown. " + NO_DIALOGUE),
     "currency": ("You are a strict currency reader for BANGLADESHI TAKA (BDT) only. State the value of the "
                  "banknote in exactly one short sentence, for example 'This is a 20 Taka note.' Do not describe "
@@ -928,31 +1020,50 @@ def _process_prompt(req: PromptRequest):
     if frame is None:
         msg = ("I can't see the screen right now." if req.mode == "screen" else
                "I can't see the camera right now. Turn the camera on and ask again.")
+        if req.guide:
+            stop_guide("I can't see the camera, so I stopped guiding. Turn the camera on and say guide me.")
+            return
         answer_with_error(req, msg)
         return
 
-    currency = req.mode == "assistive" and is_currency_question(req.text)
-    asked_to_read = detect_ocr_intent(req.text)
-    ocr = req.ocr or currency or asked_to_read
-    why = "OCR button" if req.ocr else ("money question" if currency else ("asked to read" if asked_to_read else ""))
-    prompt_key = "currency" if currency else ("ocr" if ocr else ("live" if req.mode == "slt" else req.mode))
+    assistive = req.mode == "assistive"
+    task_kind = "guide" if req.guide else (assist_task(req.text) if assistive else None)
+    currency = assistive and not req.guide and is_currency_question(req.text)
+    medicine = task_kind == "medicine"
+    asked_to_read = not req.guide and detect_ocr_intent(req.text)
+    # Medicine labels always use the full-resolution image: the print is small and must be exact.
+    ocr = not req.guide and (req.ocr or currency or asked_to_read or medicine)
+    why = ("OCR button" if req.ocr else "money question" if currency else "medicine label" if medicine
+           else "asked to read" if asked_to_read else "")
+    if currency:
+        prompt_key = "currency"
+    elif assistive:
+        # Reading a label in Assistive mode keeps the blind-user rules; "read this" alone uses the OCR prompt.
+        prompt_key = task_kind if (task_kind in ("guide", "medicine") or not ocr) else "ocr"
+    else:
+        prompt_key = "ocr" if ocr else ("live" if req.mode == "slt" else req.mode)
     max_px = OCR_MAX_PX if ocr else MAX_IMAGE_PX
+    system_prompt = SYSTEM_PROMPTS[prompt_key].replace("{today}", time.strftime("%d %B %Y"))
 
     pil_image = Image.fromarray(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
     pil_image.thumbnail((max_px, max_px), Image.LANCZOS)
     task = req.text or ("Read the text in front of me." if ocr else "What is in front of me?")
-    log_event("ROUTER", f"{req.mode} | {f'OCR ({why}) ' if ocr else ''}{pil_image.width}x{pil_image.height} from {source}")
+    if not req.guide:
+        log_event("ROUTER", f"{req.mode}{f' ({prompt_key})' if assistive else ''} | "
+                            f"{f'OCR ({why}) ' if ocr else ''}{pil_image.width}x{pil_image.height} from {source}")
 
     messages = [{"role": "user", "content": [
         {"type": "image", "image": pil_image},
-        {"type": "text", "text": f"{SYSTEM_PROMPTS[prompt_key]}\n\n{GROUNDING_RULES}\n"
+        {"type": "text", "text": f"{system_prompt}\n\n{GROUNDING_RULES}\n"
                                  f"Current user request: {task}\nRespond only to this request."},
     ]}]
-    latency.start(req, ocr=int(ocr), image_px=max(pil_image.size), queue_ms=queue_ms)
-    set_status("thinking")
-    send_reply(req, {"event": "argus_reply_start", "id": req.id, "mode": req.mode, "ocr": ocr})
+    if not req.guide:  # automatic guidance updates are not questions, so they are not timed
+        latency.start(req, ocr=int(ocr), image_px=max(pil_image.size), queue_ms=queue_ms)
+        set_status("thinking")
+    if not req.guide:
+        send_reply(req, {"event": "argus_reply_start", "id": req.id, "mode": req.mode, "ocr": ocr})
 
-    rate = "+15%" if req.mode == "assistive" else "+8%"
+    rate = ASSIST_TTS_RATE if assistive else TTS_RATE
     with vlm_lock:
         text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
         image_inputs, video_inputs = process_vision_info(messages)
@@ -961,7 +1072,8 @@ def _process_prompt(req: PromptRequest):
         streamer = TextIteratorStreamer(processor.tokenizer, skip_prompt=True, skip_special_tokens=True,
                                         clean_up_tokenization_spaces=False)
         gen_kwargs = dict(**inputs, streamer=streamer, do_sample=False, repetition_penalty=1.1,
-                          max_new_tokens=OCR_MAX_NEW_TOKENS if ocr else MAX_NEW_TOKENS,
+                          max_new_tokens=(GUIDE_MAX_NEW_TOKENS if req.guide else
+                                          OCR_MAX_NEW_TOKENS if ocr else MAX_NEW_TOKENS),
                           stopping_criteria=StoppingCriteriaList([CancelCriteria()]))
         gen_error = []
 
@@ -986,7 +1098,8 @@ def _process_prompt(req: PromptRequest):
                 cancel_generation.set()
                 pending += chunk
                 break
-            send_reply(req, {"event": "argus_reply_delta", "id": req.id, "text": chunk})
+            if not req.guide:
+                send_reply(req, {"event": "argus_reply_delta", "id": req.id, "text": chunk})
             pending += chunk
             # speak each finished sentence while the rest is still being generated
             while True:
@@ -1016,6 +1129,9 @@ def _process_prompt(req: PromptRequest):
 
     answer = clean_reply(full) or "Sorry, I didn't get a clear answer. Please ask me again."
     tail = clean_reply(pending)
+    if req.guide:
+        finish_guide_update(req, answer, rate)
+        return
     if tail:
         if seq == 0:
             latency.mark(req.id, "first_sentence_ms")
@@ -1029,6 +1145,104 @@ def _process_prompt(req: PromptRequest):
     send_reply(req, {"event": "argus_reply", "id": req.id, "text": answer, "mode": req.mode, "ocr": ocr})
     log_event("Qwen2-VL", f"{'Phone reply' if req.origin == 'phone' else 'Reply'}: {answer}")
     latency.done(req.id, "text")
+
+
+# ==========================================
+# 7b. WALKING GUIDANCE ("guide me")
+# ==========================================
+# While guidance is on, ARGUS looks at the camera every few seconds in Assistive mode and says what
+# matters for the next steps. It pauses while you ask a question or ARGUS is talking, says nothing
+# when the path stays clear, and ends with "stop guiding", "okay stop", "goodbye" or the Guide button.
+
+
+def _guide_status(on, origin, requester):
+    payload = {"event": "guide_status", "on": on}
+    if origin == "phone" and requester is not None:
+        ws_manager.send_to_sync(requester, payload)
+    ws_manager.broadcast_sync(payload, dashboards_only=True)
+
+
+def set_pc_mode(mode):
+    """Switch the dashboards and the PC mic to a mode (used when "guide me" is said in another mode)."""
+    if ws_manager.pc_mode == mode:
+        return
+    ws_manager.pc_mode = mode
+    for other in list(ws_manager.clients.values()):
+        if other.kind == "dashboard":
+            other.mode = mode
+            stop_slt(other)
+    ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode}, dashboards_only=True)
+
+
+def start_guide(origin="pc", requester=None, announce=True):
+    if origin == "pc":
+        set_pc_mode("assistive")
+    with guide_lock:
+        guide.update(on=True, origin=origin, requester=requester, last_done=0.0, last_text="",
+                     clear_said=0.0, in_flight=False)
+    log_event("GUIDE", "Walking guidance on.")
+    _guide_status(True, origin, requester)
+    if announce:
+        speak("Guiding you. Hold the camera at chest height, pointing ahead. Say stop guiding when you arrive.",
+              origin=origin, requester=requester, rate=ASSIST_TTS_RATE)
+
+
+def stop_guide(message=None):
+    with guide_lock:
+        if not guide["on"]:
+            return
+        origin, requester = guide["origin"], guide["requester"]
+        guide.update(on=False, requester=None, in_flight=False)
+    log_event("GUIDE", "Walking guidance off.")
+    _guide_status(False, origin, requester)
+    if message:
+        speak(message, origin=origin, requester=requester, rate=ASSIST_TTS_RATE)
+
+
+def finish_guide_update(req, answer, rate):
+    """Speak a guidance update only when it says something new."""
+    clean = normalize_command_text(answer)
+    now = time.time()
+    with guide_lock:
+        guide["in_flight"] = False
+        guide["last_done"] = now
+        if not guide["on"]:
+            return
+        is_clear = clean in ("clear ahead", "clear", "path is clear", "the path is clear") or clean.startswith("clear ahead")
+        if is_clear:
+            # Say "clear ahead" at most every 10 seconds so the user knows guidance is still running.
+            if now - guide["clear_said"] < 10.0:
+                return
+            guide["clear_said"] = now
+        elif SequenceMatcher(None, clean, guide["last_text"]).ratio() > 0.85:
+            return  # same warning as last time
+        guide["last_text"] = clean
+    speak(answer, req, rate=rate, seq=0)
+    log_event("GUIDE", answer)
+    if HAZARD_PATTERN.search(answer) or re.search(r"\bstop\b", answer, re.IGNORECASE):
+        play_hazard_alert()
+
+
+def guide_worker():
+    """Queues a guidance update whenever ARGUS is free and the interval has passed."""
+    while system_is_running:
+        time.sleep(0.2)
+        with guide_lock:
+            if not guide["on"] or guide["in_flight"]:
+                continue
+            origin, requester = guide["origin"], guide["requester"]
+            due = time.time() - guide["last_done"] >= GUIDE_INTERVAL_S
+        if origin == "phone" and requester not in ws_manager.clients:
+            stop_guide()
+            continue
+        if not due or not prompt_queue.empty() or vlm_lock.locked() or pc_generating.is_set():
+            continue
+        if origin == "pc" and tts_playing.is_set():
+            continue  # wait until ARGUS has finished talking
+        with guide_lock:
+            guide["in_flight"] = True
+        prompt_queue.put(PromptRequest("Guide me: what matters for my next few steps?", origin, requester,
+                                       "assistive", stream_audio=False, guide=True))
 
 
 def translate_caption_to_english(text, source_label):
@@ -1131,7 +1345,7 @@ def audio_worker():
     recognizer.energy_threshold = 280
     recognizer.dynamic_energy_threshold = True
     recognizer.pause_threshold = PAUSE_THRESHOLD
-    recognizer.non_speaking_duration = min(0.3, PAUSE_THRESHOLD)
+    recognizer.non_speaking_duration = min(0.5, PAUSE_THRESHOLD)
 
     try:
         mic = sr.Microphone()
@@ -1167,7 +1381,13 @@ def audio_worker():
 
     def handle_stop_or_sleep(heard):
         global assistant_state
+        if is_guide_stop(heard):
+            interrupt_tts()
+            clear_pending_prompts()
+            stop_guide("Okay, I stopped guiding.")
+            return True
         if is_sleep_command(heard):
+            stop_guide()
             interrupt_tts()
             clear_pending_prompts()
             assistant_state = "idle"
@@ -1175,6 +1395,7 @@ def audio_worker():
             log_event("SYSTEM", "Going to sleep. Say 'Hey Argus' to wake me.")
             return True
         if is_stop_command(heard):
+            stop_guide()
             interrupt_tts()
             clear_pending_prompts()
             assistant_state = "active"
@@ -1198,7 +1419,7 @@ def audio_worker():
             try:
                 with mic as source:
                     audio = recognizer.listen(source, timeout=8.0 if not idle else 2.0,
-                                              phrase_time_limit=12.0 if not idle else 6.0)
+                                              phrase_time_limit=MAX_PHRASE_S if not idle else 6.0)
             except sr.WaitTimeoutError:
                 continue
             now = time.time()
@@ -1252,6 +1473,9 @@ def audio_worker():
             play_capture_chime()
             ws_manager.broadcast_sync({"event": "speech_recognized", "text": sanitize_transcription_for_ui(heard)},
                                       dashboards_only=True)
+            if is_guide_start(heard):
+                start_guide("pc")
+                continue
             mode = ws_manager.pc_mode if ws_manager.pc_mode != "slt" else "live"
             prompt_queue.put(PromptRequest(heard, "pc", None, mode, ocr=False,
                                            t0=speech_end, stt_ms=stt_ms))
@@ -1267,8 +1491,13 @@ def llm_worker():
             process_prompt(req)
         except Exception:
             traceback.print_exc()
-            answer_with_error(req, "Sorry, something went wrong while answering.")
+            if not req.guide:
+                answer_with_error(req, "Sorry, something went wrong while answering.")
         finally:
+            if req.guide:
+                with guide_lock:
+                    guide["in_flight"] = False
+                    guide["last_done"] = time.time()
             if not pc_busy():
                 set_status("listening" if assistant_state == "active" else "idle")
 
@@ -1290,9 +1519,10 @@ def screen_stream_worker():
 
 
 for target in (pc_synth_worker, pc_play_worker, phone_tts_worker, audio_worker, llm_worker,
-               screen_stream_worker, hardware_metrics_worker):
+               screen_stream_worker, hardware_metrics_worker, guide_worker):
     threading.Thread(target=target, daemon=True).start()
-print("[VOICE] PC wake word: 'Hey Argus' | Stop: 'Okay stop' | Sleep: 'Goodbye' | OCR: 'Read this'")
+print("[VOICE] PC wake word: 'Hey Argus' | Stop: 'Okay stop' | Sleep: 'Goodbye' | OCR: 'Read this' "
+      "| Walking guide: 'Guide me' / 'Stop guiding'")
 
 
 # ==========================================
@@ -1345,6 +1575,10 @@ async def handle_message(client, data):
                                            "text": f"Unknown mode {data.get('mode')!r}."}))
             return
         client.mode = mode
+        with guide_lock:
+            guide_origin, guide_on = guide["origin"], guide["on"]
+        if guide_on and mode != "assistive" and guide_origin == ("phone" if client.kind == "phone" else "pc"):
+            stop_guide()
         if client.kind == "dashboard":
             ws_manager.pc_mode = mode
             for other in list(ws_manager.clients.values()):  # every dashboard follows the PC mode
@@ -1405,8 +1639,18 @@ async def handle_message(client, data):
             client.slt.clear()
 
     elif event == "stop":
+        if data.get("guide", True):
+            stop_guide()
         interrupt_tts()
         clear_pending_prompts()
+
+    elif event == "guide":  # Guide button: {"event": "guide", "on": true|false}
+        if data.get("on"):
+            interrupt_tts()
+            clear_pending_prompts()
+            start_guide("phone" if client.kind == "phone" else "pc", ws if client.kind == "phone" else None)
+        else:
+            stop_guide("Okay, I stopped guiding.")
 
     elif event == "user_prompt":
         text = (data.get("text") or "").strip()
@@ -1421,6 +1665,12 @@ async def handle_message(client, data):
         print(f"[PROMPT] {origin} ({mode}{', OCR' if ocr else ''}): {text}")
         interrupt_tts()
         clear_pending_prompts()
+        if is_guide_start(text) or is_guide_stop(text):
+            if is_guide_start(text):
+                start_guide(origin, ws if origin == "phone" else None)
+            else:
+                stop_guide("Okay, I stopped guiding.")
+            return
         if origin == "pc":  # show typed questions on every open dashboard
             ws_manager.broadcast_sync({"event": "speech_recognized", "text": text, "typed": True},
                                       dashboards_only=True)
