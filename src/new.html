@@ -440,7 +440,15 @@ const HANDLERS = {
     if (!d.slt_available) $("sltStateText").textContent = "Sign language mode is not installed on the server";
     if (d.pc_mode && d.pc_mode !== state.mode) applyMode(d.pc_mode, false);
   },
-  mode_changed(d) { if (d.mode !== state.mode) applyMode(d.mode, false); },
+  mode_changed(d) {
+    if (d.language && $("sltLang").querySelector(`option[value="${d.language}"]`)) {
+      $("sltLang").value = d.language; state.sltLanguage = d.language;
+    }
+    // A voice command switched the mode: apply it and tell the server, so Sign mode starts with the
+    // selected language just like pressing the button.
+    if (d.voice) { applyMode(d.mode, true); addLog("SYSTEM", `Voice: switched to ${d.mode} mode`); }
+    else if (d.mode !== state.mode) applyMode(d.mode, false);
+  },
   screen_frame(d) { state.screenImg.src = d.image_data; },
   speech_recognized(d) { addMessage("user", d.typed ? "You (typed)" : "You", d.text); },
   argus_reply_start(d) { startReply(d.id, d.mode, d.ocr, d.route); },

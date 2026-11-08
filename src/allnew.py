@@ -378,6 +378,10 @@ prompt_queue = queue.Queue()
 cancel_generation = threading.Event()
 # Recent exchanges per origin ("pc" / "phone"), so follow-up questions like "what colour is it?" work.
 CONTEXT_TURNS = int(os.getenv("ARGUS_CONTEXT_TURNS", "4"))
+# Only conversational answers see the recent conversation. Reading money, labels and text, and walking
+# help, must come from the current picture alone: with the history in view the model repeated
+# "This is a 500 Taka note" for a 10 and a 50 Taka note.
+CONTEXT_PROMPTS = {"general", "live", "screen"}
 CONTEXT_MAX_AGE_S = env_float("ARGUS_CONTEXT_MAX_AGE", 180.0)
 conversation = {}
 conversation_lock = threading.Lock()
@@ -923,6 +927,79 @@ def assist_task(text):
     return "general"
 
 
+MODE_TARGETS = [
+    ("assistive", r"assistive|assisted|assistant|assist|assistance|blind|helper"),
+    ("slt", r"sign language|sign|sine|signing|slt"),
+    ("live", r"live|camera|video"),
+    ("screen", r"screen|desktop|computer"),
+]
+_MODE_ALT = "|".join(f"(?P<{m}>{alt})" for m, alt in MODE_TARGETS)
+MODE_COMMAND = re.compile(
+    rf"^(?:(?:hey|ok|okay)\s+)?(?:(?:{ARGUS_PHONETIC_VARIANTS})\s+)?(?:please\s+)?"
+    rf"(?:(?:switch|change|go|move|turn|open|start|enter|use|put me|take me)\s+(?:back\s+)?(?:on\s+)?(?:to|into|in|on)?\s*"
+    rf"(?:the\s+)?(?:(?:bangla|bengali|german)\s+)?(?:{_MODE_ALT})(?:\s+mode)?|(?:(?:bangla|bengali|german)\s+)?(?:{_MODE_ALT.replace('?P<', '?P<m2_')})\s+mode)"
+    rf"(?P<rest>.*)$")
+SIGN_LANG_WORDS = {"bn": r"\b(bangla|bengali|bangladeshi)\b", "de": r"\b(german|germany|deutsch)\b"}
+
+
+def parse_mode_command(text):
+    """'Argus switch to assistive and turn on guide mode' -> ("assistive", {"guide": True}).
+    Returns (None, {}) when the text is not a mode command."""
+    clean = normalize_command_text(text)
+    m = MODE_COMMAND.match(clean)
+    if not m:
+        return None, {}
+    mode = next((k for k, v in m.groupdict().items() if v and k != "rest" and not k.startswith("m2_")), None) \
+        or next((k[3:] for k, v in m.groupdict().items() if v and k.startswith("m2_")), None)
+    rest = m.group("rest") or ""
+    # "switch to sign" is a command; "switch to sign and tell me what the paper says" is not only one
+    extra = re.sub(r"\b(and|then|also|now|please|mode|language|in|with|the|turn|on|start|switch)\b", " ", rest)
+    opts = {}
+    if re.search(r"\bguid(e|ing|ance)\b|\bnavigat|\bwalk", rest):
+        opts["guide"] = True
+        extra = re.sub(r"\b(guide|guiding|guidance|navigation|navigate|walking|walk|me)\b", " ", extra)
+    for code, pat in SIGN_LANG_WORDS.items():
+        if re.search(pat, clean):
+            opts["language"] = code
+            extra = re.sub(pat, " ", extra)
+    if len(extra.split()) > 2:
+        return None, {}  # a longer request that only mentions a mode
+    return mode, opts
+
+
+MODE_NAMES = {"screen": "Screen mode", "live": "Live mode", "assistive": "Assistive mode", "slt": "Sign mode"}
+
+
+def apply_mode_command(mode, opts, origin="pc", requester=None, client=None):
+    """Switch mode by voice or text and say so, like pressing the mode button."""
+    language = opts.get("language")
+    if origin == "pc":
+        if mode != "assistive":
+            stop_guide()
+        set_pc_mode(mode, voice=True, language=language)
+    elif client is not None:
+        client.mode = mode
+        if mode != "assistive":
+            stop_guide()
+        if mode == "slt":
+            start_slt(client, language or "de")
+            if language and client.slt:
+                client.slt.set_language(language)
+        else:
+            stop_slt(client)
+        ws_manager.send_to_sync(client.ws, {"event": "mode_changed", "mode": mode, "voice": True,
+                                            "language": language})
+    forget_conversation(origin)
+    name = MODE_NAMES[mode]
+    if mode == "slt" and language:
+        name += ", " + ("Bangla" if language == "bn" else "German")
+    log_event("SYSTEM", f"Voice command: {name}.")
+    if opts.get("guide") and mode == "assistive":
+        start_guide(origin, requester, announce=True)
+        return
+    speak(f"{name}.", origin=origin, requester=requester)
+
+
 def is_guide_start(text):
     return bool(GUIDE_START_PATTERN.match(normalize_command_text(text)))
 
@@ -1221,7 +1298,8 @@ def _process_prompt(req: PromptRequest):
     messages = [{"role": "user", "content": [
         *({"type": "image", "image": im} for im in images),
         {"type": "text", "text": (f"{system_prompt}\n\n{grounding}\n" if not req.guide else f"{system_prompt}\n") +
-                                 ("" if req.guide else recent_context(req.origin) +
+                                 ("" if req.guide else
+                                  (recent_context(req.origin) if prompt_key in CONTEXT_PROMPTS else "") +
                                   f"Current user request: {task}\nRespond only to this request.")},
     ]}]
     if not req.guide:  # automatic guidance updates are not questions, so they are not timed
@@ -1342,16 +1420,19 @@ def _guide_status(on, origin, requester):
     ws_manager.broadcast_sync(payload, dashboards_only=True)
 
 
-def set_pc_mode(mode):
-    """Switch the dashboards and the PC mic to a mode (used when "guide me" is said in another mode)."""
-    if ws_manager.pc_mode == mode:
+def set_pc_mode(mode, voice=False, language=None):
+    """Switch the dashboards and the PC mic to a mode (voice command, or "guide me" in another mode)."""
+    if ws_manager.pc_mode == mode and not language:
         return
     ws_manager.pc_mode = mode
     for other in list(ws_manager.clients.values()):
         if other.kind == "dashboard":
             other.mode = mode
-            stop_slt(other)
-    ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode}, dashboards_only=True)
+            if mode != "slt":
+                stop_slt(other)
+    # The dashboard follows and, for Sign mode, starts its sign session with the chosen language.
+    ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode, "voice": voice, "language": language},
+                              dashboards_only=True)
 
 
 def start_guide(origin="pc", requester=None, announce=True):
@@ -1789,6 +1870,12 @@ def audio_worker():
             play_capture_chime()
             ws_manager.broadcast_sync({"event": "speech_recognized", "text": sanitize_transcription_for_ui(heard)},
                                       dashboards_only=True)
+            voice_mode, mode_opts = parse_mode_command(heard)
+            if voice_mode:
+                interrupt_tts()
+                clear_pending_prompts()
+                apply_mode_command(voice_mode, mode_opts, "pc")
+                continue
             if is_guide_start(heard):
                 start_guide("pc")
                 continue
@@ -1841,7 +1928,8 @@ for target in (pc_synth_worker, pc_play_worker, phone_tts_worker, audio_worker, 
                screen_stream_worker, hardware_metrics_worker, guide_worker):
     threading.Thread(target=target, daemon=True).start()
 print("[VOICE] PC wake word: 'Hey Argus' | Stop: 'Okay stop' | Sleep: 'Goodbye' | OCR: 'Read this' "
-      "| Walking guide: 'Guide me' / 'Stop guiding' | Repeat: 'Say that again'")
+      "| Walking guide: 'Guide me' / 'Stop guiding' | Repeat: 'Say that again' "
+      "| Modes: 'Switch to assistive / live / screen / sign mode'")
 
 
 # ==========================================
@@ -1988,6 +2076,10 @@ async def handle_message(client, data):
         clear_pending_prompts()
         if is_repeat_command(text):
             repeat_last(origin, ws if origin == "phone" else None)
+            return
+        voice_mode, mode_opts = parse_mode_command(text)
+        if voice_mode:
+            apply_mode_command(voice_mode, mode_opts, origin, ws if origin == "phone" else None, client)
             return
         if is_guide_start(text) or is_guide_stop(text):
             if is_guide_start(text):

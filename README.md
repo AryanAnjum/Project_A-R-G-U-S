@@ -179,6 +179,8 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
   *"I have arrived"* ends it.
 - In Assistive mode, questions about a medicine (*"what is this medicine"*, *"when does it expire"*)
   read the label from the full-resolution image and never guess a name or dose.
+- *"Switch to assistive / live / screen / sign mode"* changes mode by voice (or typed), like the buttons.
+  Add *"and turn on guide mode"* for walking guidance, or say *"Bangla sign mode"* / *"German sign mode"*.
 - *"Say that again"* (or *"repeat that"*, *"what did you say"*) repeats the last reply.
 - *"Okay stop"* interrupts (and ends guidance). *"Goodbye"* puts it back to sleep.
 
