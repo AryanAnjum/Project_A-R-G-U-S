@@ -39,6 +39,10 @@ END_GAP_S = float(os.getenv("ARGUS_SLT_END_GAP", "1.0"))
 MIN_SIGN_S = float(os.getenv("ARGUS_SLT_MIN_SECONDS", "0.8"))
 MAX_SIGN_S = float(os.getenv("ARGUS_SLT_MAX_SECONDS", "15.0"))
 NUM_BEAMS = int(os.getenv("ARGUS_SLT_BEAMS", "5"))
+# Confidence = average per-word probability of the chosen sentence, in percent. Below this the caption is
+# replaced by "I'm not sure, please sign again" (the guess is still shown small). 0 turns it off.
+# Calibrate with: python src/slt_test_video.py <videos> --lang bn  (it prints the confidence of each).
+MIN_CONFIDENCE = float(os.getenv("ARGUS_SLT_MIN_CONF", "35"))
 HOLISTIC_TASK = os.getenv("ARGUS_SLT_HOLISTIC", os.path.join(DATA_ROOT, "models", "holistic_landmarker.task"))
 I3D_CKPT = os.getenv("ARGUS_SLT_I3D", os.path.join(DATA_ROOT, "models", "bsl1k.pth.tar"))
 I3D_RESIZE, I3D_CROP = 256, 224
@@ -171,6 +175,12 @@ class SLTEngine:
 
     def translate(self, code, keypoints, rgb_frames=None):
         """keypoints: (T, V, 3) at 25 fps. rgb_frames: (T, 224, 224, 3) uint8 RGB or None."""
+        return self.translate_scored(code, keypoints, rgb_frames)[0]
+
+    def translate_scored(self, code, keypoints, rgb_frames=None):
+        """Like translate(), but returns (text, confidence %). Confidence is the average per-token
+        probability of the chosen beam: high for signing close to the training data, low for signs
+        the model has never seen."""
         torch = self.torch
         with self.lock:
             model, vocab, needs_rgb = self._load(code)
@@ -186,8 +196,18 @@ class SLTEngine:
                 n = int(PoseEncoder.out_lengths(torch.tensor(feats.shape[1])))
                 rgb = torch.from_numpy(resample(clips, n))[None].to(self.device)
             with torch.no_grad():
-                out = model.translate(feats, lengths, num_beams=NUM_BEAMS, rgb=rgb)
-            return vocab.decode(out.tolist())[0]
+                embeds, mask = model.encode(feats, lengths, rgb)
+                out = model.text.generate(**model._text_inputs(embeds, mask), num_beams=NUM_BEAMS,
+                                          max_new_tokens=80, length_penalty=1.0, no_repeat_ngram_size=3,
+                                          return_dict_in_generate=True, output_scores=True)
+            text = vocab.decode(out.sequences.tolist())[0]
+            score = getattr(out, "sequences_scores", None)
+            if score is not None:  # beam search: sum of log-probs / length
+                confidence = float(torch.exp(score[0]).item()) * 100
+            else:  # greedy: average the chosen tokens' probabilities
+                probs = [torch.softmax(s_, -1).max().item() for s_ in out.scores]
+                confidence = 100 * float(np.mean(probs)) if probs else 0.0
+            return text, round(confidence, 1)
 
 
 class SignSession:
@@ -345,12 +365,15 @@ class SignSession:
         rgb_frames = None
         if rgb:
             rgb_frames = np.stack(rgb)[resample_index(times)]
-        text = self.engine.translate(self.language, seq, rgb_frames)
+        text, confidence = self.engine.translate_scored(self.language, seq, rgb_frames)
         ms = int((time.time() - start) * 1000)
         lang = LANGUAGES[self.language]
-        print(f"[SLT] {lang.sign_language} {duration:.1f}s -> {text!r} ({ms} ms)")
+        unsure = MIN_CONFIDENCE > 0 and confidence < MIN_CONFIDENCE
+        print(f"[SLT] {lang.sign_language} {duration:.1f}s -> {text!r} (confidence {confidence:.0f}%"
+              f"{', below ' + str(int(MIN_CONFIDENCE)) + '%: not sure' if unsure else ''}, {ms} ms)")
         self.on_event({"event": "slt_caption", "language": lang.code, "sign_language": lang.sign_language,
-                       "text": text, "seconds": round(duration, 1), "translate_ms": ms,
+                       "text": "" if unsure else text, "guess": text, "unsure": unsure,
+                       "confidence": confidence, "seconds": round(duration, 1), "translate_ms": ms,
                        "frames": len(seq), "tts_lang": lang.tts_lang})
         self.on_event({"event": "slt_status", "state": "waiting", "seconds": 0})
 

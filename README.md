@@ -166,6 +166,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 | `ARGUS_SLT_DE_CKPT` / `ARGUS_SLT_BN_CKPT` | see above | Sign language checkpoints |
 | `ARGUS_SLT_ENGLISH` | `1` | Also translate sign captions into English with Qwen |
 | `ARGUS_SLT_SPEAK` | `en` | Speak captions in `en`, the `source` language, or `off` |
+| `ARGUS_SLT_MIN_CONF` | `35` | Sign captions below this confidence (%) say "I'm not sure, please sign again". 0 = off. Calibrate with `src/slt_test_video.py` |
 | `ARGUS_SLT_END_GAP` | `1.0` | Seconds without hands that end a signed sentence |
 | `ARGUS_LATENCY_LOG` | `logs/latency.csv` | Where per-reply timings are written |
 
@@ -178,6 +179,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
   *"I have arrived"* ends it.
 - In Assistive mode, questions about a medicine (*"what is this medicine"*, *"when does it expire"*)
   read the label from the full-resolution image and never guess a name or dose.
+- *"Say that again"* (or *"repeat that"*, *"what did you say"*) repeats the last reply.
 - *"Okay stop"* interrupts (and ends guidance). *"Goodbye"* puts it back to sleep.
 
 ## Repository layout
@@ -186,6 +188,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 src/allnew.py        server: models, mic, WebSocket API, modes
 src/argus_slt.py     live sign language sessions (MediaPipe -> ARGUS-SLT)
 src/argus_tts.py     Piper / edge-tts voices
+src/slt_test_video.py  run sign videos through the live pipeline, prints captions + confidence
 src/new.html         dashboard (offline: no CDN fonts or icons)
 sign_language/       ARGUS-SLT training and evaluation code
 train500.py          phased LoRA training on the 500 GB dataset

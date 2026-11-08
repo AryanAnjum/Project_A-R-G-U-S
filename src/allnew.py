@@ -778,6 +778,33 @@ SLEEP_PHRASES = {"bye", "goodbye", "good bye", "sleep", "go to sleep", "thats al
                  "end conversation", "okay bye", "ok bye", "okay goodbye", "ok goodbye"}
 
 
+REPEAT_PHRASES = {"say that again", "say it again", "repeat", "repeat that", "repeat it", "repeat please",
+                  "please repeat", "come again", "pardon", "sorry what", "what did you say",
+                  "what was that", "can you repeat", "can you repeat that", "could you repeat that",
+                  "say again", "one more time", "tell me again"}
+
+
+def is_repeat_command(text):
+    clean = normalize_command_text(text)
+    clean = re.sub(rf"^(?:(?:hey|ok|okay)\s+)?(?:{ARGUS_PHONETIC_VARIANTS})\s+", "", clean)
+    clean = re.sub(r"^(?:please|sorry|can you|could you)\s+(?=repeat|say)", "", clean)
+    return clean in REPEAT_PHRASES
+
+
+# Last thing ARGUS said to each origin ("pc" / "phone"), for "say that again".
+last_said = {}
+
+
+def repeat_last(origin, requester=None):
+    item = last_said.get(origin)
+    if not item:
+        speak("I haven't said anything yet.", origin=origin, requester=requester)
+        return
+    text, lang = item
+    log_event("SYSTEM", f"Repeating: {text}")
+    speak(text, lang=lang, origin=origin, requester=requester)
+
+
 def is_stop_command(text):
     clean = normalize_command_text(text)
     if clean in STOP_PHRASES:
@@ -1201,7 +1228,8 @@ def _process_prompt(req: PromptRequest):
         latency.start(req, ocr=int(ocr), image_px=max(pil_image.size), queue_ms=queue_ms)
         set_status("thinking")
     if not req.guide:
-        send_reply(req, {"event": "argus_reply_start", "id": req.id, "mode": req.mode, "ocr": ocr})
+        send_reply(req, {"event": "argus_reply_start", "id": req.id, "mode": req.mode, "ocr": ocr,
+                         "route": prompt_key})
 
     rate = ASSIST_TTS_RATE if assistive else TTS_RATE
     with vlm_lock:
@@ -1288,9 +1316,11 @@ def _process_prompt(req: PromptRequest):
     if req.mode == "assistive" and HAZARD_PATTERN.search(answer):
         play_hazard_alert()
 
-    send_reply(req, {"event": "argus_reply", "id": req.id, "text": answer, "mode": req.mode, "ocr": ocr})
+    send_reply(req, {"event": "argus_reply", "id": req.id, "text": answer, "mode": req.mode, "ocr": ocr,
+                     "route": prompt_key})
     remember(req.origin, "user", req.text)
     remember(req.origin, "argus", answer)
+    last_said[req.origin] = (answer, "en")
     with guide_lock:
         guide["last_done"] = time.time()  # guidance resumes a moment after this answer
     log_event("Qwen2-VL", f"{'Phone reply' if req.origin == 'phone' else 'Reply'}: {answer}")
@@ -1487,7 +1517,12 @@ def finish_guide_update(req, raw, rate):
         play_hazard_alert()  # beep first so the warning is noticed
     speak(answer, req, rate=rate, seq=0)
     remember(req.origin, "argus", answer)
+    last_said[req.origin] = (answer, "en")
     log_event("GUIDE", answer)
+    payload = {"event": "guide_update", "text": answer, "warning": urgent}
+    if req.origin == "phone" and req.requester is not None:
+        ws_manager.send_to_sync(req.requester, payload)
+    ws_manager.broadcast_sync(payload, dashboards_only=True)
 
 
 def guide_worker():
@@ -1557,6 +1592,16 @@ def on_slt_event(client, event):
 
 def finish_caption(client, event):
     lang = argus_slt.LANGUAGES[event["language"]]
+    origin = "phone" if client.kind == "phone" else "pc"
+    requester = client.ws if origin == "phone" else None
+    if event.get("unsure"):
+        log_event("SLT", f"{lang.sign_language}: not sure ({event.get('confidence', 0):.0f}%), "
+                         f"best guess {event.get('guess', '')!r}")
+        if SLT_SPEAK != "off":
+            msg = "I'm not sure. Please sign again."
+            last_said[origin] = (msg, "en")
+            speak(msg, lang="en", origin=origin, requester=requester)
+        return
     english = None
     if SLT_ENGLISH and lang.code != "en" and event["text"]:
         try:
@@ -1573,8 +1618,8 @@ def finish_caption(client, event):
         text, tts_lang = english, "en"
     else:
         text, tts_lang = event["text"], lang.tts_lang
-    origin = "phone" if client.kind == "phone" else "pc"
-    speak(text, lang=tts_lang, origin=origin, requester=client.ws if origin == "phone" else None)
+    last_said[origin] = (text, tts_lang)
+    speak(text, lang=tts_lang, origin=origin, requester=requester)
 
 
 # ==========================================
@@ -1747,6 +1792,9 @@ def audio_worker():
             if is_guide_start(heard):
                 start_guide("pc")
                 continue
+            if is_repeat_command(heard):
+                repeat_last("pc")
+                continue
             mode = ws_manager.pc_mode if ws_manager.pc_mode != "slt" else "live"
             prompt_queue.put(PromptRequest(heard, "pc", None, mode, ocr=False,
                                            t0=speech_end, stt_ms=stt_ms))
@@ -1793,7 +1841,7 @@ for target in (pc_synth_worker, pc_play_worker, phone_tts_worker, audio_worker, 
                screen_stream_worker, hardware_metrics_worker, guide_worker):
     threading.Thread(target=target, daemon=True).start()
 print("[VOICE] PC wake word: 'Hey Argus' | Stop: 'Okay stop' | Sleep: 'Goodbye' | OCR: 'Read this' "
-      "| Walking guide: 'Guide me' / 'Stop guiding'")
+      "| Walking guide: 'Guide me' / 'Stop guiding' | Repeat: 'Say that again'")
 
 
 # ==========================================
@@ -1938,6 +1986,9 @@ async def handle_message(client, data):
         print(f"[PROMPT] {origin} ({mode}{', OCR' if ocr else ''}): {text}")
         interrupt_tts()
         clear_pending_prompts()
+        if is_repeat_command(text):
+            repeat_last(origin, ws if origin == "phone" else None)
+            return
         if is_guide_start(text) or is_guide_stop(text):
             if is_guide_start(text):
                 start_guide(origin, ws if origin == "phone" else None)
