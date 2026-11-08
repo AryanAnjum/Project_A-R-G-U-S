@@ -222,6 +222,19 @@ main {
 .msg.system .body { color: var(--muted); }
 .tag { font-size: 9px; padding: 1px 5px; border-radius: 3px; background: var(--accent); color: var(--on-accent); letter-spacing: .04em; }
 .tag.sign { background: var(--blue); color: var(--on-accent); }
+.tag.route { background: var(--surface-2); color: var(--muted); border: 1px solid var(--border); }
+.tag.warn { background: #c62828; color: #fff; }
+.msg.unsure .body { color: var(--muted); font-style: italic; }
+.demo-btn { height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--muted); font-weight: 700; font-size: 12px; }
+.demo-btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+/* Presenting: everything a viewer reads is larger */
+body.demo .msg { font-size: 19px; }
+body.demo .msg .who { font-size: 12px; }
+body.demo .tag { font-size: 11px; }
+body.demo .caption .src { font-size: 34px; }
+body.demo .caption .en { font-size: 24px; }
+body.demo .caption .meta { font-size: 12px; }
+body.demo #promptInput { font-size: 17px; }
 
 @media (prefers-reduced-motion: reduce) { body { transition: none; } }
 @media (max-width: 1300px) { main { grid-template-columns: 220px minmax(0, 1fr) 270px; gap: 12px; } }
@@ -268,6 +281,7 @@ main {
   </div>
   <div class="header-right">
     <span id="gpuLabel">GPU --</span>
+    <button type="button" class="demo-btn" id="demoBtn" title="Large text for presenting: bigger chat and captions" aria-pressed="false">Aa</button>
     <button type="button" class="theme-btn" id="themeBtn" title="Switch between night and day colors"><svg class="icon sun"><use href="#i-sun"/></svg><svg class="icon moon"><use href="#i-moon"/></svg></button>
     <span class="badge off" id="connBadge"><span class="dot"></span><span id="connText">CONNECTING</span></span>
   </div>
@@ -429,9 +443,10 @@ const HANDLERS = {
   mode_changed(d) { if (d.mode !== state.mode) applyMode(d.mode, false); },
   screen_frame(d) { state.screenImg.src = d.image_data; },
   speech_recognized(d) { addMessage("user", d.typed ? "You (typed)" : "You", d.text); },
-  argus_reply_start(d) { startReply(d.id, d.mode, d.ocr); },
+  argus_reply_start(d) { startReply(d.id, d.mode, d.ocr, d.route); },
   argus_reply_delta(d) { appendReply(d.id, d.text); },
-  argus_reply(d) { finishReply(d.id, d.text, d.mode, d.ocr); },
+  argus_reply(d) { finishReply(d.id, d.text, d.mode, d.ocr, d.route); },
+  guide_update(d) { addMessage("argus", "Guide", d.text, d.warning ? "WARNING" : "GUIDE"); },
   perception_log(d) { addLog(d.engine || "SYSTEM", d.text); },
   system_metrics(d) { updateMetrics(d); },
   latency(d) { updateLatency(d); },
@@ -457,7 +472,8 @@ function addMessage(kind, who, text, tag) {
   head.textContent = who;
   if (tag) {
     const t = document.createElement("span");
-    t.className = "tag" + (tag === "SIGN" ? " sign" : "");
+    t.className = "tag" + (tag === "SIGN" ? " sign" : tag === "WARNING" ? " warn" :
+      ["WALKING", "ROAD CROSSING", "MEDICINE", "DESCRIBE", "TAKA", "GUIDE"].includes(tag) ? " route" : "");
     t.textContent = tag;
     head.appendChild(t);
   }
@@ -470,18 +486,22 @@ function addMessage(kind, who, text, tag) {
   return body;
 }
 
-function startReply(id, mode, ocr) {
+// Which path answered a question, shown as a small label on the reply.
+const ROUTE_LABELS = { nav: "WALKING", crossing: "ROAD CROSSING", medicine: "MEDICINE", general: "DESCRIBE",
+                       currency: "TAKA", ocr: "OCR", screen: null, live: null };
+function startReply(id, mode, ocr, route) {
   if (id && state.timingReplyId !== id) resetSentenceTimings(id);
   state.ocrReplyActive = !!ocr; updateFeedTag();
-  if (!state.replies.has(id)) state.replies.set(id, addMessage("argus", "ARGUS", "", ocr ? "OCR" : null));
+  const label = route in ROUTE_LABELS ? ROUTE_LABELS[route] : (ocr ? "OCR" : null);
+  if (!state.replies.has(id)) state.replies.set(id, addMessage("argus", "ARGUS", "", label));
 }
 function appendReply(id, text) {
   if (!state.replies.has(id)) startReply(id);
   state.replies.get(id).textContent += text;
   chat.scrollTop = chat.scrollHeight;
 }
-function finishReply(id, text, mode, ocr) {
-  if (!state.replies.has(id)) startReply(id, mode, ocr);
+function finishReply(id, text, mode, ocr, route) {
+  if (!state.replies.has(id)) startReply(id, mode, ocr, route);
   state.replies.get(id).textContent = text;
   state.replies.delete(id);
   if (state.ocrReplyActive) { state.ocrReplyActive = false; updateFeedTag(); }
@@ -800,11 +820,29 @@ function setSltState(d) {
 
 function showCaption(d) {
   $("caption").classList.add("on");
+  const conf = typeof d.confidence === "number" ? ` · ${Math.round(d.confidence)}% sure` : "";
+  $("captionMeta").textContent = `${d.sign_language} → ${d.language.toUpperCase()} · ${d.seconds}s of signing · ${d.translate_ms} ms${conf}`;
+  if (d.unsure) {
+    $("captionSrc").textContent = "Not sure, please sign again";
+    $("captionEn").textContent = d.guess ? `Best guess: ${d.guess}` : "";
+    const body = addMessage("argus", "Sign", `Not sure, please sign again (best guess: ${d.guess || "-"})`, "SIGN");
+    body.parentElement.classList.add("unsure");
+    return;
+  }
   $("captionSrc").textContent = d.text || "(no translation)";
   $("captionEn").textContent = "";
-  $("captionMeta").textContent = `${d.sign_language} → ${d.language.toUpperCase()} · ${d.seconds}s of signing · ${d.translate_ms} ms`;
   addMessage("argus", "Sign", d.text, "SIGN");
 }
+
+/* ---------- Presenting (large text) ---------- */
+function setDemo(on) {
+  document.body.classList.toggle("demo", on);
+  $("demoBtn").classList.toggle("on", on);
+  $("demoBtn").setAttribute("aria-pressed", String(on));
+  try { localStorage.setItem("argus-demo", on ? "1" : "0"); } catch {}
+}
+$("demoBtn").addEventListener("click", () => setDemo(!document.body.classList.contains("demo")));
+try { if (localStorage.getItem("argus-demo") === "1") setDemo(true); } catch {}
 
 /* ---------- Start ---------- */
 addMessage("system", "System", 'Online. Say "Hey Argus" or type a question. Turn on OCR (or say "read this") to read small text at full resolution.');
