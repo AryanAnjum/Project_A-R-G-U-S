@@ -251,3 +251,4 @@ argus_phased_adapters/
 
 # Per-reply latency logs written by the server
 logs/
+/Ban-Sign-Sent-9K-V1
