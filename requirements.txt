@@ -27,6 +27,10 @@ fastapi
 uvicorn[standard]
 websockets
 
+# Connect phone panel: QR code and automatic discovery of this PC by the phone apps (src/argus_connect.py)
+segno
+zeroconf
+
 # Desktop window (python argus_desktop.py); uses Edge WebView2 on Windows
 pywebview
 

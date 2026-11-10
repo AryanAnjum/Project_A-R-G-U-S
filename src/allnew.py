@@ -47,7 +47,7 @@ import speech_recognition as sr
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from faster_whisper import WhisperModel
 from peft import PeftModel
 from PIL import Image
@@ -55,6 +55,7 @@ from qwen_vl_utils import process_vision_info
 from transformers import (AutoProcessor, Qwen2VLForConditionalGeneration, StoppingCriteria,
                           StoppingCriteriaList, TextIteratorStreamer)
 
+import argus_connect
 import argus_tts
 
 try:
@@ -162,6 +163,9 @@ class Client:
     mode: str = "screen"
     slt: object = None       # SignSession while the client is in SLT mode
     audio_queue: bool = False  # phone app can queue several audio clips per reply
+    name: str = ""           # phone's name and platform ("ios" / "android"), from its hello
+    platform: str = ""
+    since: float = field(default_factory=time.time)
 
 
 class ConnectionManager:
@@ -181,6 +185,18 @@ class ConnectionManager:
             client.slt.close()
         if client:
             print(f"[SERVER] {client.kind.capitalize()} disconnected")
+            if client.kind == "phone":
+                self.announce_phones(f"{client.name or 'Phone'} disconnected")
+
+    def phones(self):
+        """Phones connected right now, for the dashboard's Connect phone panel."""
+        return [{"name": c.name or "Phone", "platform": c.platform, "mode": c.mode,
+                 "address": getattr(c.ws.client, "host", "") if c.ws.client else "",
+                 "seconds": int(time.time() - c.since)}
+                for c in list(self.clients.values()) if c.kind == "phone"]
+
+    def announce_phones(self, note=None):
+        self.broadcast_sync({"event": "phones", "phones": self.phones(), "note": note}, dashboards_only=True)
 
     def dashboards(self):
         return [c.ws for c in list(self.clients.values()) if c.kind == "dashboard"]
@@ -219,9 +235,15 @@ ws_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ws_manager.loop = asyncio.get_running_loop()
+    # Announce this PC on the local network so the phone apps can find it (see argus_connect.py).
+    stop_advertising = threading.Event()
+    threading.Thread(target=argus_connect.keep_advertising, args=(SERVER_PORT, stop_advertising),
+                     daemon=True).start()
     yield
+    stop_advertising.set()
 
 
+SERVER_PORT = int(os.getenv("ARGUS_PORT", "8000"))
 app = FastAPI(title="A.R.G.U.S. Multimodal Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -1948,9 +1970,26 @@ async def serve_dashboard():
         return HTMLResponse(content="<h1>new.html not found. Keep it next to allnew.py.</h1>", status_code=500)
 
 
+@app.get("/connect/info")
+async def connect_info():
+    """What the dashboard's Connect phone panel shows: this PC's addresses, the pairing link, phones."""
+    info = argus_connect.connect_info(SERVER_PORT)
+    info["phones"] = ws_manager.phones()
+    return info
+
+
+@app.get("/connect/qr.svg")
+async def connect_qr():
+    svg = argus_connect.qr_svg(argus_connect.connect_info(SERVER_PORT)["link"])
+    if svg is None:
+        return Response(status_code=404)
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+
+
 def hello_payload(client):
     return {
         "event": "hello",
+        "server_name": argus_connect.pc_name(),
         "modes": list(MODES),
         "pc_mode": ws_manager.pc_mode,
         "mode": client.mode,
@@ -1969,13 +2008,18 @@ async def handle_message(client, data):
     global mic_enabled
     event = data.get("event")
     ws = client.ws
-    if data.get("origin") == "phone" or data.get("client") == "phone":
-        client.kind = "phone"
+    if (data.get("origin") == "phone" or data.get("client") == "phone") and client.kind != "phone":
+        client.kind = "phone"  # first message from a phone app (older apps never send a hello)
+        client.name = str(data.get("device") or "Phone")[:40]
+        client.platform = str(data.get("platform") or "")[:16]
+        log_event("SYSTEM", f"{client.name} connected")
+        ws_manager.announce_phones(f"{client.name} connected")
 
     if event == "hello":
         client.audio_queue = "audio_queue" in (data.get("features") or [])
         if client.kind == "phone":
             client.mode = normalize_mode(data.get("mode")) or "live"
+            ws_manager.announce_phones()
         await ws.send_text(json.dumps(hello_payload(client)))
 
     elif event == "set_mode":
@@ -2001,6 +2045,7 @@ async def handle_message(client, data):
             ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode}, dashboards_only=True)
         else:
             ws_manager.send_to_sync(ws, {"event": "mode_changed", "mode": mode})
+            ws_manager.announce_phones()
         if mode == "slt":
             start_slt(client, data.get("language", "de"))
         else:
@@ -2122,5 +2167,5 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n[SYSTEM] A.R.G.U.S. running at http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("ARGUS_PORT", "8000")), ws_max_size=32 * 1024 * 1024)
+    print(f"\n[SYSTEM] A.R.G.U.S. running at http://localhost:{SERVER_PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, ws_max_size=32 * 1024 * 1024)

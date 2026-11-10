@@ -91,7 +91,24 @@ This opens A.R.G.U.S. as a desktop app in its own window (or double-click `ARGUS
 loading screen shows each step while the models load, and closing the window stops the
 backend. It is the same backend the phone uses, so the desktop app and the Android app can
 be connected at the same time. Add `--browser` to use the default browser instead, or run
-`python allnew.py` and open `http://localhost:8000` as before. In the Android app, enter `ws://<this PC's IP>:8000/ws` as the server address.
+`python allnew.py` and open `http://localhost:8000` as before. 
+### Connect a phone
+
+The Android and iPhone apps are companions: they send your voice and the camera to this PC and
+show and speak the answers. Every model runs on the PC, so the phone only needs to be on the
+same Wi-Fi (or the PC on the phone's hotspot).
+
+Press **Connect phone** at the top of the PC app. The panel shows:
+
+- a **QR code** the phone app scans to connect,
+- this PC's **address** to type in by hand (`<IP>:8000`, the app uses `ws://<IP>:8000/ws`),
+- the **phones connected** right now and the mode each one is in.
+
+The PC also announces itself on the network (Bonjour / mDNS, `_argus._tcp`), so the iPhone app
+lists it under "PCs on this network" without typing anything. If a phone can't connect, allow
+Python / A.R.G.U.S. through Windows Firewall on private networks. The code is in
+`src/argus_connect.py`; it needs the small `segno` and `zeroconf` packages from `requirements.txt`,
+and without them the panel still shows the address.
 
 **First run needs internet once.** It downloads Qwen2-VL, Whisper, the Piper voices and the
 MediaPipe holistic model. After that everything runs offline. The Piper voices go to
@@ -190,6 +207,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 src/allnew.py        server: models, mic, WebSocket API, modes
 src/argus_slt.py     live sign language sessions (MediaPipe -> ARGUS-SLT)
 src/argus_tts.py     Piper / edge-tts voices
+src/argus_connect.py Connect phone: PC address, QR code, network discovery
 src/slt_test_video.py  run sign videos through the live pipeline, prints captions + confidence
 src/new.html         dashboard (offline: no CDN fonts or icons)
 sign_language/       ARGUS-SLT training and evaluation code

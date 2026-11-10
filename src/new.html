@@ -227,6 +227,31 @@ main {
 .msg.unsure .body { color: var(--muted); font-style: italic; }
 .demo-btn { height: 28px; padding: 0 9px; border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--muted); font-weight: 700; font-size: 12px; }
 .demo-btn.on { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+/* Connect phone */
+.phone-btn { height: 30px; padding: 0 10px; display: inline-flex; align-items: center; gap: 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); color: var(--muted); font-size: 12px; font-weight: 600; }
+.phone-btn:hover { color: var(--ink); background: var(--hover); }
+.phone-btn .icon { width: 14px; height: 14px; }
+.phone-btn.linked { color: var(--green); border-color: var(--green); background: var(--green-bg); }
+.phone-dialog { width: min(680px, calc(100vw - 32px)); margin: auto; padding: 0; border: 1px solid var(--border-strong); border-radius: 10px; background: var(--surface); color: var(--text); box-shadow: 0 18px 60px rgba(0, 0, 0, .45); }
+.phone-dialog::backdrop { background: rgba(0, 0, 0, .55); }
+.phone-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 18px; border-bottom: 1px solid var(--border); }
+.phone-head h2 { margin: 0; font-size: 15px; font-weight: 650; color: var(--ink); }
+.phone-head .theme-btn { border: none; background: transparent; }
+.phone-body { display: grid; grid-template-columns: 220px minmax(0, 1fr); gap: 20px; padding: 18px; }
+.phone-qr { width: 220px; height: 220px; border-radius: 8px; background: #fff; display: grid; place-items: center; color: #555; font-size: 12px; text-align: center; padding: 10px; }
+.phone-qr img { width: 100%; height: 100%; display: block; }
+.phone-steps { margin: 0 0 14px; padding-left: 18px; color: var(--body); font-size: 13px; line-height: 1.55; }
+.phone-label { font-size: 11px; font-weight: 600; letter-spacing: .04em; text-transform: uppercase; color: var(--muted); margin: 0 0 6px; }
+.phone-addr { display: flex; align-items: center; gap: 8px; margin-bottom: 6px; }
+.phone-addr code { flex: 1; min-width: 0; font-family: var(--mono); font-size: 13px; color: var(--ink); background: var(--surface-2); border: 1px solid var(--border); border-radius: 5px; padding: 6px 9px; overflow-wrap: anywhere; }
+.phone-note { font-size: 12px; color: var(--muted); line-height: 1.5; margin: 8px 0 0; }
+.phone-list { border-top: 1px solid var(--border); padding: 14px 18px 18px; }
+.phone-row { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface-2); font-size: 13px; color: var(--ink); margin-top: 6px; }
+.phone-row .dot { color: var(--green); }
+.phone-row .meta { margin-left: auto; font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.phone-empty { font-size: 13px; color: var(--muted); }
+@media (max-width: 640px) { .phone-body { grid-template-columns: 1fr; justify-items: center; } .phone-btn span { display: none; } }
+
 /* Presenting: everything a viewer reads is larger */
 body.demo .msg { font-size: 19px; }
 body.demo .msg .who { font-size: 12px; }
@@ -270,6 +295,7 @@ body.demo #promptInput { font-size: 17px; }
   <symbol id="i-play" viewBox="0 0 24 24"><path d="M6 4l14 8-14 8z"/></symbol>
   <symbol id="i-sun" viewBox="0 0 24 24"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.9 4.9l1.4 1.4M17.7 17.7l1.4 1.4M2 12h2M20 12h2M4.9 19.1l1.4-1.4M17.7 6.3l1.4-1.4"/></symbol>
   <symbol id="i-moon" viewBox="0 0 24 24"><path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/></symbol>
+  <symbol id="i-phone" viewBox="0 0 24 24"><rect x="6" y="2" width="12" height="20" rx="2.5"/><path d="M10.5 18.5h3"/></symbol>
   <symbol id="i-x" viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></symbol>
 </svg>
 
@@ -281,11 +307,36 @@ body.demo #promptInput { font-size: 17px; }
   </div>
   <div class="header-right">
     <span id="gpuLabel">GPU --</span>
+    <button type="button" class="phone-btn" id="phoneBtn" title="Connect a phone on the same network"><svg class="icon"><use href="#i-phone"/></svg><span id="phoneBtnText">Connect phone</span></button>
     <button type="button" class="demo-btn" id="demoBtn" title="Large text for presenting: bigger chat and captions" aria-pressed="false">Aa</button>
     <button type="button" class="theme-btn" id="themeBtn" title="Switch between night and day colors"><svg class="icon sun"><use href="#i-sun"/></svg><svg class="icon moon"><use href="#i-moon"/></svg></button>
     <span class="badge off" id="connBadge"><span class="dot"></span><span id="connText">CONNECTING</span></span>
   </div>
 </header>
+
+<dialog class="phone-dialog" id="phoneDialog" aria-labelledby="phoneTitle">
+  <div class="phone-head">
+    <h2 id="phoneTitle">Connect a phone</h2>
+    <button type="button" class="theme-btn" id="phoneClose" title="Close"><svg class="icon"><use href="#i-x"/></svg></button>
+  </div>
+  <div class="phone-body">
+    <div class="phone-qr" id="phoneQr">Loading…</div>
+    <div>
+      <ol class="phone-steps">
+        <li>Put the phone on the <b>same Wi-Fi</b> as this PC, or join this PC to the phone's hotspot.</li>
+        <li>Open the <b>A.R.G.U.S.</b> app. It lists this PC by itself: tap <b id="phonePcName">this PC</b>.</li>
+        <li>If it isn't listed, tap <b>Scan QR code</b> in the app, or type the address below.</li>
+      </ol>
+      <p class="phone-label">This PC's address</p>
+      <div id="phoneAddrs"></div>
+      <p class="phone-note" id="phoneNote">The phone only sends voice and camera and shows the answers. All models run on this PC. If the phone can't connect, allow A.R.G.U.S. (Python) through Windows Firewall on private networks.</p>
+    </div>
+  </div>
+  <div class="phone-list">
+    <p class="phone-label">Connected phones</p>
+    <div id="phoneList"><div class="phone-empty">No phone connected yet.</div></div>
+  </div>
+</dialog>
 
 <main>
   <!-- LEFT -->
@@ -413,6 +464,7 @@ function connect() {
   socket.onopen = () => {
     setConnected(true);
     send({ event: "hello", client: "dashboard" });
+    fetch("/connect/info", { cache: "no-store" }).then((r) => r.json()).then((i) => renderPhones(i.phones || [])).catch(() => {});
     send({ event: "set_mode", mode: state.mode, language: state.sltLanguage });
   };
   socket.onclose = () => { setConnected(false); setTimeout(connect, 2000); };
@@ -467,6 +519,7 @@ const HANDLERS = {
   slt_caption(d) { showCaption(d); },
   slt_caption_english(d) { if ($("captionSrc").textContent === d.source) $("captionEn").textContent = d.text; },
   slt_error(d) { addLog("SLT", d.text); setSltState({ state: "waiting", note: d.text }); },
+  phones(d) { renderPhones(d.phones || []); },
 };
 
 /* ---------- Chat & log (always textContent: model output is never parsed as HTML) ---------- */
@@ -841,6 +894,84 @@ function showCaption(d) {
   $("captionEn").textContent = "";
   addMessage("argus", "Sign", d.text, "SIGN");
 }
+
+/* ---------- Connect phone ---------- */
+// The phone apps are companions: voice and camera go to this PC, answers come back. This panel
+// shows how to reach the PC (QR code, address) and which phones are connected right now.
+const PLATFORM_NAMES = { ios: "iPhone", android: "Android" };
+
+function renderPhones(phones) {
+  const n = phones.length;
+  $("phoneBtn").classList.toggle("linked", n > 0);
+  $("phoneBtnText").textContent = n === 0 ? "Connect phone" : n === 1 ? "1 phone" : `${n} phones`;
+  const list = $("phoneList");
+  list.textContent = "";
+  if (!n) {
+    const empty = document.createElement("div");
+    empty.className = "phone-empty";
+    empty.textContent = "No phone connected yet.";
+    list.appendChild(empty);
+    return;
+  }
+  for (const p of phones) {
+    const row = document.createElement("div");
+    row.className = "phone-row";
+    const dot = document.createElement("span");
+    dot.className = "dot";
+    const name = document.createElement("span");
+    const kind = PLATFORM_NAMES[p.platform];
+    name.textContent = kind && !String(p.name).includes(kind) ? `${p.name} (${kind})` : p.name;
+    const meta = document.createElement("span");
+    meta.className = "meta";
+    meta.textContent = `${String(p.mode || "").toUpperCase()} · ${p.address || ""}`;
+    row.append(dot, name, meta);
+    list.appendChild(row);
+  }
+}
+
+async function loadConnectInfo() {
+  let info;
+  try { info = await (await fetch("/connect/info", { cache: "no-store" })).json(); }
+  catch { $("phoneQr").textContent = "Couldn't read this PC's address."; return; }
+  $("phonePcName").textContent = info.discovery ? `ARGUS on ${info.name}` : "this PC";
+  const addrs = $("phoneAddrs");
+  addrs.textContent = "";
+  const qr = $("phoneQr");
+  qr.textContent = "";
+  if (!info.addresses.length) {
+    qr.textContent = "This PC isn't on a network.";
+    addrs.textContent = "Connect this PC to Wi-Fi or to the phone's hotspot, then open this panel again.";
+  } else if (info.qr) {
+    const img = document.createElement("img");
+    img.alt = "QR code to connect the phone app to this PC";
+    img.src = "/connect/qr.svg?t=" + Date.now();
+    qr.appendChild(img);
+  } else {
+    qr.textContent = "QR code needs the segno package (pip install segno). You can still type the address.";
+  }
+  info.addresses.forEach((ip, i) => {
+    const row = document.createElement("div");
+    row.className = "phone-addr";
+    const code = document.createElement("code");
+    code.textContent = `${ip}:${info.port}`;
+    const copy = document.createElement("button");
+    copy.type = "button";
+    copy.className = "small-btn";
+    copy.textContent = "Copy";
+    copy.addEventListener("click", async () => {
+      try { await navigator.clipboard.writeText(info.ws_urls[i]); copy.textContent = "Copied"; }
+      catch { copy.textContent = "Select and copy"; }
+      setTimeout(() => { copy.textContent = "Copy"; }, 1500);
+    });
+    row.append(code, copy);
+    addrs.appendChild(row);
+  });
+  renderPhones(info.phones || []);
+}
+
+$("phoneBtn").addEventListener("click", () => { $("phoneDialog").showModal(); loadConnectInfo(); });
+$("phoneClose").addEventListener("click", () => $("phoneDialog").close());
+$("phoneDialog").addEventListener("click", (e) => { if (e.target === $("phoneDialog")) $("phoneDialog").close(); });
 
 /* ---------- Presenting (large text) ---------- */
 function setDemo(on) {
