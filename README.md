@@ -21,8 +21,8 @@ Developed and measured on an RTX 5060 Ti (16 GB) under Windows.
 
 | Mode | What it looks at | What it does |
 | --- | --- | --- |
-| **Screen** | This PC's screen (DXCam, MSS fallback) | Casual copilot for whatever is on screen |
-| **Live** | Dashboard webcam or phone camera | Conversational companion |
+| **Screen** | This PC's screen (DXCam, MSS fallback). On a phone: that phone's own screen, never its camera | Casual copilot for whatever is on screen |
+| **Live** | The chosen camera: PC webcam, head-mount camera or phone camera | Conversational companion |
 | **Assistive** | Camera | Acts as the eyes of a blind user: walking guidance with directions and distances, a hands-free **Guide** mode, medicine label reader (name, strength, dose, expiry), hazard beep, Bangladeshi Taka reader |
 | **Sign** | Camera | Translates continuous sign language into text and speech. German Sign Language (DGS) and Bangla Sign Language (BdSL) |
 
@@ -91,7 +91,99 @@ This opens A.R.G.U.S. as a desktop app in its own window (or double-click `ARGUS
 loading screen shows each step while the models load, and closing the window stops the
 backend. It is the same backend the phone uses, so the desktop app and the Android app can
 be connected at the same time. Add `--browser` to use the default browser instead, or run
-`python allnew.py` and open `http://localhost:8000` as before. In the Android app, enter `ws://<this PC's IP>:8000/ws` as the server address.
+`python allnew.py` and open `http://localhost:8000` as before. 
+### Connect a phone
+
+The Android and iPhone apps are companions: they send your voice and the camera to this PC and
+show and speak the answers. Every model runs on the PC, so the phone only needs to be on the
+same Wi-Fi (or the PC on the phone's hotspot).
+
+Press **Connect phone** at the top of the PC app. The panel shows:
+
+- a **QR code** the phone app scans to connect,
+- this PC's **address** to type in by hand (`<IP>:8000`, the app uses `ws://<IP>:8000/ws`),
+- the **phones connected** right now and the mode each one is in.
+
+The PC also announces itself on the network (Bonjour / mDNS, `_argus._tcp`), so the iPhone app
+lists it under "PCs on this network" without typing anything. If a phone can't connect, allow
+Python / A.R.G.U.S. through Windows Firewall on private networks. The code is in
+`src/argus_connect.py`; it needs the small `segno` and `zeroconf` packages from `requirements.txt`,
+and without them the panel still shows the address.
+
+### Cameras: webcam, head-mount camera, phone
+
+In Live, Assistive and Sign mode every device picks the camera it looks through:
+
+| Where | Choices |
+| --- | --- |
+| PC app (dashboard / desktop app) | **Webcam** (the PC's own camera), **Head-mount** (the USB camera worn on the head), **Phone** (the connected phone's camera) |
+| Phone app (Android, iPhone) | **Back**, **Front**, **Head-mount** |
+
+The head-mount camera is a USB webcam (for example a Rapoo 1080p on a headband) plugged into the PC.
+The server opens it itself (`src/argus_cameras.py`), so the phone can use it while you walk and
+the phone shows its picture live. It is only switched on while somebody has Head-mount selected.
+When the PC has more than one camera, choose which one is the head-mount camera in the menu under
+the camera buttons (camera names need the optional `pygrabber` package; without it they show as
+Camera 0, Camera 1). The choice is remembered in `argus_cameras.json`.
+
+With **Phone** chosen on the PC, the PC's questions, walking guidance and sign language use the
+phone's camera; the phone app keeps its camera on for that and sends about 8 pictures a second, so
+the PC shows it as video. The live views (head-mount on a phone, phone or head-mount in the PC app)
+ask the PC for "the next picture after the one I have", so they follow the camera without a timer. A question never silently falls back
+to another camera: if the chosen one has no picture, ARGUS says which camera to check.
+
+**Screen mode on a phone** looks at that phone's screen. Tap **Share screen** in the app (Android
+asks for permission; on iPhone pick **ARGUS Screen** and press Start Broadcast), then open any app
+and ask "Hey Argus, what's on my screen?".
+
+### Language: English or Bengali
+
+ARGUS can speak and answer in **English** or **Bengali (বাংলা)**, in every mode: answers, walking
+guidance, medicine and money reading, sign language captions and its own messages.
+
+| Where | How to switch |
+| --- | --- |
+| PC app | **English / বাংলা** buttons at the top right |
+| Phone app (Android, iPhone) | the **EN / বাং** chip at the top, or Settings → Language |
+| By voice or typing | *"Argus, speak Bengali"* / *"speak English"* |
+
+Each phone has its own language, and the PC app has its own, so one can be Bengali while the other
+stays English. The choice is remembered.
+
+How it works (`src/argus_language.py`): the vision model and the guidance rules keep working in
+English. Just before a sentence is spoken to a Bengali listener it is turned into Bangla:
+
+1. fixed sentences (mode names, guidance instructions such as "move a little to your left", error
+   messages) come from a hand-written table, and obstacle warnings ("Careful! There is a car ahead
+   of you") are built from a word list, so these need no model and are instant;
+2. everything else, mainly the model's own answers, is translated sentence by sentence with
+   **NLLB-200** (`facebook/nllb-200-distilled-600M`), which runs on this PC. It is downloaded the
+   first time Bengali is chosen (about 2.5 GB) and takes about 1.3 GB of VRAM. Until it is ready,
+   answers stay in English and the app shows "Downloading Bengali… 40%".
+
+**The one-time download.** ARGUS fetches the model itself into `models/nllb-200-distilled-600M/`
+(and the offline Bangla voice into `models/mms-tts-ben/`), so the PC needs internet the first time
+Bengali is chosen. If the connection drops, press **বাংলা** again and it continues where it stopped.
+If the app says *"Bengali couldn't download"*, this PC cannot reach `huggingface.co`: check its
+internet (a phone hotspot is fine), then press **বাংলা** again. For a PC without internet, copy those
+two folders from a PC that has them. This download does not use the Hugging Face cache, so it also
+works in the installed desktop app, which keeps the Hugging Face libraries offline.
+
+The chat shows the Bangla sentence with the English answer below it in smaller text.
+
+**Bangla voice.** Piper has no Bangla voice, so by default the Bangla is spoken with the online
+Microsoft voice (edge-tts, needs internet). Without internet ARGUS switches by itself to the offline
+MMS voice (`facebook/mms-tts-ben`, about 150 MB, fetched in the background the first time Bengali is
+chosen; it sounds more robotic). Set `ARGUS_TTS_BN=mms` to always use the offline voice.
+
+**Sign mode.** Bangla signs are spoken in Bangla as they are; German signs are translated to Bangla.
+With English chosen, captions are spoken in English as before.
+
+**Questions.** Speak to ARGUS in English: the speech recognition and the voice commands are English.
+A question *typed* in Bangla is translated to English for the model and answered in the chosen
+language. While ARGUS is speaking Bangla on the PC, only *"okay stop"* and *"goodbye"* interrupt it
+(its echo filter compares English text), so wait for it to finish before the next question, or use
+earphones.
 
 **First run needs internet once.** It downloads Qwen2-VL, Whisper, the Piper voices and the
 MediaPipe holistic model. After that everything runs offline. The Piper voices go to
@@ -165,10 +257,19 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 | `ARGUS_WHISPER_MODEL` | `small.en` | faster-whisper model |
 | `ARGUS_SLT_DE_CKPT` / `ARGUS_SLT_BN_CKPT` | see above | Sign language checkpoints |
 | `ARGUS_SLT_ENGLISH` | `1` | Also translate sign captions into English with Qwen |
-| `ARGUS_SLT_SPEAK` | `en` | Speak captions in `en`, the `source` language, or `off` |
+| `ARGUS_SLT_SPEAK` | `en` | Speak captions translated into the listener's language (`en`), as signed (`source`), or not at all (`off`) |
 | `ARGUS_SLT_MIN_CONF` | `35` | Sign captions below this confidence (%) say "I'm not sure, please sign again". 0 = off. Calibrate with `src/slt_test_video.py` |
 | `ARGUS_SLT_END_GAP` | `1.0` | Seconds without hands that end a signed sentence |
 | `ARGUS_LATENCY_LOG` | `logs/latency.csv` | Where per-reply timings are written |
+| `ARGUS_HEAD_CAMERA` | `auto` | Which PC camera is the head-mount camera: `auto`, a number (`0`, `1`) or part of its name (`rapoo`). The PC app's menu overrides it |
+| `ARGUS_HEAD_FPS` | `15` | Head-mount pictures per second handed to ARGUS |
+| `ARGUS_HEAD_WIDTH` / `ARGUS_HEAD_HEIGHT` | `1920` / `1080` | Head-mount capture size (1080p keeps reading sharp) |
+| `ARGUS_LANGUAGE` | `en` | Language a device starts with: `en` or `bn`. The apps' own choice overrides it |
+| `ARGUS_TRANSLATE_MODEL` | `facebook/nllb-200-distilled-600M` | Translation model for Bengali: a Hugging Face id (downloaded into `models/`) or a folder that already holds the model. `facebook/nllb-200-distilled-1.3B` translates better and needs about twice the VRAM |
+| `ARGUS_TRANSLATE_DEVICE` | `auto` | `auto` (GPU when there is one), `cuda` or `cpu` (slower, frees VRAM) |
+| `ARGUS_TRANSLATE_BEAMS` | `2` | Translation beam size; `1` is fastest |
+| `ARGUS_TTS_BN` | `auto` | Bangla voice: `auto` (online Edge voice, offline MMS voice without internet), `edge` or `mms` |
+| `ARGUS_EDGE_VOICE_BN` | `bn-BD-PradeepNeural` | Online Bangla voice (`bn-BD-NabanitaNeural` is the female one) |
 
 ## Voice commands (PC mic)
 
@@ -181,6 +282,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
   read the label from the full-resolution image and never guess a name or dose.
 - *"Switch to assistive / live / screen / sign mode"* changes mode by voice (or typed), like the buttons.
   Add *"and turn on guide mode"* for walking guidance, or say *"Bangla sign mode"* / *"German sign mode"*.
+- *"Speak Bengali"* / *"speak English"* (also *"switch language to Bengali"*) changes the language ARGUS speaks.
 - *"Say that again"* (or *"repeat that"*, *"what did you say"*) repeats the last reply.
 - *"Okay stop"* interrupts (and ends guidance). *"Goodbye"* puts it back to sleep.
 
@@ -189,7 +291,10 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 ```
 src/allnew.py        server: models, mic, WebSocket API, modes
 src/argus_slt.py     live sign language sessions (MediaPipe -> ARGUS-SLT)
-src/argus_tts.py     Piper / edge-tts voices
+src/argus_tts.py     Piper / edge-tts voices, Bangla voice (edge-tts online, MMS offline)
+src/argus_language.py  English / Bengali: fixed Bangla sentences, NLLB translation, "speak Bengali" command
+src/argus_connect.py Connect phone: PC address, QR code, network discovery
+src/argus_cameras.py head-mount camera (USB webcam on the PC) shared with the phones
 src/slt_test_video.py  run sign videos through the live pipeline, prints captions + confidence
 src/new.html         dashboard (offline: no CDN fonts or icons)
 sign_language/       ARGUS-SLT training and evaluation code

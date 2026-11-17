@@ -47,7 +47,7 @@ import speech_recognition as sr
 import torch
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, Response
 from faster_whisper import WhisperModel
 from peft import PeftModel
 from PIL import Image
@@ -55,6 +55,9 @@ from qwen_vl_utils import process_vision_info
 from transformers import (AutoProcessor, Qwen2VLForConditionalGeneration, StoppingCriteria,
                           StoppingCriteriaList, TextIteratorStreamer)
 
+import argus_cameras
+import argus_connect
+import argus_language
 import argus_tts
 
 try:
@@ -129,7 +132,9 @@ BARGE_IN = os.getenv("ARGUS_BARGE_IN", "all").lower()
 
 # Sign language captions: also translate into English with Qwen, and which text to speak.
 SLT_ENGLISH = os.getenv("ARGUS_SLT_ENGLISH", "1") == "1"
-SLT_SPEAK = os.getenv("ARGUS_SLT_SPEAK", "en").lower()  # en | source | off
+# Which text is spoken: "en" = the translation into the listener's language (English or Bengali),
+# "source" = the caption as signed (German / Bangla), "off" = captions are not spoken.
+SLT_SPEAK = os.getenv("ARGUS_SLT_SPEAK", "en").lower()
 
 LATENCY_LOG = os.getenv("ARGUS_LATENCY_LOG", os.path.join(DATA_ROOT, "logs", "latency.csv"))
 
@@ -162,6 +167,14 @@ class Client:
     mode: str = "screen"
     slt: object = None       # SignSession while the client is in SLT mode
     audio_queue: bool = False  # phone app can queue several audio clips per reply
+    name: str = ""           # phone's name and platform ("ios" / "android"), from its hello
+    platform: str = ""
+    since: float = field(default_factory=time.time)
+    camera: str = ""         # phone: "phone" or "head" (set_camera); "" = older app, any fresh camera
+    facing: str = "back"     # phone: which of its own cameras is on
+    screen_sharing: bool = False  # phone: sharing its own screen for Screen mode
+    phone_wanted: str = None      # phone: last camera_state "phone_wanted" sent to it
+    language: str = argus_language.DEFAULT_LANGUAGE  # phone: language ARGUS speaks to it ("en" / "bn")
 
 
 class ConnectionManager:
@@ -169,6 +182,8 @@ class ConnectionManager:
         self.clients = {}
         self.loop = None
         self.pc_mode = "screen"  # mode of the dashboard and the PC microphone
+        self.pc_camera = "pc"    # camera the dashboard and PC microphone use: "pc" (webcam), "head", "phone"
+        self.pc_language = argus_language.DEFAULT_LANGUAGE  # language ARGUS speaks on the PC: "en" / "bn"
 
     async def connect(self, websocket: WebSocket):
         await websocket.accept()
@@ -181,6 +196,21 @@ class ConnectionManager:
             client.slt.close()
         if client:
             print(f"[SERVER] {client.kind.capitalize()} disconnected")
+            if client.kind == "phone":
+                self.announce_phones(f"{client.name or 'Phone'} disconnected")
+            update_cameras()
+            if client.kind in ("phone", "phone_screen"):
+                broadcast_camera_state()
+
+    def phones(self):
+        """Phones connected right now, for the dashboard's Connect phone panel."""
+        return [{"name": c.name or "Phone", "platform": c.platform, "mode": c.mode,
+                 "address": getattr(c.ws.client, "host", "") if c.ws.client else "",
+                 "seconds": int(time.time() - c.since)}
+                for c in list(self.clients.values()) if c.kind == "phone"]
+
+    def announce_phones(self, note=None):
+        self.broadcast_sync({"event": "phones", "phones": self.phones(), "note": note}, dashboards_only=True)
 
     def dashboards(self):
         return [c.ws for c in list(self.clients.values()) if c.kind == "dashboard"]
@@ -219,9 +249,15 @@ ws_manager = ConnectionManager()
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     ws_manager.loop = asyncio.get_running_loop()
+    # Announce this PC on the local network so the phone apps can find it (see argus_connect.py).
+    stop_advertising = threading.Event()
+    threading.Thread(target=argus_connect.keep_advertising, args=(SERVER_PORT, stop_advertising),
+                     daemon=True).start()
     yield
+    stop_advertising.set()
 
 
+SERVER_PORT = int(os.getenv("ARGUS_PORT", "8000"))
 app = FastAPI(title="A.R.G.U.S. Multimodal Engine", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -234,6 +270,117 @@ def log_event(engine, text):
 def set_status(state):
     """idle | listening | thinking | speaking, shown on the dashboard."""
     ws_manager.broadcast_sync({"event": "assistant_status", "state": state}, dashboards_only=True)
+
+
+# ==========================================
+# 1b. REPLY LANGUAGE: English or Bengali
+# ==========================================
+# Each phone has its own language; the PC app and the PC microphone share one. The model always
+# works in English. Sentences for a Bengali listener are translated just before they are spoken
+# (argus_language.py) and spoken with a Bangla voice (argus_tts.py).
+def reply_language(origin, requester=None):
+    if origin == "phone" and requester is not None:
+        client = ws_manager.clients.get(requester)
+        if client is not None:
+            return client.language
+    return ws_manager.pc_language
+
+
+def language_state(client):
+    lang = client.language if client.kind == "phone" else ws_manager.pc_language
+    return {"event": "language_state", "language": lang,
+            "languages": [{"code": code, "label": label, "native": argus_language.NATIVE_NAMES[code]}
+                          for code, label in argus_language.LANGUAGES.items()],
+            "translator": argus_language.translator.status()}
+
+
+def broadcast_language_state():
+    for c in list(ws_manager.clients.values()):
+        if c.kind in ("phone", "dashboard"):
+            ws_manager.send_to_sync(c.ws, language_state(c))
+
+
+_translator_state = "off"
+
+
+def on_translator_change(status):
+    global _translator_state
+    if status["state"] != _translator_state:  # download progress arrives as repeated "loading" updates
+        _translator_state = status["state"]
+        if status["state"] == "loading":
+            log_event("LANGUAGE", "Getting Bengali ready (the first time downloads about 2.5 GB)...")
+        elif status["state"] == "ready":
+            log_event("LANGUAGE", f"Bengali translation is ready ({status['device']}).")
+        elif status["state"] == "error":
+            log_event("LANGUAGE", f"Bengali translation could not load, so answers stay in English. {status['error']}")
+    broadcast_language_state()
+
+
+argus_language.translator.on_change = on_translator_change
+
+
+def set_language(lang, origin="pc", client=None, announce=True, retry=False):
+    """Switch the reply language of the PC (origin "pc") or of one phone, and say so in that language.
+    `retry`: the user pressed Bengali again, so a failed download of the translation model starts again."""
+    lang = argus_language.normalize_language(lang)
+    if lang is None:
+        return
+    requester = client.ws if (origin == "phone" and client is not None) else None
+    changed = reply_language(origin, requester) != lang
+    if origin == "phone" and client is not None:
+        client.language = lang
+        ws_manager.send_to_sync(client.ws, language_state(client))
+    else:
+        ws_manager.pc_language = lang
+        for c in list(ws_manager.clients.values()):
+            if c.kind == "dashboard":
+                ws_manager.send_to_sync(c.ws, language_state(c))
+    if lang == "bn":
+        argus_language.translator.ensure_loading(retry=changed or announce or retry)
+        threading.Thread(target=argus_tts.prepare_bangla, daemon=True).start()
+    if changed:
+        who = (client.name or "Phone") if requester is not None else "PC"
+        log_event("LANGUAGE", f"{who} now speaks {argus_language.LANGUAGES[lang]}.")
+    if announce:
+        speak(argus_language.SWITCHED[lang], lang=lang, origin=origin, requester=requester)
+
+
+_translation_note = 0.0
+
+
+def localize_speech(item):
+    """Text and language to synthesize for a queued sentence. English sentences for a Bengali listener
+    are translated here, in the voice thread, so the model keeps generating in the meantime."""
+    global _translation_note
+    if item.target != "bn" or item.lang == "bn" or not item.text:
+        return item.text, item.lang
+    start = time.time()
+    bangla = argus_language.to_bangla(item.text, item.lang if item.lang in argus_language.NLLB_CODES else "en")
+    if not bangla:
+        argus_language.translator.ensure_loading()
+        if time.time() - _translation_note > 30:
+            _translation_note = time.time()
+            log_event("LANGUAGE", "Bengali isn't ready yet, so this was spoken in English.")
+        return item.text, item.lang
+    ms = int((time.time() - start) * 1000)
+    if item.req_id and not item.guide:
+        ws_manager.reply_to(item.origin, item.requester, {
+            "event": "argus_reply_translation", "id": item.req_id, "seq": item.seq, "text": bangla,
+            "language": "bn", "ms": ms})
+    print(f"[LANGUAGE] {ms} ms | {bangla}")
+    return bangla, "bn"
+
+
+def synthesize_item(item):
+    """Audio for a queued sentence in the listener's language; English if the Bangla voice fails."""
+    text, lang = localize_speech(item)
+    try:
+        return argus_tts.synthesize(text, lang, item.rate)
+    except Exception as exc:
+        if lang == item.lang:
+            raise
+        print(f"[TTS] Bangla voice failed ({type(exc).__name__}: {exc}); speaking the original sentence.")
+        return argus_tts.synthesize(item.text, item.lang, item.rate)
 
 
 # ==========================================
@@ -306,6 +453,8 @@ except Exception as exc:
           "Install mediapipe and sentencepiece in this environment to enable it.")
 
 argus_tts.warm_up("en")
+if argus_language.DEFAULT_LANGUAGE == "bn":
+    argus_language.translator.ensure_loading()
 
 
 def warm_up_models():
@@ -347,7 +496,8 @@ warm_up_models()
 # ==========================================
 # 3. SHARED STATE
 # ==========================================
-# Latest camera frame per source ("pc" = dashboard webcam, "phone" = Android app).
+# Latest frame per source: "pc" = dashboard webcam, "phone" = phone camera, "head" = head-mount camera
+# plugged into the PC, "phone_screen" = the phone's own screen (Screen mode on the phone).
 camera_frames = {}
 camera_frames_lock = threading.Lock()
 camera_history = {}  # origin -> deque of (frame, time) for the last few seconds, for motion comparison
@@ -401,7 +551,7 @@ def recent_context(origin):
     items = items[-2 * CONTEXT_TURNS:]
     if not items:
         return ""
-    lines = [f'- {"The user asked" if r == "user" else "You said"}: "{t}"' for r, t in items]
+    lines = [f'- {"Question" if r == "user" else "Your answer"}: "{t}"' for r, t in items]
     return CONTEXT_RULE + "\n" + "\n".join(lines) + "\n"
 
 
@@ -577,6 +727,8 @@ class SpeechItem:
     t0: float = 0.0        # when the user's question ended (latency clock of the reply)
     queued: float = 0.0    # when this sentence was ready to speak
     synth_ms: int = None
+    target: str = "en"     # language the listener chose; text in another language is translated first
+    guide: bool = False    # a walking-guidance update (no chat bubble to attach a translation to)
 
 
 # Interrupting bumps the epoch; audio from an older epoch is thrown away.
@@ -614,7 +766,8 @@ def speak(text, req=None, lang="en", rate=TTS_RATE, seq=0, origin=None, requeste
     requester = requester if requester is not None else (req.requester if req else None)
     now = time.time()
     item = SpeechItem(text, lang, rate, req.id if req else None, origin, requester, seq, tts_epoch,
-                      t0=req.t0 if req else now, queued=now)
+                      t0=req.t0 if req else now, queued=now, target=reply_language(origin, requester),
+                      guide=bool(req and req.guide))
     global pending_pc_speech
     if origin == "phone" and requester is not None:
         phone_tts_queue.put(item)
@@ -661,7 +814,7 @@ def pc_synth_worker():
             continue  # interrupt_tts already reset the pending count
         try:
             start = time.time()
-            audio, mime = argus_tts.synthesize(item.text, item.lang, item.rate)
+            audio, mime = synthesize_item(item)
             item.synth_ms = int((time.time() - start) * 1000)
             if item.seq == 0 and item.req_id:
                 latency.mark(item.req_id, "tts_synth_ms", value=item.synth_ms)
@@ -725,7 +878,7 @@ def phone_tts_worker():
             continue
         try:
             start = time.time()
-            audio, mime = argus_tts.synthesize(item.text, item.lang, item.rate)
+            audio, mime = synthesize_item(item)
             item.synth_ms = int((time.time() - start) * 1000)
             sentence_timings.record(item, time.time(), None)
             ws_manager.send_to_sync(item.requester, {
@@ -989,6 +1142,7 @@ def apply_mode_command(mode, opts, origin="pc", requester=None, client=None):
             stop_slt(client)
         ws_manager.send_to_sync(client.ws, {"event": "mode_changed", "mode": mode, "voice": True,
                                             "language": language})
+        update_cameras()
     forget_conversation(origin)
     name = MODE_NAMES[mode]
     if mode == "slt" and language:
@@ -998,6 +1152,13 @@ def apply_mode_command(mode, opts, origin="pc", requester=None, client=None):
         start_guide(origin, requester, announce=True)
         return
     speak(f"{name}.", origin=origin, requester=requester)
+
+
+def parse_language_command(text):
+    """'Argus, speak Bengali' / 'switch language to English' -> "bn" / "en", else None."""
+    clean = normalize_command_text(text)
+    clean = re.sub(rf"^(?:(?:hey|ok|okay)\s+)?(?:{ARGUS_PHONETIC_VARIANTS})\s+", "", clean)
+    return argus_language.parse_language_command(clean)
 
 
 def is_guide_start(text):
@@ -1116,8 +1277,8 @@ SYSTEM_PROMPTS = {
 GROUNDING_RULES = ("The image attached to this message is the only visual evidence. Do not rely on earlier "
                    "images. Answer using only details actually visible in this image; if the image "
                    "is unclear or the requested content cannot be read, say so plainly.")
-CONTEXT_RULE = ("Recent conversation, only so you know what the user is referring to (describe only what is "
-                "visible now):")
+CONTEXT_RULE = ("Earlier in this conversation (only so you know what 'it' or 'that' refers to; describe only "
+                "what is visible now, and answer the new question directly to the user as 'you'):")
 
 GROUNDING_RULES_TWO = ("The two images attached to this message are the only visual evidence: an earlier one and "
                        "the current one. Do not rely on earlier messages. Answer using only what is actually "
@@ -1195,16 +1356,64 @@ def latest_camera_frame(origin):
     return None, None
 
 
+def fresh_frame(source, max_age=None):
+    """The newest frame from one source, or None if there is none or it is too old."""
+    with camera_frames_lock:
+        item = camera_frames.get(source)
+    if item is None:
+        return None
+    frame, ts = item
+    if max_age is not None and time.time() - ts > max_age:
+        return None
+    return frame.copy()
+
+
+def phone_screen_shared():
+    return any((c.kind == "phone" and c.screen_sharing) or c.kind == "phone_screen"
+               for c in list(ws_manager.clients.values()))
+
+
+def camera_choice(req):
+    """The camera this request should look at: "pc", "head", "phone", or None (older app: any fresh one)."""
+    if req.origin == "phone":
+        client = ws_manager.clients.get(req.requester)
+        return (client.camera or None) if client else None
+    return ws_manager.pc_camera
+
+
 def pick_frame(req):
     if req.image is not None:
         return req.image, "request"
     if req.mode == "screen":
+        if req.origin == "phone":
+            # The phone's Screen mode looks at the phone's own screen, never at a camera. While sharing is
+            # on, an unchanged screen sends no new pictures, so the last one stays valid.
+            return fresh_frame("phone_screen", None if phone_screen_shared() else FRAME_MAX_AGE_S), "phone_screen"
         frame = screen_camera.get_latest_frame()
         if frame is None:
             time.sleep(0.05)
             frame = screen_camera.get_latest_frame()
         return frame, "screen"
-    return latest_camera_frame(req.origin)
+    source = camera_choice(req)
+    if source is None:
+        return latest_camera_frame(req.origin)
+    frame = fresh_frame(source, FRAME_MAX_AGE_S)
+    if frame is None and source == "head" and head_camera.wanted and not head_camera.running:
+        time.sleep(1.5)  # it was just switched on: give it a moment to open
+        frame = fresh_frame(source, FRAME_MAX_AGE_S)
+    return frame, source
+
+
+def no_frame_message(req, source):
+    if source == "phone_screen":
+        return "I can't see your phone's screen. Tap Share screen in the ARGUS app, then ask again."
+    if source == "screen":
+        return "I can't see the screen right now."
+    if source == "head":
+        return (head_camera.error or "I can't see the head-mount camera. Check that it is plugged into the PC.")
+    if source == "phone" and req.origin == "pc":
+        return "I can't see the phone's camera. Open the ARGUS app on the phone, or pick another camera."
+    return "I can't see the camera right now. Turn the camera on and ask again."
 
 
 class CancelCriteria(StoppingCriteria):
@@ -1212,11 +1421,16 @@ class CancelCriteria(StoppingCriteria):
         return cancel_generation.is_set()
 
 
+META_SENTENCE = re.compile(r"^\s*(?:the user|user)\s+(?:is|was|wants|asked|asks|would like|wishes|needs)\b[^.!?]*[.!?]\s*",
+                           re.IGNORECASE)
+
+
 def clean_reply(text):
     cut = dialogue_cut(text)
     if cut is not None:
         text = text[:cut]
     text = LEADING_LABEL.sub("", text)
+    text = META_SENTENCE.sub("", text)  # the model describing the question instead of answering it
     return text.strip().strip('"').strip()
 
 
@@ -1243,10 +1457,17 @@ def process_prompt(req: PromptRequest):
 def _process_prompt(req: PromptRequest):
     cancel_generation.clear()
     queue_ms = int((time.time() - req.t0) * 1000)
+    if not req.guide and argus_language.has_bengali(req.text):
+        # A question typed in Bangla: the model reads English, so translate it first.
+        english = argus_language.to_english(req.text)
+        if english:
+            log_event("LANGUAGE", f"Question in English: {english}")
+            req.text = english
+        else:
+            argus_language.translator.ensure_loading()
     frame, source = pick_frame(req)
     if frame is None:
-        msg = ("I can't see the screen right now." if req.mode == "screen" else
-               "I can't see the camera right now. Turn the camera on and ask again.")
+        msg = no_frame_message(req, source)
         if req.guide:
             stop_guide("I can't see the camera, so I stopped guiding. Turn the camera on and say guide me.")
             return
@@ -1255,7 +1476,7 @@ def _process_prompt(req: PromptRequest):
 
     assistive = req.mode == "assistive"
     task_kind = "guide" if req.guide else (assist_task(req.text) if assistive else None)
-    currency = assistive and not req.guide and is_currency_question(req.text)
+    currency = not req.guide and req.mode != "screen" and is_currency_question(req.text)
     medicine = task_kind == "medicine"
     asked_to_read = not req.guide and detect_ocr_intent(req.text)
     # Medicine labels always use the full-resolution image: the print is small and must be exact.
@@ -1274,7 +1495,7 @@ def _process_prompt(req: PromptRequest):
 
     # Walking help compares the newest frame with one from a moment ago to see what is approaching.
     prev_frame, gap = (None, 0.0)
-    if prompt_key in ("guide", "nav", "crossing") and source in ("pc", "phone"):
+    if prompt_key in ("guide", "nav", "crossing") and source in ("pc", "phone", "head"):
         prev_frame, gap = earlier_camera_frame(source, MOTION_GAP_S)
     if prev_frame is not None:
         max_px = min(max_px, GUIDE_IMAGE_PX)
@@ -1435,6 +1656,7 @@ def set_pc_mode(mode, voice=False, language=None):
     # The dashboard follows and, for Sign mode, starts its sign session with the chosen language.
     ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode, "voice": voice, "language": language},
                               dashboards_only=True)
+    update_cameras()
 
 
 def start_guide(origin="pc", requester=None, announce=True):
@@ -1599,11 +1821,18 @@ def finish_guide_update(req, raw, rate):
         guide["clear_said"] = now  # time of the last spoken update
     if urgent:
         play_hazard_alert()  # beep first so the warning is noticed
-    speak(answer, req, rate=rate, seq=0)
+    say, say_lang = answer, "en"
+    if reply_language(req.origin, req.requester) == "bn":
+        bangla = argus_language.to_bangla(answer)
+        if bangla:
+            say, say_lang = bangla, "bn"
+    speak(say, req, lang=say_lang, rate=rate, seq=0)
     remember(req.origin, "argus", answer)
-    last_said[req.origin] = (answer, "en")
-    log_event("GUIDE", answer)
-    payload = {"event": "guide_update", "text": answer, "warning": urgent}
+    last_said[req.origin] = (say, say_lang)
+    log_event("GUIDE", answer if say_lang == "en" else f"{say} | EN: {answer}")
+    payload = {"event": "guide_update", "text": say, "warning": urgent}
+    if say_lang != "en":
+        payload.update(source=answer, language=say_lang)
     if req.origin == "phone" and req.requester is not None:
         ws_manager.send_to_sync(req.requester, payload)
     ws_manager.broadcast_sync(payload, dashboards_only=True)
@@ -1646,6 +1875,78 @@ def translate_caption_to_english(text, source_label):
 
 
 # ==========================================
+# 7b. CAMERAS: PC webcam, phone camera, head-mount camera
+# ==========================================
+def slt_source(client):
+    """The camera a client's sign language session reads."""
+    if client.kind == "phone":
+        return client.camera or "phone"
+    return ws_manager.pc_camera
+
+
+def route_frame(source, frame, ts=None):
+    """Stores a camera frame and hands it to every sign language session that watches that camera."""
+    store_camera_frame(source, frame)
+    for c in list(ws_manager.clients.values()):
+        if c.slt is not None and slt_source(c) == source:
+            c.slt.push_frame(frame, ts)
+
+
+def on_head_frame(frame, ts):
+    route_frame("head", frame, ts)
+
+
+def camera_state(client):
+    """What a client needs to know about cameras (sent as camera_state and in hello)."""
+    head = {k: v for k, v in head_camera.state().items() if k in ("running", "error", "name", "index", "size")}
+    state = {"event": "camera_state", "pc_camera": ws_manager.pc_camera, "head": head,
+             "phones": sum(1 for c in list(ws_manager.clients.values()) if c.kind == "phone")}
+    if client.kind == "phone":
+        state["source"] = client.camera or "phone"
+        state["phone_wanted"] = client.phone_wanted or ""
+        state["screen_sharing"] = phone_screen_shared()
+    else:
+        state["source"] = ws_manager.pc_camera
+        state["phone_screen"] = phone_screen_shared()
+    return state
+
+
+def update_cameras(note_head=False):
+    """Turns the head-mount camera on while somebody looks through it, and asks the phone for its
+    camera when the PC app uses the phone's camera."""
+    clients = list(ws_manager.clients.values())
+    pc_active = any(c.kind == "dashboard" for c in clients) and ws_manager.pc_mode != "screen"
+    head_needed = (pc_active and ws_manager.pc_camera == "head") or \
+        any(c.kind == "phone" and c.camera == "head" and c.mode != "screen" for c in clients)
+    head_camera.set_wanted(head_needed)
+    wanted = ""
+    if pc_active and ws_manager.pc_camera == "phone":
+        wanted = "sign" if ws_manager.pc_mode == "slt" else "live"
+    for c in clients:
+        if c.kind == "phone" and (c.phone_wanted != wanted or note_head):
+            c.phone_wanted = wanted
+            ws_manager.send_to_sync(c.ws, camera_state(c))
+        elif c.kind == "dashboard" and note_head:
+            ws_manager.send_to_sync(c.ws, camera_state(c))
+
+
+def broadcast_camera_state():
+    for c in list(ws_manager.clients.values()):
+        if c.kind in ("phone", "dashboard"):
+            ws_manager.send_to_sync(c.ws, camera_state(c))
+
+
+def on_head_state(state):
+    if state.get("error"):
+        log_event("CAMERA", state["error"])
+    broadcast_camera_state()
+
+
+head_camera = argus_cameras.HeadCamera(on_head_frame, on_head_state,
+                                       os.path.join(DATA_ROOT, "argus_cameras.json"))
+
+
+# ==========================================
 # 8. SIGN LANGUAGE (SLT) SESSIONS
 # ==========================================
 def start_slt(client, language="de"):
@@ -1678,6 +1979,7 @@ def finish_caption(client, event):
     lang = argus_slt.LANGUAGES[event["language"]]
     origin = "phone" if client.kind == "phone" else "pc"
     requester = client.ws if origin == "phone" else None
+    target = reply_language(origin, requester)  # the listener's language: "en" or "bn"
     if event.get("unsure"):
         log_event("SLT", f"{lang.sign_language}: not sure ({event.get('confidence', 0):.0f}%), "
                          f"best guess {event.get('guess', '')!r}")
@@ -1686,24 +1988,36 @@ def finish_caption(client, event):
             last_said[origin] = (msg, "en")
             speak(msg, lang="en", origin=origin, requester=requester)
         return
-    english = None
-    if SLT_ENGLISH and lang.code != "en" and event["text"]:
+    text = event["text"]
+    translation, translation_lang = None, None
+    start = time.time()
+    if text and target == "bn" and lang.code != "bn":
+        # e.g. German signs for a Bengali listener: straight into Bangla
+        translation = argus_language.to_bangla(text, lang.code if lang.code in argus_language.NLLB_CODES else "en")
+        translation_lang = "bn" if translation else None
+        if translation is None:
+            argus_language.translator.ensure_loading()
+    if translation is None and SLT_ENGLISH and lang.code != "en" and text:
         try:
-            start = time.time()
-            english = translate_caption_to_english(event["text"], lang.label)
-            ws_manager.send_to_sync(client.ws, {"event": "slt_caption_english", "text": english,
-                                                "source": event["text"], "ms": int((time.time() - start) * 1000)})
+            translation = translate_caption_to_english(text, lang.label)
+            translation_lang = "en"
         except Exception as exc:
             print(f"[SLT] English translation failed: {exc}")
-    log_event("SLT", f"{lang.sign_language}: {event['text']}" + (f" | EN: {english}" if english else ""))
-    if SLT_SPEAK == "off" or not event["text"]:
+    if translation:
+        ws_manager.send_to_sync(client.ws, {"event": "slt_caption_english", "text": translation, "source": text,
+                                            "language": translation_lang, "ms": int((time.time() - start) * 1000)})
+    log_event("SLT", f"{lang.sign_language}: {text}" +
+              (f" | {translation_lang.upper()}: {translation}" if translation else ""))
+    if SLT_SPEAK == "off" or not text:
         return
-    if SLT_SPEAK == "en" and english:
-        text, tts_lang = english, "en"
+    if SLT_SPEAK != "source" and translation and translation_lang == target:
+        say, say_lang = translation, translation_lang
+    elif SLT_SPEAK != "source" and translation and lang.tts_lang != target:
+        say, say_lang = translation, translation_lang  # English: speak() translates it for a Bengali listener
     else:
-        text, tts_lang = event["text"], lang.tts_lang
-    last_said[origin] = (text, tts_lang)
-    speak(text, lang=tts_lang, origin=origin, requester=requester)
+        say, say_lang = text, lang.tts_lang  # the caption itself, e.g. Bangla signs for a Bengali listener
+    last_said[origin] = (say, say_lang)
+    speak(say, lang=say_lang, origin=origin, requester=requester)
 
 
 # ==========================================
@@ -1844,8 +2158,10 @@ def audio_worker():
             if is_own_echo(heard):
                 print(f"[VOICE] Ignored (sounds like ARGUS's own reply): {heard!r}")
                 continue
-            if overlapped and BARGE_IN != "all":
-                continue  # ARGUS_BARGE_IN=stop: only "stop" / "goodbye" interrupt
+            if overlapped and (BARGE_IN != "all" or ws_manager.pc_language == "bn"):
+                # ARGUS_BARGE_IN=stop: only "stop" / "goodbye" interrupt. The same holds while ARGUS speaks
+                # Bangla: the echo filter compares English text, so it can't tell ARGUS's Bangla voice apart.
+                continue
 
             if assistant_state == "idle":
                 is_wake, remainder = detect_wake_call(heard)
@@ -1873,6 +2189,12 @@ def audio_worker():
             play_capture_chime()
             ws_manager.broadcast_sync({"event": "speech_recognized", "text": sanitize_transcription_for_ui(heard)},
                                       dashboards_only=True)
+            voice_language = parse_language_command(heard)
+            if voice_language:
+                interrupt_tts()
+                clear_pending_prompts()
+                set_language(voice_language, "pc")
+                continue
             voice_mode, mode_opts = parse_mode_command(heard)
             if voice_mode:
                 interrupt_tts()
@@ -1930,6 +2252,8 @@ def screen_stream_worker():
 for target in (pc_synth_worker, pc_play_worker, phone_tts_worker, audio_worker, llm_worker,
                screen_stream_worker, hardware_metrics_worker, guide_worker):
     threading.Thread(target=target, daemon=True).start()
+ARGUS_BUILD = "2026-11-16 smooth camera build"
+print(f"[SYSTEM] ARGUS server {ARGUS_BUILD}")
 print("[VOICE] PC wake word: 'Hey Argus' | Stop: 'Okay stop' | Sleep: 'Goodbye' | OCR: 'Read this' "
       "| Walking guide: 'Guide me' / 'Stop guiding' | Repeat: 'Say that again' "
       "| Modes: 'Switch to assistive / live / screen / sign mode'")
@@ -1948,9 +2272,85 @@ async def serve_dashboard():
         return HTMLResponse(content="<h1>new.html not found. Keep it next to allnew.py.</h1>", status_code=500)
 
 
+@app.get("/connect/info")
+async def connect_info():
+    """What the dashboard's Connect phone panel shows: this PC's addresses, the pairing link, phones."""
+    info = argus_connect.connect_info(SERVER_PORT)
+    info["phones"] = ws_manager.phones()
+    return info
+
+
+@app.get("/connect/qr.svg")
+async def connect_qr():
+    svg = argus_connect.qr_svg(argus_connect.connect_info(SERVER_PORT)["link"])
+    if svg is None:
+        return Response(status_code=404)
+    return Response(content=svg, media_type="image/svg+xml", headers={"Cache-Control": "no-store"})
+
+
+@app.get("/camera/list")
+async def camera_list():
+    """The PC's cameras, for choosing which one is the head-mount camera."""
+    cams = await asyncio.to_thread(argus_cameras.list_cameras, 4,
+                                   {head_camera.index} if head_camera.running else set())
+    return {"cameras": cams, "head": head_camera.state()}
+
+
+_view_cache = {}  # (source, width) -> (frame time, JPEG bytes): several viewers share one encode
+_view_lock = threading.Lock()
+
+
+def view_jpeg(source, w, frame, ts):
+    with _view_lock:
+        cached = _view_cache.get((source, w))
+    if cached and cached[0] == ts:
+        return cached[1]
+    if frame.shape[1] > w:
+        frame = cv2.resize(frame, (w, int(frame.shape[0] * w / frame.shape[1])), interpolation=cv2.INTER_AREA)
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 75])
+    if not ok:
+        return None
+    data = buf.tobytes()
+    with _view_lock:
+        _view_cache[(source, w)] = (ts, data)
+    return data
+
+
+@app.get("/camera/{source}.jpg")
+async def camera_jpeg(source: str, w: int = 720, after: float = 0.0):
+    """The newest picture from one camera (head, phone, pc, phone_screen), for live views on the phone
+    and the dashboard. 204 when there is none.
+
+    Smooth video: the reply carries X-Frame-Time. A viewer sends that back as ?after=... and the PC then
+    answers the moment a newer picture exists (it waits up to a second), so every picture is shown once,
+    as soon as it arrives, without the viewer having to guess when to ask."""
+    if source not in ("head", "phone", "pc", "phone_screen"):
+        return Response(status_code=404)
+    if source == "head" and not head_camera.wanted:
+        head_camera.set_wanted(True)  # somebody is looking: open it; update_cameras closes it again later
+        threading.Timer(10.0, update_cameras).start()
+    deadline = time.time() + (1.0 if after else 0.0)
+    while True:
+        with camera_frames_lock:
+            item = camera_frames.get(source)
+        now = time.time()
+        if item is not None and now - item[1] <= 5.0 and item[1] > after:
+            break
+        if now >= deadline:
+            return Response(status_code=204, headers={"Cache-Control": "no-store"})
+        await asyncio.sleep(0.01)
+    w = max(160, min(int(w), 1920))
+    data = await asyncio.to_thread(view_jpeg, source, w, item[0], item[1])  # off the event loop
+    if data is None:
+        return Response(status_code=500)
+    return Response(content=data, media_type="image/jpeg",
+                    headers={"Cache-Control": "no-store", "X-Frame-Time": repr(item[1])})
+
+
 def hello_payload(client):
     return {
         "event": "hello",
+        "server_name": argus_connect.pc_name(),
         "modes": list(MODES),
         "pc_mode": ws_manager.pc_mode,
         "mode": client.mode,
@@ -1962,6 +2362,10 @@ def hello_payload(client):
         "slt_languages": argus_slt.language_list() if argus_slt else [],
         "max_image_px": MAX_IMAGE_PX,
         "ocr_max_px": OCR_MAX_PX,
+        "build": ARGUS_BUILD,
+        "features": ["camera_source", "phone_screen", "language"],
+        "camera": camera_state(client),
+        "language": language_state(client),
     }
 
 
@@ -1969,14 +2373,29 @@ async def handle_message(client, data):
     global mic_enabled
     event = data.get("event")
     ws = client.ws
-    if data.get("origin") == "phone" or data.get("client") == "phone":
-        client.kind = "phone"
+    if data.get("client") == "phone_screen" and client.kind != "phone_screen":
+        client.kind = "phone_screen"  # the iPhone's screen-sharing extension: it only sends screen_frame
+        client.name = str(data.get("device") or "Phone")[:40]
+        log_event("SYSTEM", f"{client.name} is sharing its screen")
+        broadcast_camera_state()
+    elif (data.get("origin") == "phone" or data.get("client") == "phone") and client.kind not in ("phone", "phone_screen"):
+        client.kind = "phone"  # first message from a phone app (older apps never send a hello)
+        client.name = str(data.get("device") or "Phone")[:40]
+        client.platform = str(data.get("platform") or "")[:16]
+        log_event("SYSTEM", f"{client.name} connected")
+        ws_manager.announce_phones(f"{client.name} connected")
 
     if event == "hello":
         client.audio_queue = "audio_queue" in (data.get("features") or [])
         if client.kind == "phone":
             client.mode = normalize_mode(data.get("mode")) or "live"
+            ws_manager.announce_phones()
+            if argus_language.normalize_language(data.get("language")):
+                set_language(data.get("language"), "phone", client, announce=False)
+        if client.kind == "phone_screen":
+            return
         await ws.send_text(json.dumps(hello_payload(client)))
+        update_cameras()
 
     elif event == "set_mode":
         mode = normalize_mode(data.get("mode"))
@@ -2001,11 +2420,60 @@ async def handle_message(client, data):
             ws_manager.broadcast_sync({"event": "mode_changed", "mode": mode}, dashboards_only=True)
         else:
             ws_manager.send_to_sync(ws, {"event": "mode_changed", "mode": mode})
+            ws_manager.announce_phones()
         if mode == "slt":
             start_slt(client, data.get("language", "de"))
         else:
             stop_slt(client)
+        update_cameras()
         print(f"[SYSTEM] {client.kind.capitalize()} mode -> {mode.upper()}")
+
+    elif event == "set_camera":
+        # Phone: {"source": "phone"|"head", "facing": "back"|"front"}.
+        # Dashboard: {"source": "pc"|"head"|"phone"} for the PC app and the PC microphone.
+        source = str(data.get("source") or "")
+        if client.kind == "phone" and source in ("phone", "head"):
+            client.camera = source
+            client.facing = "front" if data.get("facing") == "front" else "back"
+            print(f"[CAMERA] {client.name or 'Phone'} uses the "
+                  f"{'head-mount' if source == 'head' else client.facing} camera")
+        elif client.kind == "dashboard" and source in ("pc", "head", "phone"):
+            ws_manager.pc_camera = source
+            print(f"[CAMERA] PC app uses the {dict(pc='PC webcam', head='head-mount camera', phone='phone camera')[source]}")
+        else:
+            return
+        update_cameras()
+        broadcast_camera_state()
+
+    elif event == "set_language":
+        # {"language": "en"|"bn"}: the phone's own language, or the PC's when a dashboard sends it.
+        # "quiet" (sent when an app reconnects with its saved choice) switches without announcing it.
+        lang = argus_language.normalize_language(data.get("language"))
+        if lang is None or client.kind not in ("phone", "dashboard"):
+            return
+        origin = "phone" if client.kind == "phone" else "pc"
+        changed = reply_language(origin, ws if origin == "phone" else None) != lang
+        if changed and not data.get("quiet"):
+            interrupt_tts()
+        set_language(lang, origin, client, announce=changed and not data.get("quiet"), retry=not data.get("quiet"))
+
+    elif event == "set_head_camera" and client.kind == "dashboard":
+        index = data.get("index")
+        await asyncio.to_thread(head_camera.choose, None if index in (None, "", "auto") else int(index))
+        broadcast_camera_state()
+
+    elif event == "screen_share" and client.kind == "phone":
+        client.screen_sharing = bool(data.get("on"))
+        log_event("SYSTEM", f"{client.name or 'Phone'} {'is sharing' if client.screen_sharing else 'stopped sharing'} its screen")
+        broadcast_camera_state()
+
+    elif event == "screen_frame" and client.kind in ("phone", "phone_screen"):
+        frame = decode_image(data.get("image_data", ""))
+        if frame is not None:
+            store_camera_frame("phone_screen", frame)
+
+    elif event == "app_state":
+        pass  # the phone app came to the front or went to the background (informational)
 
     elif event == "set_mic":
         mic_enabled = bool(data.get("enabled", True))
@@ -2014,21 +2482,16 @@ async def handle_message(client, data):
         ws_manager.broadcast_sync({"event": "mic_status", "available": True, "enabled": mic_enabled},
                                   dashboards_only=True)
 
-    elif event == "video_frame":
-        frame = decode_image(data.get("image_data", ""))
-        if frame is not None:
-            store_camera_frame("phone" if client.kind == "phone" else "pc", frame)
-
-    elif event == "slt_frame":
+    elif event in ("video_frame", "slt_frame"):
         frame = decode_image(data.get("image_data", ""))
         if frame is None:
             return
-        store_camera_frame("phone" if client.kind == "phone" else "pc", frame)
-        if client.slt is None and client.mode == "slt":
+        if event == "slt_frame" and client.slt is None and client.mode == "slt":
             start_slt(client)
-        if client.slt is not None:
-            ts = data.get("ts")
-            client.slt.push_frame(frame, ts / 1000.0 if isinstance(ts, (int, float)) else None)
+        ts = data.get("ts")
+        # Each sign language session reads the camera its client chose (see slt_source).
+        route_frame("phone" if client.kind == "phone" else "pc", frame,
+                    ts / 1000.0 if isinstance(ts, (int, float)) else None)
 
     elif event == "slt_language":
         code = data.get("language", "de")
@@ -2080,6 +2543,10 @@ async def handle_message(client, data):
         if is_repeat_command(text):
             repeat_last(origin, ws if origin == "phone" else None)
             return
+        voice_language = parse_language_command(text)
+        if voice_language:
+            set_language(voice_language, origin, client)
+            return
         voice_mode, mode_opts = parse_mode_command(text)
         if voice_mode:
             apply_mode_command(voice_mode, mode_opts, origin, ws if origin == "phone" else None, client)
@@ -2122,5 +2589,5 @@ async def websocket_endpoint(websocket: WebSocket):
 
 if __name__ == "__main__":
     import uvicorn
-    print("\n[SYSTEM] A.R.G.U.S. running at http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=int(os.getenv("ARGUS_PORT", "8000")), ws_max_size=32 * 1024 * 1024)
+    print(f"\n[SYSTEM] A.R.G.U.S. running at http://localhost:{SERVER_PORT}")
+    uvicorn.run(app, host="0.0.0.0", port=SERVER_PORT, ws_max_size=32 * 1024 * 1024)

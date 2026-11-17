@@ -21,14 +21,23 @@ pyaudio
 piper-tts
 edge-tts
 pygame
+# Bengali: the translation model (NLLB-200) and the offline Bangla voice (MMS) load through
+# transformers, already listed above, and are downloaded the first time Bengali is chosen.
 
 # Server
 fastapi
 uvicorn[standard]
 websockets
 
+# Connect phone panel: QR code and automatic discovery of this PC by the phone apps (src/argus_connect.py)
+segno
+zeroconf
+
 # Desktop window (python argus_desktop.py); uses Edge WebView2 on Windows
 pywebview
+
+# Head-mount camera names in the PC app's camera menu (optional; without it they show as "Camera 0", "Camera 1")
+pygrabber; sys_platform == "win32"
 
 # Screen capture and GPU telemetry
 dxcam; sys_platform == "win32"
