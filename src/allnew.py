@@ -37,6 +37,7 @@ import traceback
 from difflib import SequenceMatcher
 import uuid
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 
@@ -129,6 +130,9 @@ MAX_PHRASE_S = env_float("ARGUS_MAX_PHRASE", 30.0)
 ECHO_GUARD_S = env_float("ARGUS_ECHO_GUARD", 0.0)
 # While ARGUS talks: "all" = any new question interrupts it, "stop" = only stop / goodbye commands.
 BARGE_IN = os.getenv("ARGUS_BARGE_IN", "all").lower()
+# Assistive mode in Bengali also understands spoken Bangla on the PC microphone, with Google's online speech
+# recognition (the same service the phones use). "off" keeps the PC microphone English-only.
+BANGLA_STT = os.getenv("ARGUS_BANGLA_STT", "bn-BD")
 
 # Sign language captions: also translate into English with Qwen, and which text to speak.
 SLT_ENGLISH = os.getenv("ARGUS_SLT_ENGLISH", "1") == "1"
@@ -275,10 +279,12 @@ def set_status(state):
 # ==========================================
 # 1b. REPLY LANGUAGE: English or Bengali
 # ==========================================
-# Each phone has its own language; the PC app and the PC microphone share one. The model always
-# works in English. Sentences for a Bengali listener are translated just before they are spoken
+# Each phone has its own language; the PC app and the PC microphone share one. Bengali is used in
+# Assistive mode (and while walking guidance runs); Screen, Live and Sign mode stay English. The model
+# always works in English. Sentences for a Bengali listener are translated just before they are spoken
 # (argus_language.py) and spoken with a Bangla voice (argus_tts.py).
-def reply_language(origin, requester=None):
+def device_language(origin, requester=None):
+    """The language chosen on that device (its switch), whatever mode it is in."""
     if origin == "phone" and requester is not None:
         client = ws_manager.clients.get(requester)
         if client is not None:
@@ -286,9 +292,30 @@ def reply_language(origin, requester=None):
     return ws_manager.pc_language
 
 
+def device_mode(origin, requester=None):
+    if origin == "phone" and requester is not None:
+        client = ws_manager.clients.get(requester)
+        if client is not None:
+            return client.mode
+    return ws_manager.pc_mode
+
+
+def bangla_active(origin, requester=None):
+    """Assistive mode, or walking guidance for this device (it may have been started from another mode)."""
+    if device_mode(origin, requester) == argus_language.BANGLA_MODE:
+        return True
+    return bool(guide["on"] and guide["origin"] == origin and (origin != "phone" or guide["requester"] is requester))
+
+
+def reply_language(origin, requester=None):
+    """The language ARGUS speaks to that device right now: Bengali only in Assistive mode."""
+    lang = device_language(origin, requester)
+    return lang if lang == "en" or bangla_active(origin, requester) else "en"
+
+
 def language_state(client):
     lang = client.language if client.kind == "phone" else ws_manager.pc_language
-    return {"event": "language_state", "language": lang,
+    return {"event": "language_state", "language": lang, "scope": argus_language.BANGLA_MODE,
             "languages": [{"code": code, "label": label, "native": argus_language.NATIVE_NAMES[code]}
                           for code, label in argus_language.LANGUAGES.items()],
             "translator": argus_language.translator.status()}
@@ -326,7 +353,7 @@ def set_language(lang, origin="pc", client=None, announce=True, retry=False):
     if lang is None:
         return
     requester = client.ws if (origin == "phone" and client is not None) else None
-    changed = reply_language(origin, requester) != lang
+    changed = device_language(origin, requester) != lang
     if origin == "phone" and client is not None:
         client.language = lang
         ws_manager.send_to_sync(client.ws, language_state(client))
@@ -342,7 +369,10 @@ def set_language(lang, origin="pc", client=None, announce=True, retry=False):
         who = (client.name or "Phone") if requester is not None else "PC"
         log_event("LANGUAGE", f"{who} now speaks {argus_language.LANGUAGES[lang]}.")
     if announce:
-        speak(argus_language.SWITCHED[lang], lang=lang, origin=origin, requester=requester)
+        if lang == "bn" and not bangla_active(origin, requester):
+            speak(argus_language.SWITCHED_ELSEWHERE, lang="en", origin=origin, requester=requester)
+        else:
+            speak(argus_language.SWITCHED[lang], lang=lang, origin=origin, requester=requester)
 
 
 _translation_note = 0.0
@@ -374,6 +404,7 @@ def localize_speech(item):
 def synthesize_item(item):
     """Audio for a queued sentence in the listener's language; English if the Bangla voice fails."""
     text, lang = localize_speech(item)
+    item.spoken = text
     try:
         return argus_tts.synthesize(text, lang, item.rate)
     except Exception as exc:
@@ -729,6 +760,7 @@ class SpeechItem:
     synth_ms: int = None
     target: str = "en"     # language the listener chose; text in another language is translated first
     guide: bool = False    # a walking-guidance update (no chat bubble to attach a translation to)
+    spoken: str = ""       # the text actually spoken (the Bangla, for a Bengali listener)
 
 
 # Interrupting bumps the epoch; audio from an older epoch is thrown away.
@@ -844,6 +876,8 @@ def pc_play_worker():
             set_status("speaking")
             last_tts_start = time.time()
             recent_speech.append((last_tts_start, normalize_command_text(item.text)))
+            if item.spoken and item.spoken != item.text:  # Bangla: what the microphone will actually hear
+                recent_speech.append((last_tts_start, argus_language.normalize_bn(item.spoken)))
             pygame.mixer.music.play()
             if item.seq == 0 and item.req_id:
                 latency.mark(item.req_id, "first_audio_ms")
@@ -992,7 +1026,7 @@ def detect_wake_call(text):
 
 def is_own_echo(heard, window_s=30.0):
     """True if the mic most likely picked up ARGUS's own voice from the speakers."""
-    clean = normalize_command_text(heard)
+    clean = argus_language.normalize_bn(heard) if argus_language.has_bengali(heard) else normalize_command_text(heard)
     words = clean.split()
     if not words:
         return False
@@ -2069,6 +2103,37 @@ def audio_worker():
         ws_manager.broadcast_sync({"event": "mic_status", "available": False, "enabled": False})
         return
 
+    # Spoken Bangla (Assistive mode in Bengali): Google's online recognizer, run next to Whisper so it
+    # adds little delay. Whisper keeps listening for the English wake word and commands.
+    bn_recognizer = sr.Recognizer()
+    bn_recognizer.operation_timeout = 6
+    bn_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="bangla-stt")
+    bn_note = {"at": 0.0}
+
+    def recognize_bangla(audio_data):
+        """Bangla text, "" when nothing was understood, None when the service can't be reached."""
+        start = time.time()
+        try:
+            text = bn_recognizer.recognize_google(audio_data, language=BANGLA_STT)
+        except sr.UnknownValueError:
+            return ""
+        except Exception as exc:
+            if time.time() - bn_note["at"] > 60:
+                bn_note["at"] = time.time()
+                log_event("LANGUAGE", "Couldn't reach Bangla speech recognition (it needs internet), "
+                                      f"so the microphone understands English only for now. ({type(exc).__name__})")
+            return None
+        print(f"[VOICE] Bangla recognition {int((time.time() - start) * 1000)} ms: {text!r}")
+        return text.strip()
+
+    def bangla_heard(bn_text, english_wake, idle):
+        """Turn recognized Bangla into what the rest of the loop expects: an English command
+        ("stop", "guide me", ...) or the Bangla question, with "hey argus" in front when it woke ARGUS."""
+        woke, rest = argus_language.bangla_wake(bn_text)
+        command = argus_language.bangla_command(bn_text)
+        body = command or rest
+        return (f"hey argus {body}" if idle and (woke or english_wake) else body).strip()
+
     def transcribe(audio_data):
         pcm = np.frombuffer(audio_data.get_raw_data(convert_rate=16000, convert_width=2), np.int16)
         segments, _ = audio_model.transcribe(
@@ -2145,7 +2210,30 @@ def audio_worker():
             overlapped = pc_busy() or last_tts_end >= phrase_start
 
             stt_start = time.time()
+            bangla = BANGLA_STT != "off" and reply_language("pc") == "bn"
+            bn_future = None
+            if bangla and assistant_state != "idle" and (not overlapped or clip_s <= 3.0):
+                # Awake: every phrase may be Bangla. While ARGUS talks only short phrases ("থামো") are sent.
+                bn_future = bn_pool.submit(recognize_bangla, audio)
             heard = transcribe(audio)
+            if bangla:
+                english_wake = assistant_state == "idle" and bool(heard) and detect_wake_call(heard)[0]
+                if english_wake and not overlapped:
+                    bn_future = bn_pool.submit(recognize_bangla, audio)  # "Hey Argus" + a Bangla question
+                bn_text = None
+                if bn_future is not None:
+                    try:
+                        bn_text = bn_future.result(timeout=8)
+                    except Exception:
+                        bn_text = None
+                if bn_text:
+                    english_command = heard and (is_stop_command(heard) or is_sleep_command(heard) or
+                                                 is_guide_stop(heard))
+                    if not english_command:  # English "okay stop" still works as it is
+                        heard = bangla_heard(bn_text, english_wake, assistant_state == "idle")
+                elif bn_text == "" and not english_wake and heard and not (
+                        is_stop_command(heard) or is_sleep_command(heard) or is_guide_stop(heard)):
+                    heard = ""  # Google heard no speech: Whisper's English guess at Bangla sounds is noise
             stt_ms = int((time.time() - stt_start) * 1000)
             if not heard:
                 continue
@@ -2158,7 +2246,7 @@ def audio_worker():
             if is_own_echo(heard):
                 print(f"[VOICE] Ignored (sounds like ARGUS's own reply): {heard!r}")
                 continue
-            if overlapped and (BARGE_IN != "all" or ws_manager.pc_language == "bn"):
+            if overlapped and (BARGE_IN != "all" or reply_language("pc") == "bn"):
                 # ARGUS_BARGE_IN=stop: only "stop" / "goodbye" interrupt. The same holds while ARGUS speaks
                 # Bangla: the echo filter compares English text, so it can't tell ARGUS's Bangla voice apart.
                 continue
@@ -2252,7 +2340,7 @@ def screen_stream_worker():
 for target in (pc_synth_worker, pc_play_worker, phone_tts_worker, audio_worker, llm_worker,
                screen_stream_worker, hardware_metrics_worker, guide_worker):
     threading.Thread(target=target, daemon=True).start()
-ARGUS_BUILD = "2026-11-16 smooth camera build"
+ARGUS_BUILD = "2026-11-17 Bangla guide build"
 print(f"[SYSTEM] ARGUS server {ARGUS_BUILD}")
 print("[VOICE] PC wake word: 'Hey Argus' | Stop: 'Okay stop' | Sleep: 'Goodbye' | OCR: 'Read this' "
       "| Walking guide: 'Guide me' / 'Stop guiding' | Repeat: 'Say that again' "
@@ -2452,7 +2540,7 @@ async def handle_message(client, data):
         if lang is None or client.kind not in ("phone", "dashboard"):
             return
         origin = "phone" if client.kind == "phone" else "pc"
-        changed = reply_language(origin, ws if origin == "phone" else None) != lang
+        changed = device_language(origin, ws if origin == "phone" else None) != lang
         if changed and not data.get("quiet"):
             interrupt_tts()
         set_language(lang, origin, client, announce=changed and not data.get("quiet"), retry=not data.get("quiet"))
@@ -2531,6 +2619,8 @@ async def handle_message(client, data):
         text = (data.get("text") or "").strip()
         if not text:
             return
+        if argus_language.has_bengali(text):
+            text = argus_language.bangla_command(text) or text  # "পথ দেখাও" -> "guide me"
         mode = normalize_mode(data.get("mode")) or client.mode
         if mode == "slt":
             mode = "live"

@@ -1,17 +1,20 @@
 """Reply language for ARGUS: English or Bengali (Bangla).
 
 The vision model, the walking guidance and the voice commands all work in English.
-When a device picks Bengali, every sentence ARGUS is about to say is turned into
-Bangla here, just before it is spoken:
+Bangla is used in Assistive mode (walking guidance) when a device picks Bengali; the other
+modes stay English. Every sentence ARGUS is about to say there is turned into Bangla here,
+just before it is spoken:
 
     1. fixed sentences (mode names, guidance instructions, error messages) come from
        a hand-written table, so they are instant and always the same,
     2. obstacle warnings are built from a template and a small word list,
-    3. everything else (the model's own answers) goes through a translation model,
-       NLLB-200 by default, which runs on this PC and is downloaded once.
+    3. everything else (the model's own answers) is translated online with Google Translate
+       when the PC has internet (fast and accurate), otherwise by NLLB-200, a translation
+       model that runs on this PC and is downloaded once.
 
-Bangla questions typed into the app are translated to English the same way, so the
-model can answer them.
+Bangla questions (typed, or spoken in Assistive mode) are translated to English the same
+way, so the model can answer them. Spoken Bangla commands ("থামো", "পথ দেখাও", ...) are
+turned into the English commands by bangla_command().
 
 The translation model is downloaded by ARGUS itself into models/<model name>/ (about
 2.5 GB, once, with a progress figure, and it resumes after an interruption). It does
@@ -21,17 +24,21 @@ the folder copied from another PC.
 
 Settings (environment variables):
     ARGUS_LANGUAGE            en | bn    language a device starts with (default en)
+    ARGUS_TRANSLATE           auto | online | offline   (auto = online when it works, else NLLB)
     ARGUS_TRANSLATE_MODEL     Hugging Face id (default facebook/nllb-200-distilled-600M),
                               or the path of a folder that already holds the model
-    ARGUS_TRANSLATE_DEVICE    auto | cuda | cpu   (auto = GPU when there is one)
+    ARGUS_TRANSLATE_DEVICE    auto | cuda | cpu   (auto = GPU when it has room, else the processor)
     ARGUS_TRANSLATE_BEAMS     beam size, 1 is fastest (default 2)
 """
 
+import json
 import os
 import re
 import threading
 import time
+import unicodedata
 import urllib.error
+import urllib.parse
 import urllib.request
 from collections import OrderedDict
 
@@ -44,8 +51,17 @@ if DEFAULT_LANGUAGE not in LANGUAGES:
     DEFAULT_LANGUAGE = "en"
 
 MODEL_NAME = os.getenv("ARGUS_TRANSLATE_MODEL", "facebook/nllb-200-distilled-600M")
+# auto: Google Translate while it answers (about 0.2 s a sentence, better Bangla), NLLB on this PC otherwise.
+TRANSLATE_MODE = os.getenv("ARGUS_TRANSLATE", "auto").lower()
+if TRANSLATE_MODE not in ("auto", "online", "offline"):
+    TRANSLATE_MODE = "auto"
+ONLINE_URL = os.getenv("ARGUS_TRANSLATE_URL", "https://translate.googleapis.com/translate_a/single")
+ONLINE_TIMEOUT_S = 4.0
+ONLINE_RETRY_S = 60.0  # after a failed online call, use the offline model this long before trying again
+ONLINE_NAME = "online (Google Translate)"
 DEVICE = os.getenv("ARGUS_TRANSLATE_DEVICE", "auto").lower()
 BEAMS = max(1, int(os.getenv("ARGUS_TRANSLATE_BEAMS", "2")))
+MIN_FREE_VRAM_GB = 1.8  # auto: less free VRAM than this and the translation model runs on the processor
 NLLB_CODES = {"en": "eng_Latn", "bn": "ben_Beng", "de": "deu_Latn"}
 REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 DATA_ROOT = os.path.abspath(os.getenv("ARGUS_HOME", REPO_ROOT))
@@ -57,7 +73,10 @@ NLLB_FILES = dict(required=["config.json", "tokenizer.json", "tokenizer_config.j
                   weights=["model.safetensors", "pytorch_model.bin"])
 
 BENGALI_CHARS = re.compile("[\u0980-\u09FF]")  # the Bengali Unicode block
-SWITCHED = {"bn": "ঠিক আছে, এখন থেকে আমি বাংলায় কথা বলব।", "en": "Okay, I will speak English now."}
+SWITCHED = {"bn": "ঠিক আছে, সহায়ক মোডে এখন থেকে আমি বাংলায় কথা বলব।", "en": "Okay, I will speak English now."}
+# Said in English when Bengali is chosen outside Assistive mode, where ARGUS keeps speaking English.
+SWITCHED_ELSEWHERE = "Okay. I will speak Bangla in Assistive mode."
+BANGLA_MODE = "assistive"  # the one mode that speaks and listens in Bangla
 
 
 def normalize_language(value):
@@ -101,6 +120,72 @@ def parse_language_command(text):
 
 
 # ------------------------------------------------------------------
+# Spoken Bangla commands (Assistive mode listens in Bangla)
+# ------------------------------------------------------------------
+# Speech recognition writes "Hey Argus" in Bangla letters, or keeps "Argus" in English letters.
+ARGUS_BN = ["আর্গাস", "আরগাস", "আর্গুস", "আরগুস", "আর্গোস", "আরগোস", "আর্গস", "আরগস", "আর্গাছ", "আগাস",
+            "আর্গাসকে", "আর্গাসের", "argus", "argas", "argos"]
+WAKE_PREFIX_BN = ["হেই", "হে", "হাই", "হ্যালো", "হেলো", "ওকে", "ওহে", "এই", "hey", "hi", "hello", "ok", "okay"]
+_POLITE_BN = ["প্লিজ", "দয়া করে", "দয়া করে", "একটু", "এখন", "please"]
+
+# Bangla phrase -> the English command the rest of ARGUS understands.
+_COMMANDS_BN = {
+    "stop": ["থামো", "থামুন", "থাম", "থামাও", "থামান", "থেমে যাও", "থেমে যান", "চুপ", "চুপ করো", "চুপ করুন",
+             "চুপ কর", "কথা বন্ধ করো", "কথা বন্ধ করুন", "বন্ধ করো", "বন্ধ করুন", "স্টপ", "ওকে স্টপ", "যথেষ্ট",
+             "আর না", "অপেক্ষা করো", "অপেক্ষা করুন"],
+    "goodbye": ["বিদায়", "বিদায়", "আল্লাহ হাফেজ", "আল্লাহ হাফিজ", "খোদা হাফেজ", "বাই", "বাই বাই", "গুডবাই",
+                "গুড বাই", "টাটা", "ঘুমাও", "ঘুমান", "ঘুমিয়ে পড়ো", "ঘুমিয়ে পড়ুন", "আজ এই পর্যন্ত"],
+    "stop guiding": ["গাইড বন্ধ করো", "গাইড বন্ধ করুন", "গাইড বন্ধ", "গাইড থামাও", "গাইড থামান", "গাইডিং বন্ধ করো",
+                     "গাইডিং বন্ধ করুন", "পথ দেখানো বন্ধ করো", "পথ দেখানো বন্ধ করুন", "পথ দেখানো থামাও",
+                     "স্টপ গাইডিং", "আমি পৌঁছে গেছি", "পৌঁছে গেছি"],
+    "guide me": ["পথ দেখাও", "পথ দেখান", "আমাকে পথ দেখাও", "আমাকে পথ দেখান", "রাস্তা দেখাও", "রাস্তা দেখান",
+                 "আমাকে রাস্তা দেখাও", "আমাকে রাস্তা দেখান", "গাইড করো", "গাইড করুন", "আমাকে গাইড করো",
+                 "আমাকে গাইড করুন", "গাইড মি", "গাইড শুরু করো", "গাইড শুরু করুন", "পথ দেখানো শুরু করো",
+                 "আমাকে নিয়ে চলো", "আমাকে নিয়ে চলুন"],
+    "say that again": ["আবার বলো", "আবার বলুন", "আরেকবার বলো", "আরেকবার বলুন", "আবার বল", "কী বললে", "কি বললে",
+                       "কী বললেন", "কি বললেন", "বুঝিনি আবার বলো", "বুঝিনি আবার বলুন", "আবার বলবে"],
+    "speak english": ["ইংরেজিতে বলো", "ইংরেজিতে বলুন", "ইংরেজিতে কথা বলো", "ইংরেজিতে কথা বলুন", "ইংলিশে বলো",
+                      "ইংলিশে বলুন", "ইংলিশে কথা বলো", "ইংলিশে কথা বলুন", "ইংরেজি", "ইংলিশ", "স্পিক ইংলিশ"],
+    "speak bengali": ["বাংলায় বলো", "বাংলায় বলুন", "বাংলায় কথা বলো", "বাংলায় কথা বলুন"],
+}
+_PUNCT_BN = re.compile(r"[।॥.,!?;:'\"()\[\]{}\-–—…]+")
+
+
+def normalize_bn(text):
+    """Lower case, punctuation (also the Bangla full stop) removed, single spaces."""
+    text = unicodedata.normalize("NFC", text or "")  # one spelling for letters like য়, which have two
+    return " ".join(_PUNCT_BN.sub(" ", text.lower()).split())
+
+
+_COMMAND_LOOKUP = {normalize_bn(p): cmd for cmd, phrases in _COMMANDS_BN.items() for p in phrases}
+_WAKE_FORMS = sorted({f"{pre} {a}" for pre in WAKE_PREFIX_BN for a in ARGUS_BN} | set(ARGUS_BN),
+                     key=len, reverse=True)
+
+
+def bangla_wake(text):
+    """'হেই আর্গাস, সামনে কী আছে?' -> (True, 'সামনে কী আছে'). (False, text) without a wake word."""
+    t = normalize_bn(text)
+    for wake in _WAKE_FORMS:
+        if t == wake:
+            return True, ""
+        if t.startswith(wake + " "):
+            return True, t[len(wake) + 1:].strip()
+    return False, t
+
+
+def bangla_command(text):
+    """A spoken or typed Bangla command -> the English command ("stop", "guide me", ...), else None.
+    A wake word in front ("হেই আর্গাস থামো") is allowed."""
+    _, t = bangla_wake(text)
+    for word in _POLITE_BN:
+        if t.startswith(word + " "):
+            t = t[len(word) + 1:]
+        if t.endswith(" " + word):
+            t = t[:-len(word) - 1]
+    return _COMMAND_LOOKUP.get(t.strip())
+
+
+# ------------------------------------------------------------------
 # Fixed sentences
 # ------------------------------------------------------------------
 PHRASES_BN = {
@@ -118,6 +203,8 @@ PHRASES_BN = {
     "Sorry, I didn't get a clear answer.": "দুঃখিত, আমি পরিষ্কার উত্তর পাইনি।",
     "Please ask me again.": "অনুগ্রহ করে আবার জিজ্ঞাসা করুন।",
     "Okay, I will speak English now.": "ঠিক আছে, এখন থেকে আমি ইংরেজিতে কথা বলব।",
+    "Okay. I will speak Bangla in Assistive mode.": "ঠিক আছে। সহায়ক মোডে আমি বাংলায় কথা বলব।",
+    "Awake.": "আমি শুনছি।",
     # sign language
     "I'm not sure.": "আমি নিশ্চিত নই।",
     "Please sign again.": "অনুগ্রহ করে আবার সাইন করুন।",
@@ -134,9 +221,9 @@ PHRASES_BN = {
     # walking guidance (the commands stay English words, written in Bangla letters so the voice can say them)
     "Guiding you.": "আমি আপনাকে পথ দেখাচ্ছি।",
     "Hold the camera at chest height, pointing ahead.": "ক্যামেরা বুকের উচ্চতায় সামনের দিকে ধরে রাখুন।",
-    "Say stop guiding when you arrive.": "পৌঁছে গেলে বলুন, স্টপ গাইডিং।",
+    "Say stop guiding when you arrive.": "পৌঁছে গেলে বলুন, গাইড বন্ধ করো।",
     "I can't see the camera, so I stopped guiding.": "আমি ক্যামেরা দেখতে পাচ্ছি না, তাই পথ দেখানো বন্ধ করেছি।",
-    "Turn the camera on and say guide me.": "ক্যামেরা চালু করে বলুন, গাইড মি।",
+    "Turn the camera on and say guide me.": "ক্যামেরা চালু করে বলুন, পথ দেখাও।",
     "Okay, I stopped guiding.": "ঠিক আছে, পথ দেখানো বন্ধ করেছি।",
     "Careful!": "সাবধান!",
     "Stand still until it passes.": "এটি চলে না যাওয়া পর্যন্ত স্থির হয়ে দাঁড়িয়ে থাকুন।",
@@ -252,10 +339,12 @@ def fetch_model(repo, required, weights, optional=(), on_progress=None, attempts
     """Make sure models/<name>/ holds the Hugging Face model `repo` and return that folder.
 
     `weights` lists the possible weight files, best first; the first one the repository has is taken.
+    A repository that only has pytorch_model.bin ends up with model.safetensors (see bin_to_safetensors).
     `on_progress(done_bytes, total_bytes)` follows the weight file, which is nearly all of the download."""
     folder = model_folder(repo)
     marker = os.path.join(folder, ".complete")
     if os.path.isfile(marker):
+        _prefer_safetensors(folder)
         return folder
     os.makedirs(folder, exist_ok=True)
     base = f"{HF_URL}/{repo}/resolve/main/"
@@ -285,6 +374,7 @@ def fetch_model(repo, required, weights, optional=(), on_progress=None, attempts
         if last is None:
             with open(marker, "w", encoding="utf-8") as f:
                 f.write(repo)
+            _prefer_safetensors(folder)
             return folder
         if not (isinstance(last, urllib.error.HTTPError) and last.code == 404):
             raise last
@@ -292,10 +382,143 @@ def fetch_model(repo, required, weights, optional=(), on_progress=None, attempts
 
 
 # ------------------------------------------------------------------
+# pytorch_model.bin -> model.safetensors
+# ------------------------------------------------------------------
+_STORAGE_TYPES = {"FloatStorage": ("F32", 4), "HalfStorage": ("F16", 2), "DoubleStorage": ("F64", 8),
+                  "BFloat16Storage": ("BF16", 2), "LongStorage": ("I64", 8), "IntStorage": ("I32", 4),
+                  "ShortStorage": ("I16", 2), "CharStorage": ("I8", 1), "ByteStorage": ("U8", 1),
+                  "BoolStorage": ("BOOL", 1)}
+
+
+def bin_to_safetensors(src, dst):
+    """Rewrite a PyTorch weight file (pytorch_model.bin) as model.safetensors, without PyTorch.
+
+    transformers refuses to open a .bin file when PyTorch is older than 2.6 (CVE-2025-32434), and some
+    models, NLLB-200 among them, are published only as .bin. Such a file is a zip: one pickle that
+    describes every tensor (type, shape, where its numbers are) and one raw entry per block of numbers.
+    The pickle is read by an unpickler that accepts tensor descriptions and nothing else, so nothing
+    in the file can run, and the numbers are copied unchanged into the safetensors layout
+    (8-byte header length, JSON header, raw data). Tensors that share their numbers (tied weights)
+    are written once, as transformers itself does."""
+    import json
+    import pickle
+    import struct
+    import zipfile
+
+    class Reader(pickle.Unpickler):
+        def find_class(self, module, name):
+            if (module, name) == ("collections", "OrderedDict"):
+                return OrderedDict
+            if (module, name) == ("torch._utils", "_rebuild_tensor_v2"):
+                return lambda storage, offset, size, stride, *rest: (storage, int(offset), tuple(size), tuple(stride))
+            if (module, name) == ("torch._utils", "_rebuild_parameter"):
+                return lambda data, *rest: data
+            if module == "torch" and name in _STORAGE_TYPES:
+                return name
+            raise pickle.UnpicklingError(f"unexpected {module}.{name} in {os.path.basename(src)}")
+
+        def persistent_load(self, pid):  # ("storage", storage type, key, location, size)
+            return pid[1], str(pid[2])
+
+    with zipfile.ZipFile(src) as zf:
+        names = set(zf.namelist())
+        pkl = [n for n in names if n == "data.pkl" or n.endswith("/data.pkl")]
+        if len(pkl) != 1:
+            raise ValueError("not a PyTorch zip weight file")
+        prefix = pkl[0][:-len("data.pkl")]
+        if prefix + "byteorder" in names and zf.read(prefix + "byteorder").strip() != b"little":
+            raise ValueError("the weight file is big-endian")
+        with zf.open(pkl[0]) as f:
+            tensors = Reader(f).load()
+        if not isinstance(tensors, dict) or not tensors:
+            raise ValueError("the weight file does not hold a table of tensors")
+
+        blocks = OrderedDict()  # (storage key, offset, shape) -> [names that share these numbers]
+        info = {}
+        for name, value in tensors.items():
+            if not (isinstance(name, str) and isinstance(value, tuple) and len(value) == 4
+                    and isinstance(value[0], tuple) and value[0][0] in _STORAGE_TYPES):
+                raise ValueError(f"unexpected entry {name!r} in the weight file")
+            (kind, key), offset, shape, stride = value
+            count, packed = 1, []
+            for n in reversed(shape):
+                packed.insert(0, count)
+                count *= n
+            if count and tuple(packed) != stride:
+                raise ValueError(f"{name} is not stored as one contiguous block")
+            block = (key, offset, shape)
+            blocks.setdefault(block, []).append(name)
+            info[block] = (kind, count)
+
+        header, plan, at = {"__metadata__": {"format": "pt"}}, [], 0
+        for block, aliases in blocks.items():
+            # Tied weights: keep the embedding the others are tied to ("shared"), else the first name.
+            name = next((a for a in aliases if "shared" in a), aliases[0])
+            dtype, width = _STORAGE_TYPES[info[block][0]]
+            size = info[block][1] * width
+            header[name] = {"dtype": dtype, "shape": list(block[2]), "data_offsets": [at, at + size]}
+            plan.append((prefix + "data/" + block[0], block[1] * width, size))
+            at += size
+        head = json.dumps(header, separators=(",", ":")).encode("utf-8")
+        head += b" " * (-len(head) % 8)
+
+        part = dst + ".part"
+        with open(part, "wb") as out:
+            out.write(struct.pack("<Q", len(head)))
+            out.write(head)
+            for entry, start, size in plan:
+                with zf.open(entry) as f:
+                    if start:
+                        f.seek(start)
+                    while size:
+                        chunk = f.read(min(size, 1 << 24))
+                        if not chunk:
+                            raise ValueError(f"{entry} is shorter than the weight file says")
+                        out.write(chunk)
+                        size -= len(chunk)
+    os.replace(part, dst)
+
+
+def _prefer_safetensors(folder):
+    """A model folder that only has pytorch_model.bin gets a model.safetensors made from it (once)."""
+    src, dst = os.path.join(folder, "pytorch_model.bin"), os.path.join(folder, "model.safetensors")
+    if os.path.isfile(dst) or not os.path.isfile(src):
+        return
+    start = time.time()
+    print(f"[DOWNLOAD] Rewriting {os.path.basename(folder)}/pytorch_model.bin as model.safetensors "
+          "(one time, up to a minute)...")
+    try:
+        bin_to_safetensors(src, dst)
+    except Exception as exc:
+        print(f"[DOWNLOAD] Could not rewrite it ({type(exc).__name__}: {exc}). "
+              "PyTorch 2.6 or newer can still load the .bin file.")
+        return
+    os.remove(src)
+    print(f"[DOWNLOAD] model.safetensors written in {time.time() - start:.0f} s.")
+
+
+# ------------------------------------------------------------------
+# Online translation
+# ------------------------------------------------------------------
+def online_translate(text, src, tgt, timeout=ONLINE_TIMEOUT_S):
+    """Google Translate's public web endpoint (no key). Raises on any network or format problem."""
+    query = urllib.parse.urlencode({"client": "gtx", "sl": src, "tl": tgt, "dt": "t", "q": text})
+    request = urllib.request.Request(f"{ONLINE_URL}?{query}", headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        data = json.loads(response.read().decode("utf-8"))
+    out = "".join(part[0] for part in (data[0] or []) if isinstance(part, list) and part and part[0])
+    out = " ".join(out.split())
+    if not out:
+        raise ValueError("the online translation came back empty")
+    return out
+
+
+# ------------------------------------------------------------------
 # Translation model
 # ------------------------------------------------------------------
 class Translator:
-    """NLLB-200 on this PC. Loads in the background the first time Bengali is chosen."""
+    """Online translation while it works, NLLB-200 on this PC as the backup. Gets ready in the background
+    the first time Bengali is chosen; NLLB is only downloaded and loaded when online translation fails."""
 
     def __init__(self):
         self.state = "off"      # off | loading | ready | error
@@ -308,6 +531,9 @@ class Translator:
         self._run_lock = threading.Lock()
         self._cache = OrderedDict()
         self._failed_at = 0.0
+        self.online = False             # the last online call worked
+        self._online_retry_at = 0.0     # no online calls before this time (after a failure)
+        self._offline_started = False
 
     def status(self):
         return {"state": self.state, "error": self.error, "model": MODEL_NAME, "device": self.device,
@@ -315,7 +541,41 @@ class Translator:
 
     @property
     def ready(self):
-        return self.state == "ready"
+        return self._fn is not None or self._online_usable()
+
+    def _online_usable(self):
+        return TRANSLATE_MODE != "offline" and self.online and time.time() >= self._online_retry_at
+
+    def _online_failed(self, exc):
+        first = self.online or self._online_retry_at == 0.0
+        self.online = False
+        self._online_retry_at = time.time() + ONLINE_RETRY_S
+        if first:
+            print(f"[LANGUAGE] Online translation failed ({type(exc).__name__}: {exc}).")
+        if TRANSLATE_MODE == "auto":
+            self._start_offline()
+        elif self._fn is None:
+            self._failed_at = time.time()
+            self._set("error", f"Online translation is not reachable ({type(exc).__name__}: {exc}). "
+                               "Check this PC's internet connection.")
+
+    def _online_worked(self):
+        if not self.online:
+            self.online = True
+            self.device = ONLINE_NAME
+            if self.state != "ready":
+                self._set("ready")
+
+    def _start_offline(self):
+        """Load NLLB in the background (once), as the backup when online translation is not reachable."""
+        with self._load_lock:
+            if self._offline_started or self._fn is not None:
+                return
+            self._offline_started = True
+        print("[LANGUAGE] Using the offline translation model while online translation is not reachable.")
+        if self.state != "loading":
+            self._set("loading")
+        threading.Thread(target=self._load_offline, daemon=True).start()
 
     def _set(self, state, error=""):
         self.state, self.error = state, error
@@ -333,12 +593,40 @@ class Translator:
                 return
             if self.state == "error" and not retry and time.time() - self._failed_at < 60:
                 return
+            if self._fn is None:
+                self._offline_started = False  # nothing is loading (the state would say so): start afresh
             self.state, self.error = "loading", ""
         if self.on_change:
             self.on_change(self.status())
         threading.Thread(target=self._load, daemon=True).start()
 
     def _load(self):
+        if TRANSLATE_MODE != "offline":
+            start = time.time()
+            try:
+                sample = online_translate("Good morning, how are you?", "en", "bn")
+                if not BENGALI_CHARS.search(sample):
+                    raise ValueError(f"the test translation was not Bangla: {sample!r}")
+                self.online, self._online_retry_at, self.device = True, 0.0, ONLINE_NAME
+                print(f"[LANGUAGE] Online translation works ({int((time.time() - start) * 1000)} ms): "
+                      "Bangla comes from Google Translate.")
+                self._set("ready")
+                return
+            except Exception as exc:
+                self._online_retry_at = time.time() + ONLINE_RETRY_S
+                print(f"[LANGUAGE] Online translation is not reachable ({type(exc).__name__}: {exc}).")
+                if TRANSLATE_MODE == "online":
+                    self._failed_at = time.time()
+                    self._set("error", f"Online translation is not reachable ({type(exc).__name__}: {exc}). "
+                                       "Check this PC's internet connection.")
+                    return
+        with self._load_lock:
+            if self._offline_started:
+                return
+            self._offline_started = True
+        self._load_offline()
+
+    def _load_offline(self):
         start = time.time()
         try:
             print(f"[LANGUAGE] Loading the translation model {MODEL_NAME} "
@@ -350,11 +638,14 @@ class Translator:
             if not BENGALI_CHARS.search(sample or ""):
                 raise RuntimeError(f"the model's test translation was not Bangla: {sample!r}")
             print(f"[LANGUAGE] Translation model ready on {self.device} in {time.time() - start:.1f} s.")
+            if self.online:
+                self.device = ONLINE_NAME
             self._set("ready")
         except Exception as exc:
             self._fn = None
             self.progress = None
             self._failed_at = time.time()
+            self._offline_started = False
             print(f"[LANGUAGE] Translation model not available ({type(exc).__name__}: {exc}). "
                   "Replies stay in English until it loads.")
             self._set("error", f"{type(exc).__name__}: {exc}")
@@ -377,6 +668,17 @@ class Translator:
         from transformers import AutoModelForSeq2SeqLM, AutoTokenizer
 
         device = DEVICE if DEVICE in ("cuda", "cpu") else ("cuda" if torch.cuda.is_available() else "cpu")
+        if device == "cuda" and DEVICE != "cuda":
+            # auto: the model needs about 1.3 GB plus working room. On a full card (8 GB with the
+            # other models) it would spill into shared memory and slow everything, so use the processor.
+            try:
+                free = torch.cuda.mem_get_info()[0] / 2 ** 30
+            except Exception:
+                free = None
+            if free is not None and free < MIN_FREE_VRAM_GB:
+                print(f"[LANGUAGE] Only {free:.1f} GB of VRAM is free, so the translation model runs on "
+                      "the processor (a little slower). Set ARGUS_TRANSLATE_DEVICE=cuda to force the GPU.")
+                device = "cpu"
         source, extra, download_error = MODEL_NAME, {}, None
         if not os.path.isdir(MODEL_NAME):
             try:
@@ -401,7 +703,7 @@ class Translator:
         def make(model):
             def run(text, src, tgt):
                 tok.src_lang = NLLB_CODES[src]
-                enc = tok(text, return_tensors="pt", truncation=True, max_length=256).to(device)
+                enc = tok(text, return_tensors="pt", truncation=True, max_length=256).to(model.device)
                 with torch.inference_mode():
                     out = model.generate(
                         **enc, forced_bos_token_id=tok.convert_tokens_to_ids(NLLB_CODES[tgt]),
@@ -419,7 +721,13 @@ class Translator:
                     return run
                 print("[LANGUAGE] Half precision gave a bad translation; using full precision.")
             except Exception as exc:
-                print(f"[LANGUAGE] Half precision failed ({type(exc).__name__}: {exc}); using full precision.")
+                if "out of memory" in str(exc).lower():
+                    print("[LANGUAGE] The GPU is out of memory; the translation model runs on the processor.")
+                    device = "cpu"
+                    model = model.float().to("cpu")
+                    torch.cuda.empty_cache()
+                else:
+                    print(f"[LANGUAGE] Half precision failed ({type(exc).__name__}: {exc}); using full precision.")
             model = model.float()
         self.device = device
         return make(model.to(device))
@@ -434,13 +742,23 @@ class Translator:
             if key in self._cache:
                 self._cache.move_to_end(key)
                 return self._cache[key]
-            if self._fn is None:
-                raise RuntimeError("translation model not loaded")
-            out = self._fn(text, src, tgt)
+        out = None
+        if TRANSLATE_MODE != "offline" and time.time() >= self._online_retry_at:
+            try:
+                out = online_translate(text, src, tgt)
+                self._online_worked()
+            except Exception as exc:
+                self._online_failed(exc)
+        if out is None:
+            with self._run_lock:
+                if self._fn is None:
+                    raise RuntimeError("translation model not loaded")
+                out = self._fn(text, src, tgt)
+        with self._run_lock:
             self._cache[key] = out
             while len(self._cache) > 500:
                 self._cache.popitem(last=False)
-            return out
+        return out
 
 
 translator = Translator()

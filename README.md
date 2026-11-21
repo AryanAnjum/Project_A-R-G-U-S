@@ -138,8 +138,10 @@ and ask "Hey Argus, what's on my screen?".
 
 ### Language: English or Bengali
 
-ARGUS can speak and answer in **English** or **Bengali (বাংলা)**, in every mode: answers, walking
-guidance, medicine and money reading, sign language captions and its own messages.
+ARGUS can speak, answer and listen in **English** or **Bengali (বাংলা)** in **Assistive mode**:
+walking guidance, answers, medicine and money reading, and its own messages. Screen, Live and Sign
+mode always speak English, also with Bengali chosen (and walking guidance stays Bangla even when it
+was started from another mode).
 
 | Where | How to switch |
 | --- | --- |
@@ -151,39 +153,65 @@ Each phone has its own language, and the PC app has its own, so one can be Benga
 stays English. The choice is remembered.
 
 How it works (`src/argus_language.py`): the vision model and the guidance rules keep working in
-English. Just before a sentence is spoken to a Bengali listener it is turned into Bangla:
+English. Just before a sentence is spoken to a Bengali listener in Assistive mode it is turned into
+Bangla:
 
 1. fixed sentences (mode names, guidance instructions such as "move a little to your left", error
    messages) come from a hand-written table, and obstacle warnings ("Careful! There is a car ahead
    of you") are built from a word list, so these need no model and are instant;
-2. everything else, mainly the model's own answers, is translated sentence by sentence with
-   **NLLB-200** (`facebook/nllb-200-distilled-600M`), which runs on this PC. It is downloaded the
-   first time Bengali is chosen (about 2.5 GB) and takes about 1.3 GB of VRAM. Until it is ready,
-   answers stay in English and the app shows "Downloading Bengali… 40%".
+2. everything else, mainly the model's own answers, is translated sentence by sentence **online with
+   Google Translate** while the PC has internet (about 0.2 s a sentence, and much better Bangla), and
+   otherwise by the offline backup below. Set `ARGUS_TRANSLATE=offline` to never send text online.
+3. **Offline backup: NLLB-200** (`facebook/nllb-200-distilled-600M`), which runs on this PC. It is
+   only downloaded and loaded when online translation does not work (about 2.5 GB, once) and takes
+   about 1.3 GB of VRAM. Every minute ARGUS tries online again. Until the backup is ready,
+   answers stay in English and the app shows "Downloading Bengali… 40%". On a graphics card with
+   less than 1.8 GB free (an 8 GB card with every other model loaded) it runs on the processor
+   instead, which is a little slower per sentence and leaves the card to the other models.
 
-**The one-time download.** ARGUS fetches the model itself into `models/nllb-200-distilled-600M/`
+**The one-time download** (only for the offline backup). ARGUS fetches the model itself into `models/nllb-200-distilled-600M/`
 (and the offline Bangla voice into `models/mms-tts-ben/`), so the PC needs internet the first time
 Bengali is chosen. If the connection drops, press **বাংলা** again and it continues where it stopped.
 If the app says *"Bengali couldn't download"*, this PC cannot reach `huggingface.co`: check its
 internet (a phone hotspot is fine), then press **বাংলা** again. For a PC without internet, copy those
 two folders from a PC that has them. This download does not use the Hugging Face cache, so it also
-works in the installed desktop app, which keeps the Hugging Face libraries offline.
+works in the installed desktop app, which keeps the Hugging Face libraries offline. NLLB-200 is
+published only as `pytorch_model.bin`, which the Hugging Face library refuses to open with PyTorch
+older than 2.6, so after the download ARGUS rewrites it once as `model.safetensors` (same numbers,
+about a minute). Nothing has to be upgraded.
 
 The chat shows the Bangla sentence with the English answer below it in smaller text.
 
 **Bangla voice.** Piper has no Bangla voice, so by default the Bangla is spoken with the online
 Microsoft voice (edge-tts, needs internet). Without internet ARGUS switches by itself to the offline
 MMS voice (`facebook/mms-tts-ben`, about 150 MB, fetched in the background the first time Bengali is
-chosen; it sounds more robotic). Set `ARGUS_TTS_BN=mms` to always use the offline voice.
+chosen; it sounds more robotic and is slower). Set `ARGUS_TTS_BN=mms` to always use the offline voice.
+The black window shows which voice spoke and how long it took (`[TTS] Bangla voice: online, 640 ms`).
+If it keeps saying *offline* on a PC with internet, update the online voice: `pip install -U edge-tts`.
 
-**Sign mode.** Bangla signs are spoken in Bangla as they are; German signs are translated to Bangla.
-With English chosen, captions are spoken in English as before.
+**Sign mode** speaks English: Bangla signs are shown in Bangla and spoken in English, as before.
 
-**Questions.** Speak to ARGUS in English: the speech recognition and the voice commands are English.
-A question *typed* in Bangla is translated to English for the model and answered in the chosen
-language. While ARGUS is speaking Bangla on the PC, only *"okay stop"* and *"goodbye"* interrupt it
-(its echo filter compares English text), so wait for it to finish before the next question, or use
-earphones.
+**Speaking Bangla.** In Assistive mode with Bengali chosen, ARGUS also understands spoken Bangla:
+
+| Say | What happens |
+| --- | --- |
+| *"হেই আর্গাস"* (or *"Hey Argus"*) and a question in Bangla | the question is translated to English for the model, the answer is spoken in Bangla |
+| *"পথ দেখাও"* / *"আমাকে গাইড করো"* | walking guidance starts |
+| *"গাইড বন্ধ করো"* / *"আমি পৌঁছে গেছি"* | walking guidance stops |
+| *"থামো"* / *"চুপ করো"* | ARGUS stops talking |
+| *"আবার বলো"* | ARGUS repeats the last thing it said |
+| *"বিদায়"* | ARGUS goes to sleep |
+| *"ইংরেজিতে কথা বলো"* | back to English |
+
+The English commands keep working too. On the PC microphone the Bangla is recognized online with
+Google's speech recognition (the same service the SpeechRecognition library already uses), next to
+Whisper, which still listens for "Hey Argus" and the English commands. Without internet the PC
+microphone understands English only and says so. The phones use their own Bangla speech recognition
+(Android: Google, `bn-BD`; iPhone: Apple's, when the iPhone has Bangla). Set `ARGUS_BANGLA_STT=off`
+to keep the PC microphone English-only. Typed Bangla questions work in every mode.
+
+While ARGUS is speaking Bangla on the PC, only stop words (*"থামো"*, *"okay stop"*) and *"goodbye"*
+interrupt it, so it does not answer its own voice; wait for it to finish, or use earphones.
 
 **First run needs internet once.** It downloads Qwen2-VL, Whisper, the Piper voices and the
 MediaPipe holistic model. After that everything runs offline. The Piper voices go to
@@ -265,8 +293,10 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 | `ARGUS_HEAD_FPS` | `15` | Head-mount pictures per second handed to ARGUS |
 | `ARGUS_HEAD_WIDTH` / `ARGUS_HEAD_HEIGHT` | `1920` / `1080` | Head-mount capture size (1080p keeps reading sharp) |
 | `ARGUS_LANGUAGE` | `en` | Language a device starts with: `en` or `bn`. The apps' own choice overrides it |
-| `ARGUS_TRANSLATE_MODEL` | `facebook/nllb-200-distilled-600M` | Translation model for Bengali: a Hugging Face id (downloaded into `models/`) or a folder that already holds the model. `facebook/nllb-200-distilled-1.3B` translates better and needs about twice the VRAM |
-| `ARGUS_TRANSLATE_DEVICE` | `auto` | `auto` (GPU when there is one), `cuda` or `cpu` (slower, frees VRAM) |
+| `ARGUS_TRANSLATE` | `auto` | `auto` (Google Translate online, NLLB on this PC when offline), `online`, or `offline` (never send text online) |
+| `ARGUS_BANGLA_STT` | `bn-BD` | Language the PC microphone recognizes in Assistive mode with Bengali (Google, online); `off` keeps it English-only |
+| `ARGUS_TRANSLATE_MODEL` | `facebook/nllb-200-distilled-600M` | Offline translation model for Bengali: a Hugging Face id (downloaded into `models/`) or a folder that already holds the model. `facebook/nllb-200-distilled-1.3B` translates better and needs about twice the VRAM |
+| `ARGUS_TRANSLATE_DEVICE` | `auto` | `auto` (GPU when it has 1.8 GB free, else the processor), `cuda` or `cpu` (slower, frees VRAM) |
 | `ARGUS_TRANSLATE_BEAMS` | `2` | Translation beam size; `1` is fastest |
 | `ARGUS_TTS_BN` | `auto` | Bangla voice: `auto` (online Edge voice, offline MMS voice without internet), `edge` or `mms` |
 | `ARGUS_EDGE_VOICE_BN` | `bn-BD-PradeepNeural` | Online Bangla voice (`bn-BD-NabanitaNeural` is the female one) |
@@ -292,7 +322,7 @@ uses edge-tts, which needs internet, because Piper has no Bangla voice yet.
 src/allnew.py        server: models, mic, WebSocket API, modes
 src/argus_slt.py     live sign language sessions (MediaPipe -> ARGUS-SLT)
 src/argus_tts.py     Piper / edge-tts voices, Bangla voice (edge-tts online, MMS offline)
-src/argus_language.py  English / Bengali: fixed Bangla sentences, NLLB translation, "speak Bengali" command
+src/argus_language.py  English / Bengali: fixed Bangla sentences, online and NLLB translation, Bangla commands
 src/argus_connect.py Connect phone: PC address, QR code, network discovery
 src/argus_cameras.py head-mount camera (USB webcam on the PC) shared with the phones
 src/slt_test_video.py  run sign videos through the live pipeline, prints captions + confidence

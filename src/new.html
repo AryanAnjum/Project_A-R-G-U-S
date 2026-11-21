@@ -325,7 +325,7 @@ body.demo #promptInput { font-size: 17px; }
     <span id="gpuLabel">GPU --</span>
     <button type="button" class="phone-btn" id="phoneBtn" title="Connect a phone on the same network"><svg class="icon"><use href="#i-phone"/></svg><span id="phoneBtnText">Connect phone</span></button>
     <span class="lang-note" id="langNote" hidden></span>
-    <div class="lang-switch" id="langSwitch" role="group" aria-label="Language ARGUS speaks" title="Language ARGUS speaks and answers in. You can also say: Argus, speak Bengali.">
+    <div class="lang-switch" id="langSwitch" role="group" aria-label="Language ARGUS speaks" title="Language ARGUS speaks, answers and listens in, in Assistive mode. Screen, Live and Sign mode stay English. You can also say: Argus, speak Bengali.">
       <button type="button" class="lang-btn active" data-lang="en">English</button>
       <button type="button" class="lang-btn" data-lang="bn" lang="bn">বাংলা</button>
     </div>
@@ -520,7 +520,7 @@ function setConnected(ok) {
 const HANDLERS = {
   hello(d) {
     $("gpuLabel").textContent = `${d.gpu_name} · ${d.vram_total} GB`;
-    if (d.build) addLog("SYSTEM", `Server: ${d.build} · dashboard: 2026-11-16 smooth camera build`);
+    if (d.build) addLog("SYSTEM", `Server: ${d.build} · dashboard: 2026-11-17 Bangla guide build`);
     if (d.language) languageState(d.language);
     if (d.max_image_px) state.maxPx = d.max_image_px;
     if (d.ocr_max_px) state.ocrPx = d.ocr_max_px;
@@ -651,14 +651,25 @@ function languageState(d) {
     try { localStorage.setItem("argus-language", d.language); } catch (e) { /* storage blocked */ }
   }
   document.querySelectorAll("#langSwitch .lang-btn").forEach((b) => b.classList.toggle("active", b.dataset.lang === state.language));
-  const tr = d.translator || {}, note = $("langNote");
+  state.translator = d.translator || {};
+  renderLangNote();
+}
+function renderLangNote() {
+  const tr = state.translator || {}, note = $("langNote");
   let text = "";
   if (state.language === "bn" && tr.state === "loading") {
     text = typeof tr.progress === "number" ? `Downloading Bengali… ${tr.progress}%` : "Getting Bengali ready…";
   } else if (state.language === "bn" && tr.state === "error") {
-    text = "Bengali couldn't download. Check this PC's internet, then press বাংলা again.";
+    text = /online translation/i.test(tr.error || "")
+      ? "Bengali needs internet on this PC. Check it, then press বাংলা again."
+      : /download|connect|internet/i.test(tr.error || "")
+      ? "Bengali couldn't download. Check this PC's internet, then press বাংলা again."
+      : "Bengali couldn't load on this PC. Point here for the reason, or press বাংলা to try again.";
+  } else if (state.language === "bn" && state.mode !== "assistive") {
+    text = "বাংলা in Assistive mode";
   }
-  note.textContent = text; note.title = tr.error || text;
+  note.textContent = text; note.title = tr.error || (text && tr.state !== "error"
+    ? "ARGUS speaks and listens in Bangla in Assistive mode; Screen, Live and Sign stay English." : text);
   note.hidden = !text;
   note.classList.toggle("warn", tr.state === "error");
 }
@@ -666,7 +677,8 @@ function chooseLanguage(lang) {
   state.languageChosen = true;
   try { localStorage.setItem("argus-language", lang); } catch (e) { /* storage blocked */ }
   send({ event: "set_language", language: lang });
-  addLog("LANGUAGE", `ARGUS will speak ${LANGUAGE_NAMES[lang]}`);
+  addLog("LANGUAGE", lang === "bn" ? "ARGUS will speak and listen in Bengali in Assistive mode"
+                                     : "ARGUS will speak English");
 }
 function appendReply(id, text) {
   if (!state.replies.has(id)) startReply(id);
@@ -799,6 +811,7 @@ function applyMode(mode, notifyServer) {
     mode === "assistive" ? "Ask what's ahead, or read a medicine label..." : "Ask A.R.G.U.S. about the camera...";
   $("camSwitch").hidden = mode === "screen";
   syncCamera();
+  renderLangNote();
   if (notifyServer) send({ event: "set_mode", mode, language: state.sltLanguage });
 }
 

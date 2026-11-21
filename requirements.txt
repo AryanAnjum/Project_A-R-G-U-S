@@ -19,10 +19,11 @@ pyaudio
 
 # Speech out (piper = offline voice, edge-tts = online fallback)
 piper-tts
-edge-tts
+edge-tts>=7.0.0  # older versions are refused by Microsoft's voice service (then the slower offline voice is used)
 pygame
-# Bengali: the translation model (NLLB-200) and the offline Bangla voice (MMS) load through
-# transformers, already listed above, and are downloaded the first time Bengali is chosen.
+# Bengali: translation is online (Google Translate) and so is Bangla speech recognition on the PC
+# (SpeechRecognition, above). The offline backups (NLLB-200 translation, MMS voice) load through
+# transformers, already listed above, and are downloaded only when needed.
 
 # Server
 fastapi

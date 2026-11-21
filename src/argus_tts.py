@@ -200,10 +200,12 @@ def _bangla(text, rate):
     """Bangla: the online Edge voice first (it sounds better), the offline MMS voice when there is no
     internet. After a failed online try, the offline voice is used directly for the next two minutes."""
     global _edge_down_until
+    start = time.time()
     if BN_ENGINE != "mms" and time.time() >= _edge_down_until:
         try:
             audio = _edge_mp3(text, "bn", rate)
             if audio:
+                print(f"[TTS] Bangla voice: online, {int((time.time() - start) * 1000)} ms")
                 return audio, "audio/mpeg"
             raise RuntimeError("the online voice returned no audio")
         except Exception as exc:
@@ -211,8 +213,11 @@ def _bangla(text, rate):
                 raise
             _edge_down_until = time.time() + 120
             print(f"[TTS] Online Bangla voice unavailable ({type(exc).__name__}: {exc}); "
-                  "using the offline voice for now.")
-    return _mms_wav(text, rate), "audio/wav"
+                  "using the slower offline voice for now. If this PC has internet, run: pip install -U edge-tts")
+    start = time.time()
+    audio = _mms_wav(text, rate)
+    print(f"[TTS] Bangla voice: offline, {int((time.time() - start) * 1000)} ms")
+    return audio, "audio/wav"
 
 
 def synthesize(text, lang="en", rate="+8%"):
